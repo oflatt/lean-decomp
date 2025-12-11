@@ -22,20 +22,6 @@ private def containsSubstring (haystack needle : String) : Bool :=
 private def isAuxiliaryProofName (name : Name) : Bool :=
   containsSubstring name.toString "_proof_"
 
-private def nameHasPrefix (pref : String) (name : Name) : Bool :=
-  name.toString.startsWith pref
-
-private partial def exprContainsConst (p : Name → Bool) : Expr → Bool
-  | .const name _ => p name
-  | .app fn arg => exprContainsConst p fn || exprContainsConst p arg
-  | .lam _ ty body _ => exprContainsConst p ty || exprContainsConst p body
-  | .forallE _ ty body _ => exprContainsConst p ty || exprContainsConst p body
-  | .letE _ ty val body _ =>
-      exprContainsConst p ty || exprContainsConst p val || exprContainsConst p body
-  | .mdata _ body => exprContainsConst p body
-  | .proj _ _ body => exprContainsConst p body
-  | _ => false
-
 private partial def expandAuxiliaryProofsAux (env : Environment) (visited : NameSet)
     (e : Expr) : MetaM Expr := do
   match e with
@@ -43,14 +29,14 @@ private partial def expandAuxiliaryProofsAux (env : Environment) (visited : Name
       if visited.contains name || !isAuxiliaryProofName name then
         return e
       else
-    match env.find? name with
-    | some decl =>
-      match decl.value? with
-      | some val =>
-        let body := val.instantiateLevelParams decl.levelParams lvls
-        expandAuxiliaryProofsAux env (visited.insert name) body
-      | none => return e
-    | none => return e
+        match env.find? name with
+        | some decl =>
+            match decl.value? with
+            | some val =>
+                let body := val.instantiateLevelParams decl.levelParams lvls
+                expandAuxiliaryProofsAux env (visited.insert name) body
+            | none => return e
+        | none => return e
   | .app fn arg =>
       return .app (← expandAuxiliaryProofsAux env visited fn)
         (← expandAuxiliaryProofsAux env visited arg)
@@ -73,6 +59,7 @@ private partial def expandAuxiliaryProofsAux (env : Environment) (visited : Name
 private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
   expandAuxiliaryProofsAux (← getEnv) NameSet.empty e
 
+
 /--
 `showProofTerm thmName` logs the kernel-level proof term associated with `thmName`.
 This helps inspect what Lean actually stores for a theorem.
@@ -80,7 +67,7 @@ This helps inspect what Lean actually stores for a theorem.
 elab "showProofTerm " thm:ident : command => do
   Command.liftTermElabM do
     let thmExpr ← Lean.Elab.Term.elabTerm thm none
-    let some constName := thmExpr.constName?
+    let some constName := thmExpr.getAppFn.constName?
       | throwError "{thm} does not refer to a constant"
     let env ← getEnv
     let some decl := env.find? constName
@@ -88,18 +75,12 @@ elab "showProofTerm " thm:ident : command => do
     let some value := decl.value?
       | throwError "{thm} does not have an associated proof term"
     let expandedValue ← expandAuxiliaryProofs value
-    let typeFmt ← Meta.ppExpr decl.type
     let proofFmt ← Meta.ppExpr expandedValue
+    let typeFmt ← Meta.ppExpr decl.type
     logInfo m!"proof term for {thm}:\n{proofFmt}"
     let typeStr := typeFmt.pretty
     let proofStr := proofFmt.pretty
-    let usesGrind := exprContainsConst (nameHasPrefix "Lean.Grind.") expandedValue
-    let suggestion :=
-      if usesGrind then
-        s!"theorem {constName} : {typeStr} :=\n  by\n    grind"
-      else
-        s!"theorem {constName} : {typeStr} :=\n  {proofStr}"
-    Lean.Meta.Tactic.TryThis.addSuggestion (← getRef) suggestion
-      (header := s!"Try rewriting `{constName}` to use the raw proof term:\n")
+    Lean.Meta.Tactic.TryThis.addSuggestion (← getRef)
+      s!"theorem {constName} : {typeStr} :=\n  {proofStr}"
 
 end LeanDecomp
