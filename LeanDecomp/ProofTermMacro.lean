@@ -47,8 +47,8 @@ private def chooseIntroName (idx : Nat) (userName : Name) (used : List String) :
   let introName := mkUniqueName base used
   (introName, introName :: used)
 
-private def assignIntroNames (xs : Array Expr) : MetaM (List String × LocalContext × List String) := do
-  let mut used : List String := []
+private def assignIntroNames (xs : Array Expr) (used0 : List String) : MetaM (List String × LocalContext × List String) := do
+  let mut used : List String := used0
   let mut idx := 0
   let mut names : List String := []
   let mut lctx ← getLCtx
@@ -64,49 +64,71 @@ private def assignIntroNames (xs : Array Expr) : MetaM (List String × LocalCont
     idx := idx + 1
   return (names.reverse, lctx, used)
 
-private def indentLines (s : String) (indent : Nat) : String :=
-  let indentStr := String.ofList (List.replicate indent ' ')
-  String.intercalate "\n" ((s.splitOn "\n").map (fun line => indentStr ++ line))
-
 private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
   Meta.deltaExpand e isAuxiliaryProofName
 
-private def formatByContradiction? (bodyExpr : Expr) (renamedLctx : LocalContext)
-    (usedNames : List String) (baseLocalInstances : LocalInstances) : MetaM (Option String) := do
-  withLCtx renamedLctx baseLocalInstances do
-    let rec peel (e : Expr) (acc : List Expr) : Expr × List Expr :=
-      match e with
-      | Expr.app f arg => peel f (arg :: acc)
-      | _ => (e, acc)
-    let (fn, args) := peel bodyExpr []
-    let some constName := Expr.constName? fn
-      | return none
-    if constName != ``Classical.byContradiction then
-      return none
-    let some handler := args.getLast?
-      | return none
-    let handlerType ← Meta.inferType handler
-    Meta.forallTelescope handlerType fun binders _ => do
-      if binders.size = 1 then
-        let binder := binders[0]!
-        let lctxWithBinder ← getLCtx
-        let some fvarId := binder.fvarId?
-          | throwError "Unexpected non-fvar binder in byContradiction handler"
-        let decl ← fvarId.getDecl
-        let (binderName, _) := chooseIntroName usedNames.length decl.userName usedNames
-        let renamedBinderLctx := lctxWithBinder.setUserName fvarId (Name.mkSimple binderName)
-        let binderLocalInstances ← getLocalInstances
-        let applied := Expr.app handler binder
-        let bodyFmt ← withLCtx renamedBinderLctx binderLocalInstances <|
-          withOptions (fun o =>
-            let o := o.setBool `pp.notation false
-            o.setBool `pp.all true) <|
-              Meta.ppExpr applied
-        let bodyStr := bodyFmt.pretty
-        let block := s!"  classical\n  apply Classical.byContradiction\n  intro {binderName}\n  exact\n{indentLines bodyStr 4}"
-        return some block
-      else
+mutual
+
+  private partial def renderExprToTactics (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (List String × List String) := do
+    withLCtx lctx localInsts do
+      Meta.lambdaTelescope expr fun xs body => do
+        if xs.size > 0 then
+          let (introNames, newLctx, used') ← assignIntroNames xs used
+          let newLocalInsts ← getLocalInstances
+          let (bodyLines, used'') ← renderExprToTactics body newLctx newLocalInsts used'
+          let introLines :=
+            if introNames.isEmpty then []
+            else [s!"  intros {String.intercalate " " introNames}"]
+          return (introLines ++ bodyLines, used'')
+        else
+          match ← renderByContradiction? expr lctx localInsts used with
+          | some res => pure res
+          | none => do
+              let bodyFmt ← withOptions (fun o =>
+                let o := o.setBool `pp.notation false
+                o.setBool `pp.all true) <|
+                  Meta.ppExpr expr
+              let bodyLines := bodyFmt.pretty.splitOn "\n"
+              let indented := bodyLines.map (fun line => "    " ++ line)
+              return ("  exact" :: indented, used)
+
+  private partial def renderByContradiction? (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (List String × List String)) := do
+    withLCtx lctx localInsts do
+      let rec peel (e : Expr) (acc : List Expr) : Expr × List Expr :=
+        match e with
+        | Expr.app f arg => peel f (arg :: acc)
+        | _ => (e, acc)
+      let (fn, args) := peel expr []
+      let some constName := Expr.constName? fn
+        | return none
+      if constName != ``Classical.byContradiction then
         return none
+      let some handler := args.getLast?
+        | return none
+      let handlerType ← Meta.inferType handler
+      Meta.forallTelescope handlerType fun binders _ => do
+        if binders.size = 1 then
+          let binder := binders[0]!
+          let lctxWithBinder ← getLCtx
+          let some fvarId := binder.fvarId?
+            | throwError "Unexpected non-fvar binder in byContradiction handler"
+          let decl ← fvarId.getDecl
+          let (binderName, used') := chooseIntroName used.length decl.userName used
+          let renamedBinderLctx := lctxWithBinder.setUserName fvarId (Name.mkSimple binderName)
+          let binderLocalInsts ← getLocalInstances
+          let applied := Expr.app handler binder
+          let (bodyLines, used'') ← renderExprToTactics applied renamedBinderLctx binderLocalInsts used'
+          let lines :=
+            [ "  classical"
+            , "  apply Classical.byContradiction"
+            , s!"  intro {binderName}" ] ++ bodyLines
+          return some (lines, used'')
+        else
+          return none
+
+end
 
 
 /--
@@ -125,25 +147,15 @@ elab "showProofTerm " thm:ident : command => do
       | throwError "{thm} does not have an associated proof term"
       let expandedValue ← expandAuxiliaryProofs value
       Meta.lambdaTelescope expandedValue fun xs bodyExpr => do
-        let (introNames, renamedLctx, usedNames) ← assignIntroNames xs
+        let (introNames, renamedLctx, usedNames) ← assignIntroNames xs []
         let localInstances ← getLocalInstances
-        let specialBlock? ← formatByContradiction? bodyExpr renamedLctx usedNames localInstances
-        let exactSection ←
-          match specialBlock? with
-          | some block => pure block
-          | none => do
-              let bodyFmt ← withLCtx renamedLctx localInstances <|
-                withOptions (fun o =>
-                  let o := o.setBool `pp.notation false
-                  o.setBool `pp.all true) <|
-                    Meta.ppExpr bodyExpr
-              let bodyStr := bodyFmt.pretty
-              pure s!"  exact\n{indentLines bodyStr 4}"
-        let introsLine :=
+        let (bodyLines, _) ← renderExprToTactics bodyExpr renamedLctx localInstances usedNames
+        let introsLines :=
           match introNames with
-          | [] => ""
-          | ns => s!"  intros {String.intercalate " " ns}\n"
-        let tacticBlock := s!"{introsLine}{exactSection}"
+          | [] => []
+          | ns => [s!"  intros {String.intercalate " " ns}"]
+        let tacticLines := introsLines ++ bodyLines
+        let tacticBlock := String.intercalate "\n" tacticLines
         let scriptTerm := s!"by\n{tacticBlock}"
         let scriptSyntax ←
           match Parser.runParserCategory (env := env) `term scriptTerm with
@@ -155,7 +167,7 @@ elab "showProofTerm " thm:ident : command => do
             Term.elabTerm scriptSyntax (some decl.type)
           Term.synthesizeSyntheticMVars
           _ ← instantiateMVars elaborated
-        catch err =>
+        catch err : Exception =>
           let msg ← err.toMessageData.format
           throwError s!"Generated tactic block failed to elaborate:\n{msg.pretty}"
         finally
