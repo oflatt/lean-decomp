@@ -41,8 +41,14 @@ elab "showProofTerm " thm:ident : command => do
     let some value := decl.value?
       | throwError "{thm} does not have an associated proof term"
     let expandedValue ← expandAuxiliaryProofs value
-    let proofFmt ← Meta.ppExpr expandedValue
-    let typeFmt ← Meta.ppExpr decl.type
+    let proofFmt ← withOptions (fun o =>
+      let o := o.setBool `pp.notation false
+      o.setBool `pp.all true) <|
+        Meta.ppExpr expandedValue
+    let typeFmt ← withOptions (fun o =>
+      let o := o.setBool `pp.notation false
+      o.setBool `pp.all true) <|
+        Meta.ppExpr decl.type
     let typeStr := typeFmt.pretty
     let proofStr := proofFmt.pretty
     Lean.Meta.Tactic.TryThis.addSuggestion (← getRef)

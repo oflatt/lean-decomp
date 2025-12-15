@@ -46,58 +46,184 @@ theorem cases_if_of_false {B S T s t} (hcond : ¬ B s) : (ifThenElse B S T, s) =
   grind
 
 
-#print cases_if_of_true
+showProofTerm cases_if_of_true
 
-theorem cases_if_of_true2 : ∀ {B : State → Prop} {S T : Stmt} {s t : State}, B s → (ifThenElse B S T,s) ==> t → (S,s) ==> t :=
-  fun {B} {S T} {s t} hcond h =>
-  Classical.byContradiction fun h_1 =>
-    id
-      (BigStep.casesOn (motive := fun a a_1 a_2 x => ifThenElse B S T = a → s = a_1 → t = a_2 → h ≍ x → False) h
-        (fun s_1 =>
-          Lean.Grind.intro_with_eq (ifThenElse B S T = skip) False (s = s_1 → t = s_1 → h ≍ BigStep.skip s_1 → False)
-            (eq_false' fun h => False.elim (noConfusion_of_Nat Stmt.ctorIdx h)) fun h_2 =>
-            False.casesOn (fun x => s = s_1 → t = s_1 → h ≍ BigStep.skip s_1 → False) h_2)
-        (fun x a s_1 =>
-          Lean.Grind.intro_with_eq (ifThenElse B S T = assign x a) False
-            (s = s_1 → (t = fun v => if v = x then a s_1 else s_1 v) → h ≍ BigStep.assign x a s_1 → False)
-            (eq_false' fun h => False.elim (noConfusion_of_Nat Stmt.ctorIdx h)) fun h_2 =>
-            False.casesOn
-              (fun x_1 => s = s_1 → (t = fun v => if v = x then a s_1 else s_1 v) → h ≍ BigStep.assign x a s_1 → False)
+theorem cases_if_of_true2 : ∀ {B : State → Prop} {S T : Stmt} {s t : State} (hcond : B s), BigStep (Stmt.ifThenElse B S T) s t → BigStep S s t :=
+  by
+  intros B S T s t hcond h
+  exact
+  @Classical.byContradiction (BigStep S s t) fun (h_1 : Not (BigStep S s t)) =>
+    @id.{0} False
+      (@BigStep.casesOn
+        (fun (a : Stmt) (a_1 a_2 : State) (x : BigStep a a_1 a_2) =>
+          ∀ (h_2 : @Eq.{1} Stmt (Stmt.ifThenElse B S T) a) (h_3 : @Eq.{1} State s a_1) (h_4 : @Eq.{1} State t a_2)
+            (h : @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep a a_1 a_2) x), False)
+        (Stmt.ifThenElse B S T) s t h
+        (fun (s_1 : State) =>
+          Lean.Grind.intro_with_eq.{0} (@Eq.{1} Stmt (Stmt.ifThenElse B S T) Stmt.skip) False
+            (∀ (h_2 : @Eq.{1} State s s_1) (h_3 : @Eq.{1} State t s_1)
+              (h : @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep Stmt.skip s_1 s_1) (BigStep.skip s_1)),
+              False)
+            (@eq_false' (@Eq.{1} Stmt (Stmt.ifThenElse B S T) Stmt.skip)
+              fun (h : @Eq.{1} Stmt (Stmt.ifThenElse B S T) Stmt.skip) =>
+              @False.elim.{0} False (@noConfusion_of_Nat.{1} Stmt Stmt.ctorIdx (Stmt.ifThenElse B S T) Stmt.skip h))
+            fun (h_2 : False) =>
+            False.casesOn.{0}
+              (fun (x : False) =>
+                ∀ (h_3 : @Eq.{1} State s s_1) (h_4 : @Eq.{1} State t s_1)
+                  (h : @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep Stmt.skip s_1 s_1) (BigStep.skip s_1)),
+                  False)
               h_2)
-        (fun {S_1 T_1} {s_1 t_1 u} hS hT =>
-          Lean.Grind.intro_with_eq (ifThenElse B S T = S_1;; T_1) False
-            (s = s_1 → t = u → h ≍ BigStep.seq hS hT → False)
-            (eq_false' fun h => False.elim (noConfusion_of_Nat Stmt.ctorIdx h)) fun h_2 =>
-            False.casesOn (fun x => s = s_1 → t = u → h ≍ BigStep.seq hS hT → False) h_2)
-        (fun {B_1} {s_1 t_1} hcond_1 S_1 T_1 hbody h_2 =>
-          Stmt.ifThenElse.noConfusion h_2 fun a_eq a_eq_1 a_eq_2 h_3 h_4 =>
-            False.elim
-              (Eq.mp
-                (Eq.trans
-                  (Eq.trans (Eq.symm (eq_true hbody))
-                    (congr (congr (congrArg BigStep (Eq.symm a_eq_1)) (Eq.symm h_3)) (Eq.symm h_4)))
-                  (eq_false h_1))
+        (fun (x : Variable) (a : State → Nat) (s_1 : State) =>
+          Lean.Grind.intro_with_eq.{0} (@Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.assign x a)) False
+            (∀ (h_2 : @Eq.{1} State s s_1)
+              (h_3 :
+                @Eq.{1} State t fun (v : Variable) =>
+                  @ite.{1} Nat (@Eq.{1} Variable v x) (instDecidableEqString v x) (a s_1) (s_1 v))
+              (h :
+                @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h
+                  (BigStep (Stmt.assign x a) s_1 fun (v : Variable) =>
+                    @ite.{1} Nat (@Eq.{1} Variable v x) (instDecidableEqString v x) (a s_1) (s_1 v))
+                  (BigStep.assign x a s_1)),
+              False)
+            (@eq_false' (@Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.assign x a))
+              fun (h : @Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.assign x a)) =>
+              @False.elim.{0} False
+                (@noConfusion_of_Nat.{1} Stmt Stmt.ctorIdx (Stmt.ifThenElse B S T) (Stmt.assign x a) h))
+            fun (h_2 : False) =>
+            False.casesOn.{0}
+              (fun (x_1 : False) =>
+                ∀ (h_3 : @Eq.{1} State s s_1)
+                  (h_4 :
+                    @Eq.{1} State t fun (v : Variable) =>
+                      @ite.{1} Nat (@Eq.{1} Variable v x) (instDecidableEqString v x) (a s_1) (s_1 v))
+                  (h :
+                    @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h
+                      (BigStep (Stmt.assign x a) s_1 fun (v : Variable) =>
+                        @ite.{1} Nat (@Eq.{1} Variable v x) (instDecidableEqString v x) (a s_1) (s_1 v))
+                      (BigStep.assign x a s_1)),
+                  False)
+              h_2)
+        (fun {S_1 T_1 : Stmt} {s_1 t_1 u : State} (hS : BigStep S_1 s_1 t_1) (hT : BigStep T_1 t_1 u) =>
+          Lean.Grind.intro_with_eq.{0} (@Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.seq S_1 T_1)) False
+            (∀ (h_2 : @Eq.{1} State s s_1) (h_3 : @Eq.{1} State t u)
+              (h :
+                @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep (Stmt.seq S_1 T_1) s_1 u)
+                  (@BigStep.seq S_1 T_1 s_1 t_1 u hS hT)),
+              False)
+            (@eq_false' (@Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.seq S_1 T_1))
+              fun (h : @Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.seq S_1 T_1)) =>
+              @False.elim.{0} False
+                (@noConfusion_of_Nat.{1} Stmt Stmt.ctorIdx (Stmt.ifThenElse B S T) (Stmt.seq S_1 T_1) h))
+            fun (h_2 : False) =>
+            False.casesOn.{0}
+              (fun (x : False) =>
+                ∀ (h_3 : @Eq.{1} State s s_1) (h_4 : @Eq.{1} State t u)
+                  (h :
+                    @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep (Stmt.seq S_1 T_1) s_1 u)
+                      (@BigStep.seq S_1 T_1 s_1 t_1 u hS hT)),
+                  False)
+              h_2)
+        (fun {B_1 : State → Prop} {s_1 t_1 : State} (hcond_1 : B_1 s_1) (S_1 T_1 : Stmt) (hbody : BigStep S_1 s_1 t_1)
+            (h_2 : @Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.ifThenElse B_1 S_1 T_1)) =>
+          @Stmt.ifThenElse.noConfusion.{0}
+            (∀ (h_3 : @Eq.{1} State s s_1) (h_4 : @Eq.{1} State t t_1)
+              (h :
+                @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep (Stmt.ifThenElse B_1 S_1 T_1) s_1 t_1)
+                  (@BigStep.if_true B_1 s_1 t_1 hcond_1 S_1 T_1 hbody)),
+              False)
+            B S T B_1 S_1 T_1 h_2
+            fun (a_eq : @Eq.{1} (State → Prop) B B_1) (a_eq_1 : @Eq.{1} Stmt S S_1) (a_eq_2 : @Eq.{1} Stmt T T_1)
+              (h_3 : @Eq.{1} State s s_1) (h_4 : @Eq.{1} State t t_1) =>
+            @False.elim.{0}
+              (∀
+                (h :
+                  @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep (Stmt.ifThenElse B_1 S_1 T_1) s_1 t_1)
+                    (@BigStep.if_true B_1 s_1 t_1 hcond_1 S_1 T_1 hbody)),
+                False)
+              (@Eq.mp.{0} True False
+                (@Eq.trans.{1} Prop True (BigStep S s t) False
+                  (@Eq.trans.{1} Prop True (BigStep S_1 s_1 t_1) (BigStep S s t)
+                    (@Eq.symm.{1} Prop (BigStep S_1 s_1 t_1) True (@eq_true (BigStep S_1 s_1 t_1) hbody))
+                    (@congr.{1, 1} State Prop (BigStep S_1 s_1) (BigStep S s) t_1 t
+                      (@congr.{1, 1} State (State → Prop) (BigStep S_1) (BigStep S) s_1 s
+                        (@congrArg.{1, 1} Stmt (State → State → Prop) S_1 S BigStep (@Eq.symm.{1} Stmt S S_1 a_eq_1))
+                        (@Eq.symm.{1} State s s_1 h_3))
+                      (@Eq.symm.{1} State t t_1 h_4)))
+                  (@eq_false (BigStep S s t) h_1))
                 True.intro))
-        (fun {B_1} {s_1 t_1} hcond_1 S_1 T_1 hbody h_2 =>
-          Stmt.ifThenElse.noConfusion h_2 fun a_eq a_eq_1 a_eq_2 h_3 =>
-            False.elim
-              (Eq.mp
-                (Eq.trans
-                  (Eq.trans (Eq.symm (eq_true hcond))
-                    (eq_of_heq (a_eq ▸ (fun a a' e_1 => e_1 ▸ HEq.refl (B a)) s s_1 h_3)))
-                  (eq_false hcond_1))
+        (fun {B_1 : State → Prop} {s_1 t_1 : State} (hcond_1 : Not (B_1 s_1)) (S_1 T_1 : Stmt)
+            (hbody : BigStep T_1 s_1 t_1) (h_2 : @Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.ifThenElse B_1 S_1 T_1)) =>
+          @Stmt.ifThenElse.noConfusion.{0}
+            (∀ (h_3 : @Eq.{1} State s s_1) (h_4 : @Eq.{1} State t t_1)
+              (h :
+                @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep (Stmt.ifThenElse B_1 S_1 T_1) s_1 t_1)
+                  (@BigStep.if_false B_1 s_1 t_1 hcond_1 S_1 T_1 hbody)),
+              False)
+            B S T B_1 S_1 T_1 h_2
+            fun (a_eq : @Eq.{1} (State → Prop) B B_1) (a_eq_1 : @Eq.{1} Stmt S S_1) (a_eq_2 : @Eq.{1} Stmt T T_1)
+              (h_3 : @Eq.{1} State s s_1) =>
+            @False.elim.{0}
+              (∀ (h_4 : @Eq.{1} State t t_1)
+                (h :
+                  @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep (Stmt.ifThenElse B_1 S_1 T_1) s_1 t_1)
+                    (@BigStep.if_false B_1 s_1 t_1 hcond_1 S_1 T_1 hbody)),
+                False)
+              (@Eq.mp.{0} True False
+                (@Eq.trans.{1} Prop True (B_1 s_1) False
+                  (@Eq.trans.{1} Prop True (B s) (B_1 s_1) (@Eq.symm.{1} Prop (B s) True (@eq_true (B s) hcond))
+                    (@eq_of_heq.{1} Prop (B s) (B_1 s_1)
+                      (@Eq.ndrec.{0, 1} (State → Prop) B (fun (x : State → Prop) => @HEq.{1} Prop (B s) Prop (x s_1))
+                        ((fun (a a' : State) (e_1 : @Eq.{1} State a a') =>
+                            @Eq.ndrec.{0, 1} State a (fun (a' : State) => @HEq.{1} Prop (B a) Prop (B a'))
+                              (@HEq.refl.{1} Prop (B a)) a' e_1)
+                          s s_1 h_3)
+                        B_1 a_eq)))
+                  (@eq_false (B_1 s_1) hcond_1))
                 True.intro))
-        (fun {B_1} {S_1} {s_1 t_1 u} hcond_1 hbody hrest =>
-          Lean.Grind.intro_with_eq (ifThenElse B S T = whileDo B_1 S_1) False
-            (s = s_1 → t = u → h ≍ BigStep.while_true hcond_1 hbody hrest → False)
-            (eq_false' fun h => False.elim (noConfusion_of_Nat Stmt.ctorIdx h)) fun h_2 =>
-            False.casesOn (fun x => s = s_1 → t = u → h ≍ BigStep.while_true hcond_1 hbody hrest → False) h_2)
-        (fun {B_1} {S_1} {s_1} hcond_1 =>
-          Lean.Grind.intro_with_eq (ifThenElse B S T = whileDo B_1 S_1) False
-            (s = s_1 → t = s_1 → h ≍ BigStep.while_false hcond_1 → False)
-            (eq_false' fun h => False.elim (noConfusion_of_Nat Stmt.ctorIdx h)) fun h_2 =>
-            False.casesOn (fun x => s = s_1 → t = s_1 → h ≍ BigStep.while_false hcond_1 → False) h_2)
-        (Eq.refl (ifThenElse B S T)) (Eq.refl s) (Eq.refl t) (HEq.refl h))
+        (fun {B_1 : State → Prop} {S_1 : Stmt} {s_1 t_1 u : State} (hcond_1 : B_1 s_1) (hbody : BigStep S_1 s_1 t_1)
+            (hrest : BigStep (Stmt.whileDo B_1 S_1) t_1 u) =>
+          Lean.Grind.intro_with_eq.{0} (@Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.whileDo B_1 S_1)) False
+            (∀ (h_2 : @Eq.{1} State s s_1) (h_3 : @Eq.{1} State t u)
+              (h :
+                @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep (Stmt.whileDo B_1 S_1) s_1 u)
+                  (@BigStep.while_true B_1 S_1 s_1 t_1 u hcond_1 hbody hrest)),
+              False)
+            (@eq_false' (@Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.whileDo B_1 S_1))
+              fun (h : @Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.whileDo B_1 S_1)) =>
+              @False.elim.{0} False
+                (@noConfusion_of_Nat.{1} Stmt Stmt.ctorIdx (Stmt.ifThenElse B S T) (Stmt.whileDo B_1 S_1) h))
+            fun (h_2 : False) =>
+            False.casesOn.{0}
+              (fun (x : False) =>
+                ∀ (h_3 : @Eq.{1} State s s_1) (h_4 : @Eq.{1} State t u)
+                  (h :
+                    @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep (Stmt.whileDo B_1 S_1) s_1 u)
+                      (@BigStep.while_true B_1 S_1 s_1 t_1 u hcond_1 hbody hrest)),
+                  False)
+              h_2)
+        (fun {B_1 : State → Prop} {S_1 : Stmt} {s_1 : State} (hcond_1 : Not (B_1 s_1)) =>
+          Lean.Grind.intro_with_eq.{0} (@Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.whileDo B_1 S_1)) False
+            (∀ (h_2 : @Eq.{1} State s s_1) (h_3 : @Eq.{1} State t s_1)
+              (h :
+                @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep (Stmt.whileDo B_1 S_1) s_1 s_1)
+                  (@BigStep.while_false B_1 S_1 s_1 hcond_1)),
+              False)
+            (@eq_false' (@Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.whileDo B_1 S_1))
+              fun (h : @Eq.{1} Stmt (Stmt.ifThenElse B S T) (Stmt.whileDo B_1 S_1)) =>
+              @False.elim.{0} False
+                (@noConfusion_of_Nat.{1} Stmt Stmt.ctorIdx (Stmt.ifThenElse B S T) (Stmt.whileDo B_1 S_1) h))
+            fun (h_2 : False) =>
+            False.casesOn.{0}
+              (fun (x : False) =>
+                ∀ (h_3 : @Eq.{1} State s s_1) (h_4 : @Eq.{1} State t s_1)
+                  (h :
+                    @HEq.{0} (BigStep (Stmt.ifThenElse B S T) s t) h (BigStep (Stmt.whileDo B_1 S_1) s_1 s_1)
+                      (@BigStep.while_false B_1 S_1 s_1 hcond_1)),
+                  False)
+              h_2)
+        (@Eq.refl.{1} Stmt (Stmt.ifThenElse B S T)) (@Eq.refl.{1} State s) (@Eq.refl.{1} State t)
+        (@HEq.refl.{0} (BigStep (Stmt.ifThenElse B S T) s t) h))
 
 theorem if_iff {B S T s t} : (ifThenElse B S T, s) ==> t ↔ (B s ∧ (S, s) ==> t) ∨ (¬ B s ∧ (T, s) ==> t) := by
   grind =>
