@@ -57,3 +57,5 @@ theorem if_iff {B S T s t} : (ifThenElse B S T, s) ==> t ↔ (B s ∧ (S, s) ==>
     · cases #1c13
 
 end
+
+showProofTerm cases_if_of_true
