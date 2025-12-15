@@ -67,68 +67,86 @@ private def assignIntroNames (xs : Array Expr) (used0 : List String) : MetaM (Li
 private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
   Meta.deltaExpand e isAuxiliaryProofName
 
-mutual
+private def renderExactSection (expr : Expr) : MetaM (List String) := do
+  let bodyFmt ← withOptions (fun o =>
+    let o := o.setBool `pp.notation false
+    o.setBool `pp.all true) <|
+      Meta.ppExpr expr
+  let bodyLines := bodyFmt.pretty.splitOn "\n"
+  let indented := bodyLines.map (fun line => "    " ++ line)
+  return "  exact" :: indented
 
-  private partial def renderExprToTactics (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (List String × List String) := do
-    withLCtx lctx localInsts do
-      Meta.lambdaTelescope expr fun xs body => do
-        if xs.size > 0 then
-          let (introNames, newLctx, used') ← assignIntroNames xs used
-          let newLocalInsts ← getLocalInstances
-          let (bodyLines, used'') ← renderExprToTactics body newLctx newLocalInsts used'
-          let introLines :=
-            if introNames.isEmpty then []
-            else [s!"  intros {String.intercalate " " introNames}"]
-          return (introLines ++ bodyLines, used'')
-        else
-          match ← renderByContradiction? expr lctx localInsts used with
-          | some res => pure res
-          | none => do
-              let bodyFmt ← withOptions (fun o =>
-                let o := o.setBool `pp.notation false
-                o.setBool `pp.all true) <|
-                  Meta.ppExpr expr
-              let bodyLines := bodyFmt.pretty.splitOn "\n"
-              let indented := bodyLines.map (fun line => "    " ++ line)
-              return ("  exact" :: indented, used)
-
-  private partial def renderByContradiction? (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (List String × List String)) := do
-    withLCtx lctx localInsts do
-      let rec peel (e : Expr) (acc : List Expr) : Expr × List Expr :=
-        match e with
-        | Expr.app f arg => peel f (arg :: acc)
-        | _ => (e, acc)
-      let (fn, args) := peel expr []
-      let some constName := Expr.constName? fn
-        | return none
+private def detectContradictionHandler (expr : Expr) : Option Expr :=
+  let rec peel (e : Expr) (acc : List Expr) : Expr × List Expr :=
+    match e with
+    | Expr.app f arg => peel f (arg :: acc)
+    | _ => (e, acc)
+  let (fn, args) := peel expr []
+  match Expr.constName? fn with
+  | some constName =>
       if constName != ``Classical.byContradiction then
-        return none
-      let some handler := args.getLast?
-        | return none
-      let handlerType ← Meta.inferType handler
-      Meta.forallTelescope handlerType fun binders _ => do
-        if binders.size = 1 then
-          let binder := binders[0]!
-          let lctxWithBinder ← getLCtx
-          let some fvarId := binder.fvarId?
-            | throwError "Unexpected non-fvar binder in byContradiction handler"
-          let decl ← fvarId.getDecl
-          let (binderName, used') := chooseIntroName used.length decl.userName used
-          let renamedBinderLctx := lctxWithBinder.setUserName fvarId (Name.mkSimple binderName)
-          let binderLocalInsts ← getLocalInstances
-          let applied := Expr.app handler binder
-          let (bodyLines, used'') ← renderExprToTactics applied renamedBinderLctx binderLocalInsts used'
-          let lines :=
-            [ "  classical"
-            , "  apply Classical.byContradiction"
-            , s!"  intro {binderName}" ] ++ bodyLines
-          return some (lines, used'')
-        else
-          return none
+        none
+      else
+        args.getLast?
+  | none => none
 
-end
+private def renderContradiction
+    (renderExprToTactics : Expr → LocalContext → LocalInstances → List String →
+      MetaM (List String × List String))
+    (handler : Expr) (lctx : LocalContext) (localInsts : LocalInstances)
+    (used : List String) : MetaM (Option (List String × List String)) := do
+  withLCtx lctx localInsts do
+    let handlerType ← Meta.inferType handler
+    Meta.forallTelescope handlerType fun binders _ => do
+      if binders.size = 1 then
+        let binder := binders[0]!
+        let lctxWithBinder ← getLCtx
+        let some fvarId := binder.fvarId?
+          | throwError "Unexpected non-fvar binder in byContradiction handler"
+        let decl ← fvarId.getDecl
+        let (binderName, used') := chooseIntroName used.length decl.userName used
+        let renamedBinderLctx := lctxWithBinder.setUserName fvarId (Name.mkSimple binderName)
+        let binderLocalInsts ← getLocalInstances
+        let applied := Expr.app handler binder
+        let (bodyLines, used'') ← renderExprToTactics applied renamedBinderLctx binderLocalInsts used'
+        let lines :=
+          [ "  classical"
+          , "  apply Classical.byContradiction"
+          , s!"  intro {binderName}" ] ++ bodyLines
+        return some (lines, used'')
+      else
+        return none
+
+private def renderLambda
+    (renderExprToTactics : Expr → LocalContext → LocalInstances → List String →
+      MetaM (List String × List String))
+    (expr : Expr) (used : List String) : MetaM (List String × List String) := do
+  Meta.lambdaTelescope expr fun xs body => do
+    let (introNames, newLctx, used') ← assignIntroNames xs used
+    let newLocalInsts ← getLocalInstances
+    let (bodyLines, used'') ← renderExprToTactics body newLctx newLocalInsts used'
+    let introLines :=
+      if introNames.isEmpty then []
+      else [s!"  intros {String.intercalate " " introNames}"]
+    return (introLines ++ bodyLines, used'')
+
+private partial def renderExprToTactics (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) : MetaM (List String × List String) := do
+  withLCtx lctx localInsts do
+    let expr ← Meta.whnf expr
+    match expr with
+  | Expr.lam .. => renderLambda renderExprToTactics expr used
+    | _ =>
+    match detectContradictionHandler expr with
+    | some handler =>
+      match ← renderContradiction renderExprToTactics handler lctx localInsts used with
+      | some res => pure res
+      | none => do
+        let lines ← renderExactSection expr
+        return (lines, used)
+    | none => do
+      let lines ← renderExactSection expr
+      return (lines, used)
 
 
 /--
