@@ -45,6 +45,7 @@ theorem cases_if_of_true {B S T s t} (hcond : B s) : (ifThenElse B S T, s) ==> t
 theorem cases_if_of_false {B S T s t} (hcond : ¬ B s) : (ifThenElse B S T, s) ==> t → (T, s) ==> t := by
   grind
 
+
 showProofTerm cases_if_of_true
 
 theorem if_iff {B S T s t} : (ifThenElse B S T, s) ==> t ↔ (B s ∧ (S, s) ==> t) ∨ (¬ B s ∧ (T, s) ==> t) := by
@@ -57,5 +58,3 @@ theorem if_iff {B S T s t} : (ifThenElse B S T, s) ==> t ↔ (B s ∧ (S, s) ==>
     · cases #1c13
 
 end
-
-showProofTerm cases_if_of_true

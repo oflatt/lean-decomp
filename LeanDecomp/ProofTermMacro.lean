@@ -67,22 +67,34 @@ private def assignIntroNames (xs : Array Expr) (used0 : List String) : MetaM (Li
 private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
   Meta.deltaExpand e isAuxiliaryProofName
 
+inductive TacticAst where
+  | intro (names : List String)
+  | simple (text : String)
+  | exactBlock (lines : List String)
+
+namespace TacticAst
+
+def render : TacticAst → List String
+  | intro [] => []
+  | intro names => [s!"  intros {String.intercalate " " names}"]
+  | simple text => [s!"  {text}"]
+  | exactBlock lines => lines
+
+end TacticAst
+
+private def renderTacticScript (tactics : List TacticAst) : List String :=
+  tactics.foldr (fun tac acc => TacticAst.render tac ++ acc) []
+
 mutual
 
   private partial def renderExprToTactics (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (List String × List String) := do
+      (localInsts : LocalInstances) (used : List String) : MetaM (List TacticAst × List String) := do
     withLCtx lctx localInsts do
       Meta.lambdaTelescope expr fun xs body => do
         if xs.size > 0 then
-          let (introNames, newLctx, used') ← assignIntroNames xs used
-          let newLocalInsts ← getLocalInstances
-          let (bodyLines, used'') ← renderExprToTactics body newLctx newLocalInsts used'
-          let introLines :=
-            if introNames.isEmpty then []
-            else [s!"  intros {String.intercalate " " introNames}"]
-          return (introLines ++ bodyLines, used'')
+          renderIntroCase xs body lctx localInsts used
         else
-          match ← renderByContradiction? expr lctx localInsts used with
+          match ← renderByContradictionCase expr lctx localInsts used with
           | some res => pure res
           | none => do
               let bodyFmt ← withOptions (fun o =>
@@ -91,10 +103,22 @@ mutual
                   Meta.ppExpr expr
               let bodyLines := bodyFmt.pretty.splitOn "\n"
               let indented := bodyLines.map (fun line => "    " ++ line)
-              return ("  exact" :: indented, used)
+              let block := "  exact" :: indented
+              return ([TacticAst.exactBlock block], used)
 
-  private partial def renderByContradiction? (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (List String × List String)) := do
+  private partial def renderIntroCase (xs : Array Expr) (body : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (List TacticAst × List String) := do
+    withLCtx lctx localInsts do
+      let (introNames, newLctx, used') ← assignIntroNames xs used
+      let newLocalInsts ← getLocalInstances
+      let (bodyTactics, used'') ← renderExprToTactics body newLctx newLocalInsts used'
+      let introNodes :=
+        if introNames.isEmpty then []
+        else [TacticAst.intro introNames]
+      return (introNodes ++ bodyTactics, used'')
+
+  private partial def renderByContradictionCase (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (List TacticAst × List String)) := do
     withLCtx lctx localInsts do
       let rec peel (e : Expr) (acc : List Expr) : Expr × List Expr :=
         match e with
@@ -119,12 +143,12 @@ mutual
           let renamedBinderLctx := lctxWithBinder.setUserName fvarId (Name.mkSimple binderName)
           let binderLocalInsts ← getLocalInstances
           let applied := Expr.app handler binder
-          let (bodyLines, used'') ← renderExprToTactics applied renamedBinderLctx binderLocalInsts used'
-          let lines :=
-            [ "  classical"
-            , "  apply Classical.byContradiction"
-            , s!"  intro {binderName}" ] ++ bodyLines
-          return some (lines, used'')
+          let (bodyTactics, used'') ← renderExprToTactics applied renamedBinderLctx binderLocalInsts used'
+          let header :=
+            [ TacticAst.simple "classical",
+              TacticAst.simple "apply Classical.byContradiction",
+              TacticAst.simple s!"intro {binderName}" ]
+          return some (header ++ bodyTactics, used'')
         else
           return none
 
@@ -149,12 +173,12 @@ elab "showProofTerm " thm:ident : command => do
       Meta.lambdaTelescope expandedValue fun xs bodyExpr => do
         let (introNames, renamedLctx, usedNames) ← assignIntroNames xs []
         let localInstances ← getLocalInstances
-        let (bodyLines, _) ← renderExprToTactics bodyExpr renamedLctx localInstances usedNames
-        let introsLines :=
+        let (bodyTactics, _) ← renderExprToTactics bodyExpr renamedLctx localInstances usedNames
+        let introTactics :=
           match introNames with
           | [] => []
-          | ns => [s!"  intros {String.intercalate " " ns}"]
-        let tacticLines := introsLines ++ bodyLines
+          | ns => [TacticAst.intro ns]
+        let tacticLines := renderTacticScript (introTactics ++ bodyTactics)
         let tacticBlock := String.intercalate "\n" tacticLines
         let scriptTerm := s!"by\n{tacticBlock}"
         let scriptSyntax ←
