@@ -1,7 +1,9 @@
 import Lean
+import Lean.Meta.Tactic.TryThis
 
 namespace LeanDecomp
-open Lean Elab Command Meta
+open Lean Elab Command Meta Tactic
+open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax addSuggestion)
 
 private def startsWithChars : List Char → List Char → Bool
   | [], _ => true
@@ -70,55 +72,52 @@ private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
 inductive TacticAst where
   | intro (names : List String)
   | simple (text : String)
-  | exactBlock (lines : List String)
+  | exact (term : String)
+  | seq (tactics : List TacticAst)
 
 namespace TacticAst
 
-def render : TacticAst → List String
+partial def render : TacticAst → List String
   | intro [] => []
   | intro names => [s!"  intros {String.intercalate " " names}"]
   | simple text => [s!"  {text}"]
-  | exactBlock lines => lines
+  | exact term => [s!"  exact {term}"]
+  | seq tactics => tactics.flatMap render
 
 end TacticAst
-
-private def renderTacticScript (tactics : List TacticAst) : List String :=
-  tactics.foldr (fun tac acc => TacticAst.render tac ++ acc) []
 
 mutual
 
   private partial def renderExprToTactics (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (List TacticAst × List String) := do
+      (localInsts : LocalInstances) (used : List String) : MetaM (TacticAst × List String) := do
     withLCtx lctx localInsts do
       Meta.lambdaTelescope expr fun xs body => do
         if xs.size > 0 then
-          renderIntroCase xs body lctx localInsts used
+          -- Use the current local context from inside lambdaTelescope
+          let telescopeLctx ← getLCtx
+          let telescopeInsts ← getLocalInstances
+          renderIntroCase xs body telescopeLctx telescopeInsts used
         else
           match ← renderByContradictionCase expr lctx localInsts used with
           | some res => pure res
           | none => do
-              let bodyFmt ← withOptions (fun o =>
-                let o := o.setBool `pp.notation false
-                o.setBool `pp.all true) <|
-                  Meta.ppExpr expr
-              let bodyLines := bodyFmt.pretty.splitOn "\n"
-              let indented := bodyLines.map (fun line => "    " ++ line)
-              let block := "  exact" :: indented
-              return ([TacticAst.exactBlock block], used)
+              let termStx ← delabToRefinableSyntax expr
+              let termStr := termStx.raw.prettyPrint.pretty
+              return (TacticAst.exact termStr, used)
 
   private partial def renderIntroCase (xs : Array Expr) (body : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (List TacticAst × List String) := do
+      (localInsts : LocalInstances) (used : List String) : MetaM (TacticAst × List String) := do
     withLCtx lctx localInsts do
       let (introNames, newLctx, used') ← assignIntroNames xs used
       let newLocalInsts ← getLocalInstances
       let (bodyTactics, used'') ← renderExprToTactics body newLctx newLocalInsts used'
-      let introNodes :=
-        if introNames.isEmpty then []
-        else [TacticAst.intro introNames]
-      return (introNodes ++ bodyTactics, used'')
+      let introNode :=
+        if introNames.isEmpty then TacticAst.seq []
+        else TacticAst.intro introNames
+      return (TacticAst.seq [introNode, bodyTactics], used'')
 
   private partial def renderByContradictionCase (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (List TacticAst × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (TacticAst × List String)) := do
     withLCtx lctx localInsts do
       let rec peel (e : Expr) (acc : List Expr) : Expr × List Expr :=
         match e with
@@ -144,11 +143,11 @@ mutual
           let binderLocalInsts ← getLocalInstances
           let applied := Expr.app handler binder
           let (bodyTactics, used'') ← renderExprToTactics applied renamedBinderLctx binderLocalInsts used'
-          let header :=
+          let header := TacticAst.seq
             [ TacticAst.simple "classical",
               TacticAst.simple "apply Classical.byContradiction",
               TacticAst.simple s!"intro {binderName}" ]
-          return some (header ++ bodyTactics, used'')
+          return some (TacticAst.seq [header, bodyTactics], used'')
         else
           return none
 
@@ -174,11 +173,12 @@ elab "showProofTerm " thm:ident : command => do
         let (introNames, renamedLctx, usedNames) ← assignIntroNames xs []
         let localInstances ← getLocalInstances
         let (bodyTactics, _) ← renderExprToTactics bodyExpr renamedLctx localInstances usedNames
-        let introTactics :=
+        let introTactic :=
           match introNames with
-          | [] => []
-          | ns => [TacticAst.intro ns]
-        let tacticLines := renderTacticScript (introTactics ++ bodyTactics)
+          | [] => TacticAst.seq []
+          | ns => TacticAst.intro ns
+        let tactics := TacticAst.seq [introTactic, bodyTactics]
+        let tacticLines := tactics.render
         let tacticBlock := String.intercalate "\n" tacticLines
         let scriptTerm := s!"by\n{tacticBlock}"
         let scriptSyntax ←
@@ -203,5 +203,23 @@ elab "showProofTerm " thm:ident : command => do
         let typeStr := typeFmt.pretty
         let theoremStr := s!"theorem {constName} : {typeStr} := by\n{tacticBlock}"
         Lean.Meta.Tactic.TryThis.addSuggestion (← getRef) theoremStr
+
+/--
+`decompile` wraps a tactic sequence, runs it, captures the proof term,
+and suggests an equivalent tactic script.
+Usage: `decompile simp [foo]` or `decompile { simp; ring }`
+-/
+elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainContext do
+  let goalMVar ← getMainGoal
+  evalTactic (← `(tacticSeq| $t))
+  let proof ← instantiateMVars (mkMVar goalMVar)
+  let expandedProof ← expandAuxiliaryProofs proof
+  let lctx ← getLCtx
+  let localInstances ← getLocalInstances
+  let (tactics, _) ← renderExprToTactics expandedProof lctx localInstances []
+  let tacticLines := tactics.render
+  let tacticBlock := String.intercalate "\n" tacticLines
+  let suggestion := s!"by\n{tacticBlock}"
+  addSuggestion tk suggestion (origSpan? := ← getRef)
 
 end LeanDecomp

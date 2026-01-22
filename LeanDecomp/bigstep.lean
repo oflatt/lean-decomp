@@ -37,14 +37,19 @@ notation:55 "(" S:55 "," s:55 ")" " ==> " t:55 => BigStep S s t
 example {B S T s t} (hcond : B s) : (ifThenElse B S T, s) ==> t → (S, s) ==> t := by
   grind [BigStep]
 
+
 attribute [grind] BigStep
 
 theorem cases_if_of_true {B S T s t} (hcond : B s) : (ifThenElse B S T, s) ==> t → (S, s) ==> t := by
-  grind
+  grind -abstractProof
 
 theorem cases_if_of_false {B S T s t} (hcond : ¬ B s) : (ifThenElse B S T, s) ==> t → (T, s) ==> t := by
-  grind
+  grind -abstractProof
 
+
+-- can use -abstractProof to avoid one level of indirection
+-- how to detect auxiliary proofs? use something like is_auxilliary_name is_internal_name, detect underscore patterns?
+#print cases_if_of_true
 
 showProofTerm cases_if_of_true
 
