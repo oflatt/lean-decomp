@@ -20,7 +20,7 @@ example : 2 + 2 = 4 := by
 /--
 info: Try this:
   [apply] by
-    intros h
+    intro h
     exact  h
 -/
 #guard_msgs in
@@ -51,7 +51,7 @@ example (P Q : Prop) (h : P → Q) (a : P) : Q := by
 /--
 info: Try this:
   [apply] by
-    intros n
+    intro n
     exact  Nat.zero_add  n
 -/
 #guard_msgs in

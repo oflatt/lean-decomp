@@ -1,6 +1,8 @@
 import LeanDecomp.ProofTermMacro
+import Lean.Elab.GuardMsgs
 
-@[expose] public section
+namespace LeanDecomp.BigStepTest
+
 abbrev Variable := String
 
 def State := Variable → Nat
@@ -41,25 +43,15 @@ example {B S T s t} (hcond : B s) : (ifThenElse B S T, s) ==> t → (S, s) ==> t
 attribute [grind] BigStep
 
 theorem cases_if_of_true {B S T s t} (hcond : B s) : (ifThenElse B S T, s) ==> t → (S, s) ==> t := by
-  grind -abstractProof
+  grind
 
 theorem cases_if_of_false {B S T s t} (hcond : ¬ B s) : (ifThenElse B S T, s) ==> t → (T, s) ==> t := by
-  grind -abstractProof
+  grind
 
 
--- can use -abstractProof to avoid one level of indirection
--- how to detect auxiliary proofs? use something like is_auxilliary_name is_internal_name, detect underscore patterns?
-#print cases_if_of_true
-
-showProofTerm cases_if_of_true
 
 theorem if_iff {B S T s t} : (ifThenElse B S T, s) ==> t ↔ (B s ∧ (S, s) ==> t) ∨ (¬ B s ∧ (T, s) ==> t) := by
-  grind =>
-    instantiate only [BigStep.if_true, BigStep.if_false]
-    cases #8de8
-    · cases #52a7
-      · cases #860f
-      · cases #74ed <;> cases #860f
-    · cases #1c13
+  grind
 
-end
+
+end LeanDecomp.BigStepTest

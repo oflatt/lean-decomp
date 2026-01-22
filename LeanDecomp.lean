@@ -1,2 +1,1 @@
 import LeanDecomp.ProofTermMacro
-import LeanDecomp.ProofTermMacroTest

@@ -1,4 +1,3 @@
-import LeanDecomp.ProofTermMacroTest
 import LeanDecomp.bigstep
 
 def main : IO Unit :=
