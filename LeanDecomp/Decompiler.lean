@@ -48,29 +48,23 @@ private def assignIntroNames (xs : Array Expr) (used0 : List String) : MetaM (Li
     idx := idx + 1
   return (names.reverse, lctx, used)
 
-/-- AST representation of tactics for rendering. -/
-inductive TacticAst where
-  | intro (names : List String)
-  | simple (text : String)
-  | exact (term : String)
-  | seq (tactics : List TacticAst)
+/-- Convert intro names to identifier syntax -/
+private def namesToIdents (names : List String) : Array Ident :=
+  names.toArray.map (fun n => mkIdent (Name.mkSimple n))
 
-namespace TacticAst
+/-- Build a tacticSeq from an array of tactics -/
+private def mkTacticSeq (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax ``Lean.Parser.Tactic.tacticSeq) := do
+  `(Lean.Parser.Tactic.tacticSeq| $[$tacs]*)
 
-partial def render : TacticAst → List String
-  | intro [] => []
-  | intro names => [s!"  intro {String.intercalate " " names}"]
-  | simple text => [s!"  {text}"]
-  | exact term => [s!"  exact {term}"]
-  | seq tactics => tactics.flatMap render
-
-end TacticAst
+/-- Flatten nested arrays of tactics -/
+private def flattenTactics (tacss : List (Array (TSyntax `tactic))) : Array (TSyntax `tactic) :=
+  tacss.foldl (· ++ ·) #[]
 
 mutual
 
-  /-- Convert a proof term expression into a TacticAst. -/
+  /-- Convert a proof term expression into tactic syntax. -/
   partial def renderExprToTactics (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (TacticAst × List String) := do
+      (localInsts : LocalInstances) (used : List String) : MetaM (Array (TSyntax `tactic) × List String) := do
     withLCtx lctx localInsts do
       Meta.lambdaTelescope expr fun xs body => do
         if xs.size > 0 then
@@ -83,23 +77,25 @@ mutual
           | some res => pure res
           | none => do
               let termStx ← delabToRefinableSyntax expr
-              let fmt ← ppTerm termStx
-              let termStr := fmt.pretty
-              return (TacticAst.exact termStr, used)
+              let tac ← `(tactic| exact $termStx)
+              return (#[tac], used)
 
   private partial def renderIntroCase (xs : Array Expr) (body : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (TacticAst × List String) := do
+      (localInsts : LocalInstances) (used : List String) : MetaM (Array (TSyntax `tactic) × List String) := do
     withLCtx lctx localInsts do
       let (introNames, newLctx, used') ← assignIntroNames xs used
       let newLocalInsts ← getLocalInstances
       let (bodyTactics, used'') ← renderExprToTactics body newLctx newLocalInsts used'
-      let introNode :=
-        if introNames.isEmpty then TacticAst.seq []
-        else TacticAst.intro introNames
-      return (TacticAst.seq [introNode, bodyTactics], used'')
+      let introTac ← if introNames.isEmpty then
+          pure #[]
+        else
+          let idents := namesToIdents introNames
+          let tac ← `(tactic| intro $[$idents]*)
+          pure #[tac]
+      return (introTac ++ bodyTactics, used'')
 
   private partial def renderByContradictionCase (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (TacticAst × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let rec peel (e : Expr) (acc : List Expr) : Expr × List Expr :=
         match e with
@@ -125,10 +121,12 @@ mutual
           let binderLocalInsts ← getLocalInstances
           let applied := Expr.app handler binder
           let (bodyTactics, used'') ← renderExprToTactics applied renamedBinderLctx binderLocalInsts used'
-          let header := TacticAst.seq
-            [ TacticAst.simple "apply Classical.byContradiction",
-              TacticAst.simple s!"intro {binderName}" ]
-          return some (TacticAst.seq [header, bodyTactics], used'')
+          let binderIdent := mkIdent (Name.mkSimple binderName)
+          -- Use mkIdent without macro scopes to avoid hygiene marks in output
+          let byContradictionIdent : Ident := ⟨mkIdent ``Classical.byContradiction |>.raw.setInfo .none⟩
+          let applyTac ← `(tactic| apply $byContradictionIdent:ident)
+          let introTac ← `(tactic| intro $binderIdent:ident)
+          return some (#[applyTac, introTac] ++ bodyTactics, used'')
         else
           return none
 end
