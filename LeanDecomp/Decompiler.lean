@@ -1,8 +1,9 @@
 import Lean
 import Lean.Meta.Tactic.TryThis
+import Lean.PrettyPrinter
 
 namespace LeanDecomp
-open Lean Elab Meta
+open Lean Elab Meta PrettyPrinter
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
 private def binderBaseName (idx : Nat) (name : Name) : String :=
@@ -82,7 +83,8 @@ mutual
           | some res => pure res
           | none => do
               let termStx ← delabToRefinableSyntax expr
-              let termStr := termStx.raw.prettyPrint.pretty
+              let fmt ← ppTerm termStx
+              let termStr := fmt.pretty
               return (TacticAst.exact termStr, used)
 
   private partial def renderIntroCase (xs : Array Expr) (body : Expr) (lctx : LocalContext)
@@ -124,13 +126,11 @@ mutual
           let applied := Expr.app handler binder
           let (bodyTactics, used'') ← renderExprToTactics applied renamedBinderLctx binderLocalInsts used'
           let header := TacticAst.seq
-            [ TacticAst.simple "classical",
-              TacticAst.simple "apply Classical.byContradiction",
+            [ TacticAst.simple "apply Classical.byContradiction",
               TacticAst.simple s!"intro {binderName}" ]
           return some (TacticAst.seq [header, bodyTactics], used'')
         else
           return none
-
 end
 
 end LeanDecomp

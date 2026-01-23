@@ -37,7 +37,7 @@ inductive BigStep : Stmt → State → State → Prop where
 notation:55 "(" S:55 "," s:55 ")" " ==> " t:55 => BigStep S s t
 
 example {B S T s t} (hcond : B s) : (ifThenElse B S T, s) ==> t → (S, s) ==> t := by
-  grind [BigStep]
+  decompile grind [BigStep]
 
 
 attribute [grind] BigStep

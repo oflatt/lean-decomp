@@ -29,16 +29,19 @@ private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
   Meta.deltaExpand e isAuxiliaryProofName
 
 /-- Validate that a generated tactic script actually proves a goal with the given type and local context. -/
-private def validateTacticScript (tacticLines : List String) (suggestion : String)
+private def validateTacticScript (tacticLines : List String)
     (goalType : Expr) (lctx : LocalContext) (localInstances : LocalInstances) : TacticM Unit := do
   let env ← getEnv
-  -- Wrap in braces so it parses as a proper tactic sequence
-  let trimmedLines := tacticLines.map (fun s => (s.dropWhile (· == ' ')).toString)
-  let wrappedTactics := "{ " ++ String.intercalate "; " trimmedLines ++ " }"
+  -- Join tactic lines with semicolons (each line is a complete tactic)
+  -- and wrap in braces for parsing as a single tactic block
+  let trimmedLines := tacticLines.map (·.trimAscii.toString)
+  let singleLine := String.intercalate "; " trimmedLines
+  let wrappedTactics := "{" ++ singleLine ++ "}"
+  let tacticBlock := String.intercalate "\n" tacticLines
   let tacticSyntax ←
     match Parser.runParserCategory (env := env) `tactic wrappedTactics with
     | Except.ok stx => pure stx
-    | Except.error err => throwError s!"decompile: failed to parse generated tactic block:\n{err}\n\nGenerated:\n{suggestion}"
+    | Except.error err => throwError s!"decompile: failed to parse generated tactic block:\n{err}\n\nGenerated:\n{tacticBlock}"
   -- Create a fresh goal with the same type and local context, then try to solve it
   let savedState ← saveState
   try
@@ -47,10 +50,10 @@ private def validateTacticScript (tacticLines : List String) (suggestion : Strin
     evalTactic tacticSyntax
     let remainingGoals ← getGoals
     unless remainingGoals.isEmpty do
-      throwError s!"decompile: generated tactics did not close the goal\n\nGenerated:\n{suggestion}"
+      throwError s!"decompile: generated tactics did not close the goal\n\nGenerated:\n{tacticBlock}"
   catch err : Exception =>
     let msg ← err.toMessageData.format
-    throwError s!"decompile: generated tactic block failed to elaborate:\n{msg.pretty}\n\nGenerated:\n{suggestion}"
+    throwError s!"decompile: generated tactic block failed to elaborate:\n{msg.pretty}\n\nGenerated:\n{tacticBlock}"
   finally
     savedState.restore
 
@@ -69,9 +72,8 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   let localInstances ← getLocalInstances
   let (tactics, _) ← renderExprToTactics expandedProof lctx localInstances []
   let tacticLines := tactics.render
+  validateTacticScript tacticLines goalType lctx localInstances
   let tacticBlock := String.intercalate "\n" tacticLines
-  let suggestion := s!"by\n{tacticBlock}"
-  validateTacticScript tacticLines suggestion goalType lctx localInstances
-  addSuggestion tk suggestion (origSpan? := ← getRef)
+  addSuggestion tk tacticBlock (origSpan? := ← getRef)
 
 end LeanDecomp

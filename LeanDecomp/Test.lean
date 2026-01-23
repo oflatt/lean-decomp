@@ -9,8 +9,7 @@ theorem simple_arith : 2 + 2 = 4 :=
 
 /--
 info: Try this:
-  [apply] by
-    exact  of_decide_eq_true  id  Eq.refl  true
+  [apply]   exact of_decide_eq_true (id (Eq.refl true))
 -/
 #guard_msgs in
 example : 2 + 2 = 4 := by
@@ -19,9 +18,8 @@ example : 2 + 2 = 4 := by
 -- Test 2: Simple implication with intro
 /--
 info: Try this:
-  [apply] by
-    intro h
-    exact  h
+  [apply]   intro h
+    exact h
 -/
 #guard_msgs in
 example (P : Prop) : P → P := by
@@ -30,8 +28,7 @@ example (P : Prop) : P → P := by
 -- Test 3: And introduction
 /--
 info: Try this:
-  [apply] by
-    exact  ⟨  ha  ,  hb  ⟩
+  [apply]   exact ⟨ha, hb⟩
 -/
 #guard_msgs in
 example (a b : Prop) (ha : a) (hb : b) : a ∧ b := by
@@ -40,8 +37,7 @@ example (a b : Prop) (ha : a) (hb : b) : a ∧ b := by
 -- Test 4: Modus ponens
 /--
 info: Try this:
-  [apply] by
-    exact  h  a
+  [apply]   exact h a
 -/
 #guard_msgs in
 example (P Q : Prop) (h : P → Q) (a : P) : Q := by
@@ -50,9 +46,8 @@ example (P Q : Prop) (h : P → Q) (a : P) : Q := by
 -- Test 5: Universal statement
 /--
 info: Try this:
-  [apply] by
-    intro n
-    exact  Nat.zero_add  n
+  [apply]   intro n
+    exact Nat.zero_add n
 -/
 #guard_msgs in
 example : ∀ n : Nat, 0 + n = n := by
