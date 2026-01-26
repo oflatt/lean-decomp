@@ -82,7 +82,8 @@ mutual
         else
           let specialized? ← firstSomeM [
             tryDecompByContradiction expr lctx localInsts used,
-            tryDecompBetaRedex expr lctx localInsts used
+            tryDecompBetaRedex expr lctx localInsts used,
+            tryDecompId expr lctx localInsts used
           ]
           match specialized? with
           | some res => pure res
@@ -170,6 +171,30 @@ mutual
       let argIdent := mkIdent argName
       let letTac ← `(tactic| let $letBinderIdent := $argIdent)
       return some (#[letTac] ++ bodyTactics, used'')
+
+  /-- Handle `@id T body` - extract the body into a let binding with type annotation.
+      Transform `@id T body` into `let prf : T := by <decompiled body>; exact prf` -/
+  private partial def tryDecompId (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+    withLCtx lctx localInsts do
+      -- Check if expr is `@id T body`
+      let .app fn body := expr | return none
+      let .app idConst typeArg := fn | return none
+      let some constName := idConst.constName? | return none
+      if constName != ``id then return none
+      -- Decompile the body
+      let (bodyTactics, used') ← decompileExpr body lctx localInsts used
+      -- Create a fresh name for the proof
+      let (prfName, used'') := chooseIntroName used'.length `prf used'
+      let prfIdent := mkIdent (Name.mkSimple prfName)
+      -- Delaborate the type
+      let typeStx ← delabToRefinableSyntax typeArg
+      -- Build: let prf : T := by <bodyTactics>
+      let bodyTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$bodyTactics]*)
+      let letTac ← `(tactic| let $prfIdent : $typeStx := by $bodyTacticSeq)
+      -- Build: exact prf
+      let exactTac ← `(tactic| exact $prfIdent)
+      return some (#[letTac, exactTac], used'')
 
 end
 
