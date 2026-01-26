@@ -60,10 +60,17 @@ private def mkTacticSeq (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax ``Lean
 private def flattenTactics (tacss : List (Array (TSyntax `tactic))) : Array (TSyntax `tactic) :=
   tacss.foldl (· ++ ·) #[]
 
+/-- Try a list of computations in order, returning the first `some` result. -/
+private def firstSomeM [Monad m] (xs : List (m (Option α))) : m (Option α) := do
+  for x in xs do
+    if let some res ← x then
+      return some res
+  return none
+
 mutual
 
   /-- Convert a proof term expression into tactic syntax. -/
-  partial def renderExprToTactics (expr : Expr) (lctx : LocalContext)
+  partial def decompileExpr (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Array (TSyntax `tactic) × List String) := do
     withLCtx lctx localInsts do
       Meta.lambdaTelescope expr fun xs body => do
@@ -71,21 +78,25 @@ mutual
           -- Use the current local context from inside lambdaTelescope
           let telescopeLctx ← getLCtx
           let telescopeInsts ← getLocalInstances
-          renderIntroCase xs body telescopeLctx telescopeInsts used
+          tryDecompIntro xs body telescopeLctx telescopeInsts used
         else
-          match ← renderByContradictionCase expr lctx localInsts used with
+          let specialized? ← firstSomeM [
+            tryDecompByContradiction expr lctx localInsts used,
+            tryDecompBetaRedex expr lctx localInsts used
+          ]
+          match specialized? with
           | some res => pure res
           | none => do
               let termStx ← delabToRefinableSyntax expr
               let tac ← `(tactic| exact $termStx)
               return (#[tac], used)
 
-  private partial def renderIntroCase (xs : Array Expr) (body : Expr) (lctx : LocalContext)
+  private partial def tryDecompIntro (xs : Array Expr) (body : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Array (TSyntax `tactic) × List String) := do
     withLCtx lctx localInsts do
       let (introNames, newLctx, used') ← assignIntroNames xs used
       let newLocalInsts ← getLocalInstances
-      let (bodyTactics, used'') ← renderExprToTactics body newLctx newLocalInsts used'
+      let (bodyTactics, used'') ← decompileExpr body newLctx newLocalInsts used'
       let introTac ← if introNames.isEmpty then
           pure #[]
         else
@@ -94,7 +105,7 @@ mutual
           pure #[tac]
       return (introTac ++ bodyTactics, used'')
 
-  private partial def renderByContradictionCase (expr : Expr) (lctx : LocalContext)
+  private partial def tryDecompByContradiction (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let rec peel (e : Expr) (acc : List Expr) : Expr × List Expr :=
@@ -120,15 +131,46 @@ mutual
           let renamedBinderLctx := lctxWithBinder.setUserName fvarId (Name.mkSimple binderName)
           let binderLocalInsts ← getLocalInstances
           let applied := Expr.app handler binder
-          let (bodyTactics, used'') ← renderExprToTactics applied renamedBinderLctx binderLocalInsts used'
+          let (bodyTactics, used'') ← decompileExpr applied renamedBinderLctx binderLocalInsts used'
           let binderIdent := mkIdent (Name.mkSimple binderName)
-          -- Use mkIdent without macro scopes to avoid hygiene marks in output
+          -- Use mkIdent with no info to avoid hygiene marks (✝) in pretty-printed output
           let byContradictionIdent : Ident := ⟨mkIdent ``Classical.byContradiction |>.raw.setInfo .none⟩
           let applyTac ← `(tactic| apply $byContradictionIdent:ident)
           let introTac ← `(tactic| intro $binderIdent:ident)
           return some (#[applyTac, introTac] ++ bodyTactics, used'')
         else
           return none
+
+  /-- Handle beta redex: `(fun x => body) arg` where arg is an fvar.
+      Transform to `let x := arg; body` to avoid immediate application in output. -/
+  private partial def tryDecompBetaRedex (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+    withLCtx lctx localInsts do
+      -- Check if expr is `(fun x => body) arg` where arg is an fvar
+      let .app fn arg := expr | return none
+      let .lam binderName binderType body _binderInfo := fn | return none
+      let some argFvarId := arg.fvarId? | return none
+      -- Get the name of the argument variable
+      let argDecl ← argFvarId.getDecl
+      let argName := argDecl.userName
+      -- Use the lambda's binder name for the let binding (it will shadow)
+      let letBinderName := binderBaseName used.length binderName
+      let letBinderId := FVarId.mk (← mkFreshId)
+      -- Add the let declaration to the local context
+      let newLctx := lctx.mkLetDecl letBinderId (Name.mkSimple letBinderName) binderType arg
+      let newLocalInsts ← getLocalInstances
+      -- Mark the let binder name as used for future naming
+      let used' := letBinderName :: used
+      -- Substitute the new fvar for the bound variable in body
+      let newBody := body.instantiate1 (Expr.fvar letBinderId)
+      -- Recursively render the body
+      let (bodyTactics, used'') ← decompileExpr newBody newLctx newLocalInsts used'
+      -- Build the let tactic: `let letBinderName := argName`
+      let letBinderIdent := mkIdent (Name.mkSimple letBinderName)
+      let argIdent := mkIdent argName
+      let letTac ← `(tactic| let $letBinderIdent := $argIdent)
+      return some (#[letTac] ++ bodyTactics, used'')
+
 end
 
 end LeanDecomp

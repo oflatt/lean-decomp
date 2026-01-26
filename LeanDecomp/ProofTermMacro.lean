@@ -44,9 +44,9 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   let expandedProof ← expandAuxiliaryProofs proof
   let lctx ← getLCtx
   let localInstances ← getLocalInstances
-  -- Render to syntax with pp.all for re-elaboration
+  -- Decompile to syntax with pp.all for re-elaboration
   let (tactics, _) ← withOptions (fun o => o.setBool `pp.all true) do
-    renderExprToTactics expandedProof lctx localInstances []
+    decompileExpr expandedProof lctx localInstances []
   validateTactics tactics goalType lctx localInstances
   -- Build a tacticSeq from the array of tactics
   let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
