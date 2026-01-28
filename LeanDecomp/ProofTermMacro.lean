@@ -1,7 +1,6 @@
 import Lean
 import Lean.Meta.Tactic.TryThis
 import LeanDecomp.Decompiler
-import LeanDecomp.Simplify
 
 namespace LeanDecomp
 open Lean Elab Command Meta Tactic
@@ -13,24 +12,27 @@ private def isAuxiliaryProofName (name : Name) : Bool :=
 private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
   Meta.deltaExpand e isAuxiliaryProofName
 
-/-- Validate that a generated tactic sequence actually proves a goal with the given type and local context. -/
-private def validateTactics (tactics : Array (TSyntax `tactic))
-    (goalType : Expr) (lctx : LocalContext) (localInstances : LocalInstances) : TacticM Unit := do
-  -- Create a fresh goal with the same type and local context, then try to solve it
-  let savedState ← saveState
-  try
-    let testGoal ← Meta.mkFreshExprMVarAt lctx localInstances goalType .syntheticOpaque `testGoal
-    setGoals [testGoal.mvarId!]
-    for tac in tactics do
-      evalTactic tac
-    let remainingGoals ← getGoals
-    unless remainingGoals.isEmpty do
-      throwError "decompile: generated tactics did not close the goal"
-  catch err : Exception =>
-    let msg ← err.toMessageData.format
-    throwError s!"decompile: generated tactic block failed to elaborate:\n{msg.pretty}"
-  finally
-    savedState.restore
+/-- Run tactics, throwing a decompile error if they give an error -/
+private def runDecompiled (tactics : Array (TSyntax `tactic)) : TacticM Unit := do
+  -- Save initial message log to restore later (suppressing intermediate errors)
+  let initialMsgs ← Core.getMessageLog
+  let initialMsgCount := initialMsgs.toList.length
+
+  for tac in tactics do
+    evalTactic tac
+  let remainingGoals ← getGoals
+  unless remainingGoals.isEmpty do
+    throwError "decompile: generated tactics did not close the goal"
+
+  -- Check for logged errors
+  let finalMsgs ← Core.getMessageLog
+  let newMsgs := finalMsgs.toList.drop initialMsgCount
+  let errorMsgs := newMsgs.filter (·.severity == .error)
+  unless errorMsgs.isEmpty do
+    -- Restore original message log to suppress the duplicate errors
+    Core.setMessageLog initialMsgs
+    let errorStr := String.intercalate "\n" (← errorMsgs.mapM (fun m => do return (← m.data.format).pretty))
+    throwError s!"decompile: generated tactic block had errors:\n{errorStr}"
 
 /--
 `decompile` wraps a tactic sequence, runs it, captures the proof term,
@@ -38,21 +40,31 @@ and suggests an equivalent tactic script.
 Usage: `decompile simp [foo]` or `decompile { simp; ring }`
 -/
 elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainContext do
+
   let goalMVar ← getMainGoal
-  let goalType ← goalMVar.getType
+  let stateBefore ← saveState
+
   evalTactic (← `(tacticSeq| $t))
+
+  let stateAfter ← saveState
   let proof ← instantiateMVars (mkMVar goalMVar)
+
   let expandedProof ← expandAuxiliaryProofs proof
   let lctx ← getLCtx
   let localInstances ← getLocalInstances
   -- Decompile to syntax with pp.all for re-elaboration
   let (tactics, _) ← withOptions (fun o => o.setBool `pp.all true) do
     decompileExpr expandedProof lctx localInstances []
-  -- Simplify the generated tactics (remove impossible cases, etc.)
-  let simplifiedTactics ← simplifyTactics tactics
-  validateTactics simplifiedTactics goalType lctx localInstances
+
+  -- restore the original state with the original goal
+  stateBefore.restore
+
+  -- run the newly generated tactics to ensure they work
+  runDecompiled tactics
+
   -- Build a tacticSeq from the array of tactics
-  let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$simplifiedTactics]*)
+  let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
   addSuggestion tk tacticSeq (origSpan? := ← getRef)
+
 
 end LeanDecomp

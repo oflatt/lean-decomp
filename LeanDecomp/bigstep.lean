@@ -40,6 +40,7 @@ example {B S T s t} (hcond : B s) : (ifThenElse B S T, s) ==> t → (S, s) ==> t
   decompile grind [BigStep]
 
 
+
 attribute [grind] BigStep
 
 theorem cases_if_of_true {B S T s t} (hcond : B s) : (ifThenElse B S T, s) ==> t → (S, s) ==> t := by
