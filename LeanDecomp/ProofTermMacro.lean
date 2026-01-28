@@ -1,6 +1,7 @@
 import Lean
 import Lean.Meta.Tactic.TryThis
 import LeanDecomp.Decompiler
+import LeanDecomp.Simplify
 
 namespace LeanDecomp
 open Lean Elab Command Meta Tactic
@@ -47,9 +48,11 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   -- Decompile to syntax with pp.all for re-elaboration
   let (tactics, _) ← withOptions (fun o => o.setBool `pp.all true) do
     decompileExpr expandedProof lctx localInstances []
-  validateTactics tactics goalType lctx localInstances
+  -- Simplify the generated tactics (remove impossible cases, etc.)
+  let simplifiedTactics ← simplifyTactics tactics
+  validateTactics simplifiedTactics goalType lctx localInstances
   -- Build a tacticSeq from the array of tactics
-  let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
+  let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$simplifiedTactics]*)
   addSuggestion tk tacticSeq (origSpan? := ← getRef)
 
 end LeanDecomp

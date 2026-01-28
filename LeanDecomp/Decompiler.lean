@@ -83,7 +83,7 @@ mutual
         else
           let specialized? ← firstSomeM [
             tryDecompByContradiction expr lctx localInsts used,
-            tryDecompCasesOn expr lctx localInsts used,
+            tryDecompCasesOn expr lctx localInsts used decompileExpr assignIntroNames,
             tryDecompBetaRedex expr lctx localInsts used,
             tryDecompId expr lctx localInsts used
           ]
@@ -139,51 +139,6 @@ mutual
           return some (#[applyTac, introTac] ++ bodyTactics, used'')
         else
           return none
-
-  /-- Handle `*.casesOn` applications - generate a `cases` tactic.
-      Detects when expr is an application of an inductive type's casesOn eliminator. -/
-  private partial def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
-    withLCtx lctx localInsts do
-      let some info ← parseCasesOn expr
-        | return none
-      let ctorNames := info.indVal.ctors
-      -- Get the discriminant as syntax (should be an fvar in most cases)
-      let discriminantStx ← delabToRefinableSyntax info.discriminant
-      -- Build the cases tactic with named alternatives
-      let mut alts : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt) := #[]
-      let mut used := used
-      for (ctorName, caseBranch) in ctorNames.zip info.caseBranches do
-        -- Extract just the constructor name (last component)
-        let ctorShortName := ctorName.getString!
-        let ctorIdent := mkIdent (Name.mkSimple ctorShortName)
-        -- Each case branch is a lambda - use lambdaTelescope to enter it
-        -- and recursively decompile the body
-        let (branchTactics, used') ← Meta.lambdaTelescope caseBranch fun xs body => do
-          if xs.size > 0 then
-            let telescopeLctx ← getLCtx
-            let telescopeInsts ← getLocalInstances
-            -- Assign names to the introduced variables
-            let (introNames, newLctx, used') ← assignIntroNames xs used
-            -- Recursively decompile the body
-            let (bodyTactics, used'') ← decompileExpr body newLctx telescopeInsts used'
-            -- Build intro tactic for the case arguments
-            let introTac ← if introNames.isEmpty then
-                pure #[]
-              else
-                let idents := namesToIdents introNames
-                let tac ← `(tactic| intro $[$idents]*)
-                pure #[tac]
-            return (introTac ++ bodyTactics, used'')
-          else
-            decompileExpr body lctx localInsts used
-        used := used'
-        -- Build the case alternative
-        let branchTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$branchTactics]*)
-        let altStx ← `(Lean.Parser.Tactic.inductionAlt| | $ctorIdent => $branchTacticSeq)
-        alts := alts.push altStx
-      let casesTac ← `(tactic| cases $discriminantStx:term with $[$alts:inductionAlt]*)
-      return some (#[casesTac], used)
 
   /-- Handle beta redex: `(fun x => body) arg` where arg is an fvar.
       Transform to `let x := arg; body` to avoid immediate application in output. -/
