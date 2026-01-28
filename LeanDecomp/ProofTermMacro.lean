@@ -14,6 +14,11 @@ private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
 
 /-- Run tactics, throwing a decompile error if they give an error -/
 private def runDecompiled (tactics : Array (TSyntax `tactic)) : TacticM Unit := do
+  -- Build tacticSeq upfront for error reporting
+  let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
+  let tacticSeqFmt ← PrettyPrinter.ppCategory `Lean.Parser.Tactic.tacticSeq tacticSeq
+  let tacticSeqStr := tacticSeqFmt.pretty
+
   -- Save initial message log to restore later (suppressing intermediate errors)
   let initialMsgs ← Core.getMessageLog
   let initialMsgCount := initialMsgs.toList.length
@@ -22,7 +27,7 @@ private def runDecompiled (tactics : Array (TSyntax `tactic)) : TacticM Unit := 
     evalTactic tac
   let remainingGoals ← getGoals
   unless remainingGoals.isEmpty do
-    throwError "decompile: generated tactics did not close the goal"
+    throwError s!"decompile: generated tactics did not close the goal\n\nGenerated tacticSeq:\n{tacticSeqStr}"
 
   -- Check for logged errors
   let finalMsgs ← Core.getMessageLog
@@ -32,7 +37,7 @@ private def runDecompiled (tactics : Array (TSyntax `tactic)) : TacticM Unit := 
     -- Restore original message log to suppress the duplicate errors
     Core.setMessageLog initialMsgs
     let errorStr := String.intercalate "\n" (← errorMsgs.mapM (fun m => do return (← m.data.format).pretty))
-    throwError s!"decompile: generated tactic block had errors:\n{errorStr}"
+    throwError s!"decompile: generated tactic block had errors:\n{errorStr}\n\nGenerated tacticSeq:\n{tacticSeqStr}"
 
 /--
 `decompile` wraps a tactic sequence, runs it, captures the proof term,
@@ -46,7 +51,6 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
 
   evalTactic (← `(tacticSeq| $t))
 
-  let stateAfter ← saveState
   let proof ← instantiateMVars (mkMVar goalMVar)
 
   let expandedProof ← expandAuxiliaryProofs proof
