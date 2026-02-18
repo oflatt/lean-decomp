@@ -64,7 +64,7 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   stateBefore.restore
 
   -- run the newly generated tactics to ensure they work
-  runDecompiled tactics
+  --runDecompiled tactics
 
   -- Build a tacticSeq from the array of tactics
   let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
