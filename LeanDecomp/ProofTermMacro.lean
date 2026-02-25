@@ -70,5 +70,28 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
   addSuggestion tk tacticSeq (origSpan? := ← getRef)
 
+/--
+`showterm` wraps a tactic sequence, runs it, captures the proof term,
+and prints it as a message.
+Usage: `showterm simp [foo]` or `showterm { simp; ring }`
+-/
+elab "showterm " t:tacticSeq : tactic => withMainContext do
+  let goalMVar ← getMainGoal
+  evalTactic (← `(tacticSeq| $t))
+  let proof ← instantiateMVars (mkMVar goalMVar)
+  let expandedProof ← expandAuxiliaryProofs proof
+  let fmt ← ppExpr expandedProof
+  logInfo m!"proof term:\n{fmt}"
+
+
+elab "showtermexpanded " t:tacticSeq : tactic => withMainContext do
+  withOptions (fun o => o.setBool `pp.all true) do
+    let goalMVar ← getMainGoal
+    evalTactic (← `(tacticSeq| $t))
+    let proof ← instantiateMVars (mkMVar goalMVar)
+    let expandedProof ← expandAuxiliaryProofs proof
+    let fmt ← ppExpr expandedProof
+    logInfo m!"proof term:\n{fmt}"
+
 
 end LeanDecomp

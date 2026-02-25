@@ -170,18 +170,18 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     let some info ← parseCasesOn expr
       | return none
     let ctorNames := info.indVal.ctors
-    -- Get the discriminant's type to determine which constructors could match
-    let discriminantType ← inferType info.discriminant
     -- Get the discriminant as syntax (should be an fvar in most cases)
     let discriminantStx ← delabToRefinableSyntax info.discriminant
     -- Build the cases tactic with named alternatives
     let mut alts : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt) := #[]
     let mut used := used
+
+
+    -- TODO find actual name
+    let discriminantNameOpt : Option String := some "h"
+    let some discriminantName := discriminantNameOpt | return none
+
     for (ctorName, caseBranch) in ctorNames.zip info.caseBranches do
-      -- Check if this constructor could possibly match the discriminant
-      let couldMatch ← couldConstructorMatch ctorName discriminantType
-      if !couldMatch then
-        continue
       -- Extract just the constructor name (last component)
       let ctorShortName := ctorName.getString!
       let ctorIdent := mkIdent (Name.mkSimple ctorShortName)
@@ -259,7 +259,8 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
       let branchTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$branchTactics]*)
       let altStx ← `(Lean.Parser.Tactic.inductionAlt| | $ctorIdent => $branchTacticSeq)
       alts := alts.push altStx
-    let casesTac ← `(tactic| cases $discriminantStx:term with $[$alts:inductionAlt]*)
+    let hIdent : TSyntax `Lean.binderIdent ← `(Lean.binderIdent| $(mkIdent (Name.mkSimple discriminantName)):ident)
+    let casesTac ← `(tactic| cases $hIdent : $discriminantStx:term with $[$alts:inductionAlt]*)
     return some (#[casesTac], used)
 
 end LeanDecomp

@@ -1,0 +1,9 @@
+Stmt.casesOn (motive := fun t => s = t → (s == Stmt.skip || s == Stmt.other) = true) s
+  (fun h => Eq.symm h ▸ of_decide_eq_true (id (Eq.refl true)))
+  (fun h => Eq.symm h ▸ of_decide_eq_true (id (Eq.refl true))) (Eq.refl s)
+
+
+cases on type:
+LeanDecomp.BigStepTest.Stmt.casesOn.{u} : {motive : Stmt → Sort u} →
+  (t : Stmt) → motive Stmt.skip → motive Stmt.other → motive t :=
+fun {motive} t skip other => Stmt.rec skip other t
