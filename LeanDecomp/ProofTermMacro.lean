@@ -13,31 +13,26 @@ private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
   Meta.deltaExpand e isAuxiliaryProofName
 
 /-- Run tactics, throwing a decompile error if they give an error -/
-private def runDecompiled (tactics : Array (TSyntax `tactic)) : TacticM Unit := do
-  -- Build tacticSeq upfront for error reporting
-  let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
-  let tacticSeqFmt ← PrettyPrinter.ppCategory `Lean.Parser.Tactic.tacticSeq tacticSeq
-  let tacticSeqStr := tacticSeqFmt.pretty
+private def runDecompiled (tactics : TSyntax `Lean.Parser.Tactic.tacticSeq) : TacticM Unit := do
+  let savedState ← saveState
+  let savedMsgs ← Core.getMessageLog
+  -- Suppress intermediate error messages during validation
+  Core.setMessageLog {}
+  try
+    withCurrHeartbeats do
+      withoutRecover do
+        evalTactic tactics
+    -- Check if any errors were logged (e.g., by `cases` alternatives)
+    let newMsgs ← Core.getMessageLog
+    Core.setMessageLog savedMsgs
+    if newMsgs.hasErrors then
+      savedState.restore
+      throwError "decompile failed: generated tactics did not re-elaborate"
+  catch _ =>
+    savedState.restore
+    Core.setMessageLog savedMsgs
+    throwError "decompile failed: generated tactics did not re-elaborate"
 
-  -- Save initial message log to restore later (suppressing intermediate errors)
-  let initialMsgs ← Core.getMessageLog
-  let initialMsgCount := initialMsgs.toList.length
-
-  for tac in tactics do
-    evalTactic tac
-  let remainingGoals ← getGoals
-  unless remainingGoals.isEmpty do
-    throwError s!"decompile: generated tactics did not close the goal\n\nGenerated tacticSeq:\n{tacticSeqStr}"
-
-  -- Check for logged errors
-  let finalMsgs ← Core.getMessageLog
-  let newMsgs := finalMsgs.toList.drop initialMsgCount
-  let errorMsgs := newMsgs.filter (·.severity == .error)
-  unless errorMsgs.isEmpty do
-    -- Restore original message log to suppress the duplicate errors
-    Core.setMessageLog initialMsgs
-    let errorStr := String.intercalate "\n" (← errorMsgs.mapM (fun m => do return (← m.data.format).pretty))
-    throwError s!"decompile: generated tactic block had errors:\n{errorStr}\n\nGenerated tacticSeq:\n{tacticSeqStr}"
 
 /--
 `decompile` wraps a tactic sequence, runs it, captures the proof term,
@@ -49,7 +44,7 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   let goalMVar ← getMainGoal
   let stateBefore ← saveState
 
-  evalTactic (← `(tacticSeq| $t))
+  evalTactic t
 
   let proof ← instantiateMVars (mkMVar goalMVar)
 
@@ -64,10 +59,11 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   stateBefore.restore
 
   -- run the newly generated tactics to ensure they work
-  --runDecompiled tactics
 
   -- Build a tacticSeq from the array of tactics
   let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
+
+  runDecompiled tacticSeq
   addSuggestion tk tacticSeq (origSpan? := ← getRef)
 
 /--
