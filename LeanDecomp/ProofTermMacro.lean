@@ -27,11 +27,11 @@ private def runDecompiled (tactics : TSyntax `Lean.Parser.Tactic.tacticSeq) : Ta
     Core.setMessageLog savedMsgs
     if newMsgs.hasErrors then
       savedState.restore
-      throwError "decompile failed: generated tactics did not re-elaborate"
+      logError "decompile failed: generated tactics did not re-elaborate"
   catch _ =>
     savedState.restore
     Core.setMessageLog savedMsgs
-    throwError "decompile failed: generated tactics did not re-elaborate"
+    logError "decompile failed: generated tactics did not re-elaborate"
 
 
 /--
