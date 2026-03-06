@@ -218,7 +218,10 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
         let ctorParamCount := xs.size - numTrailingEq
         let mut ctorParams : Array Expr := #[]
         for i in List.range ctorParamCount do
-          ctorParams := ctorParams.push xs[i]!
+          let x := xs[i]!
+          let xDecl ← getFVarLocalDecl x
+          if xDecl.binderInfo.isExplicit then
+            ctorParams := ctorParams.push x
 
         -- Assign names for constructor params and track them
         let (ctorParamNames, newLctx, usedAfterCtorParams) ←
@@ -227,11 +230,12 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
           else
             pure ([], telescopeLctx, used)
 
-        dbg_trace s!"[casesOn] branch {ctorShortName}: ctorParams={ctorParamCount}, trailingEq={numTrailingEq}, names={ctorParamNames}"
+        dbg_trace s!"[casesOn] branch {ctorShortName}: ctorParams={ctorParams.size}/{ctorParamCount}, trailingEq={numTrailingEq}, names={ctorParamNames}"
 
-        -- Strip the Eq.ndrec/Eq.rec wrapper if present (the `cases` tactic
-        -- handles the substitution automatically, so we extract the inner body)
-        let innerBody ← if hasEqMotive then stripEqRec body none else pure body
+        -- Keep the original body for generalized motives. Stripping Eq.rec can
+        -- expose constructor-internal fvars (e.g. implicit indices) that are
+        -- not available as case pattern binders.
+        let innerBody := body
 
         -- Recursively decompile the inner body
         let (bodyTactics, _usedInBranch) ← decompileExpr innerBody newLctx telescopeInsts usedAfterCtorParams
@@ -243,39 +247,48 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
       -- Start with quasi-quote pattern that has no binders
       let baseAlt ← `(Lean.Parser.Tactic.inductionAlt| | $ctorIdent => $branchTacticSeq)
       
+      dbg_trace s!"[DEBUG] baseAlt structure: {baseAlt.raw}"
+      
       -- If we have parameter names, modify the syntax tree to insert them as plain identifiers  
       -- This controls what names `cases` introduces (you were right!)
       let altStx := if ctorParamNames.isEmpty then
         baseAlt
       else 
-        -- Navigate into the AST and insert binder identifiers after the constructor ident
-        -- Structure: inductionAlt[null[inductionAltLHS[pipe, group[...]]],null[arrow, tacSeq]]
+        -- Navigate into the AST and insert binder identifiers after the constructor group
+        -- Working structure: inductionAltLHS[pipe, group[null[], ctorIdent], null[param1, param2, ...]]
         match baseAlt.raw with
         | .node info kind #[lhsWrapper, rhsWrapper] =>
             match lhsWrapper with
             | .node lhsInfo `null #[altLHS] =>
                 match altLHS with
                 | .node altLHSInfo `Lean.Parser.Tactic.inductionAltLHS children =>
-                    if children.size >= 2 then
-                      let group := children[1]!
-                      match group with
-                      | .node groupInfo `group groupChildren =>
-                          -- Insert binders after existing children
-                          -- Original: [null[], ident]  → Target: [null[], ident, param1, param2, ...]
-                          if groupChildren.size >= 2 then 
-                            let binderIdents := ctorParamNames.toArray.map fun name =>
-                              (mkIdent (Name.mkSimple name)).raw
-                            dbg_trace s!"[DEBUG] {ctorShortName}: Adding {binderIdents.size} binders: {ctorParamNames}"
-                            let newGroupChildren := groupChildren ++ binderIdents
-                            dbg_trace s!"[DEBUG] Group before: {groupChildren.size} children, after: {newGroupChildren.size} children"
-                            let newGroup := Syntax.node groupInfo `group newGroupChildren
-                            let newAltLHS := Syntax.node altLHSInfo `Lean.Parser.Tactic.inductionAltLHS (children.set! 1 newGroup)
-                            let newLHSWrapper := Syntax.node lhsInfo `null #[newAltLHS]
-                            let newAlt := Syntax.node info kind #[newLHSWrapper, rhsWrapper]
-                            ⟨newAlt⟩
-                          else
-                            baseAlt
-                      | _ => baseAlt
+                    -- children should be: #[pipe, group, emptyNull]
+                    -- We need to replace emptyNull with: null[binders...]
+                    if children.size >= 3 then
+                      -- Get the source info from the group to use for the binders node
+                      let sourceInfo := match children[1]! with
+                        | .node info _ _ => info
+                        | .atom info _ => info
+                        | _ => SourceInfo.none
+                      
+                      -- Create identifier syntax nodes for each parameter name
+                      let binderIdents : Array Syntax := ctorParamNames.toArray.map fun name =>
+                        let ident : Ident := mkIdent (Name.mkSimple name)
+                        ident.raw
+                      dbg_trace s!"[DEBUG] {ctorShortName}: Adding {binderIdents.size} binders: {ctorParamNames}"
+                      
+                      -- Create a null node containing the binder idents
+                      let bindersNode := Syntax.node sourceInfo `null binderIdents
+                      dbg_trace s!"[DEBUG] bindersNode kind: {bindersNode.getKind}, children: {binderIdents.size}"
+                      
+                      -- REPLACE the third child (empty null) with our binders null node
+                      let newChildren := children.set! 2 bindersNode
+                      dbg_trace s!"[DEBUG] altLHS children: {children.size} (replaced child 2)"
+                      
+                      let newAltLHS := Syntax.node altLHSInfo `Lean.Parser.Tactic.inductionAltLHS newChildren
+                      let newLHSWrapper := Syntax.node lhsInfo `null #[newAltLHS]
+                      let newAlt := Syntax.node info kind #[newLHSWrapper, rhsWrapper]
+                      ⟨newAlt⟩
                     else
                       baseAlt
                 | _ => baseAlt
@@ -293,6 +306,7 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     else
       `(tactic| cases $discriminantStx:term with $[$alts:inductionAlt]*)
 
+    dbg_trace s!"[DEBUG] Generated cases tactic:\n{casesTac}"
     return some (#[casesTac], used)
 
 end LeanDecomp
