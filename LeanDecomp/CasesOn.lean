@@ -124,6 +124,74 @@ private partial def stripEqRec (body : Expr) (eqProofFvar : Option Expr) : MetaM
   else
     return body
 
+/-- Substitute selected fvars in an expression. -/
+private def substFVars (e : Expr) (substs : Array (FVarId × Expr)) : Expr :=
+  substs.foldl (init := e) fun acc (fid, replacement) =>
+    acc.replace fun t =>
+      match t with
+      | .fvar fid' => if fid' == fid then some replacement else none
+      | _ => none
+
+/-- Infer substitutions for constructor-local index fvars (e.g. `s_1`) by
+    scanning Eq/HEq constraints in the branch body. -/
+private def mkCtorIndexSubsts
+    (ctorParamsAll : Array Expr) (body : Expr) : MetaM (Array (FVarId × Expr)) := do
+  let mut ctorFVars : Array FVarId := #[]
+  for p in ctorParamsAll do
+    if let some fid := p.fvarId? then
+      ctorFVars := ctorFVars.push fid
+
+  let containsCtorFVar (fid : FVarId) : Bool :=
+    ctorFVars.any (· == fid)
+
+  let addIfCtorIndex (substs : Array (FVarId × Expr)) (lhs rhs : Expr) : Array (FVarId × Expr) :=
+    match lhs.fvarId? with
+    | some fid =>
+        if containsCtorFVar fid && !substs.any (fun (fid', _) => fid' == fid) then
+          substs.push (fid, rhs)
+        else
+          substs
+    | none => substs
+
+  let rec visit (e : Expr) (acc : Array (FVarId × Expr)) : Array (FVarId × Expr) :=
+    let (fn, args) := peelArgs e
+    let acc :=
+      if fn.isConstOf ``Eq && args.length >= 3 then
+        let lhs := args[1]!
+        let rhs := args[2]!
+        let acc := addIfCtorIndex acc lhs rhs
+        addIfCtorIndex acc rhs lhs
+      else if fn.isConstOf ``HEq && args.length >= 4 then
+        let lhs := args[1]!
+        let rhs := args[3]!
+        let acc := addIfCtorIndex acc lhs rhs
+        addIfCtorIndex acc rhs lhs
+      else
+        acc
+
+    match e with
+    | .app f a =>
+        let acc := visit f acc
+        visit a acc
+    | .lam _ t b _ =>
+        let acc := visit t acc
+        visit b acc
+    | .forallE _ t b _ =>
+        let acc := visit t acc
+        visit b acc
+    | .letE _ t v b _ =>
+        let acc := visit t acc
+        let acc := visit v acc
+        visit b acc
+    | .mdata _ b =>
+        visit b acc
+    | .proj _ _ b =>
+        visit b acc
+    | _ =>
+        acc
+
+  return visit body #[]
+
 /-- Get the user name of an fvar expression, if it is one. -/
 private def getDiscriminantName (disc : Expr) (lctx : LocalContext) : Option String :=
   if let .fvar fvarId := disc then
@@ -216,12 +284,18 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
               break
 
         let ctorParamCount := xs.size - numTrailingEq
+        let mut ctorParamsAll : Array Expr := #[]
         let mut ctorParams : Array Expr := #[]
         for i in List.range ctorParamCount do
           let x := xs[i]!
+          ctorParamsAll := ctorParamsAll.push x
           let xDecl ← getFVarLocalDecl x
           if xDecl.binderInfo.isExplicit then
             ctorParams := ctorParams.push x
+
+        let mut trailingEqParams : Array Expr := #[]
+        for i in List.range numTrailingEq do
+          trailingEqParams := trailingEqParams.push xs[ctorParamCount + i]!
 
         -- Assign names for constructor params and track them
         let (ctorParamNames, newLctx, usedAfterCtorParams) ←
@@ -230,12 +304,26 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
           else
             pure ([], telescopeLctx, used)
 
-        dbg_trace s!"[casesOn] branch {ctorShortName}: ctorParams={ctorParams.size}/{ctorParamCount}, trailingEq={numTrailingEq}, names={ctorParamNames}"
 
-        -- Keep the original body for generalized motives. Stripping Eq.rec can
-        -- expose constructor-internal fvars (e.g. implicit indices) that are
-        -- not available as case pattern binders.
-        let innerBody := body
+        let ctorIndexSubsts ← mkCtorIndexSubsts ctorParamsAll body
+        let bodyAfterCtorIndex := substFVars body ctorIndexSubsts
+
+        -- Bind branch-local trailing Eq/HEq params (e.g. `h_2`) to the matching
+        -- casesOn motive arguments (e.g. `Eq.refl ...`) and then apply any
+        -- leftover motive args that the branch body still expects.
+        let mut eqParamSubsts : Array (FVarId × Expr) := #[]
+        let motiveArgCount := info.motiveArgs.length
+        let bindableEqCount := Nat.min numTrailingEq motiveArgCount
+        for i in List.range bindableEqCount do
+          let eqParam := trailingEqParams[i]!
+          if let some fid := eqParam.fvarId? then
+            eqParamSubsts := eqParamSubsts.push (fid, info.motiveArgs[i]!)
+
+        let bodyAfterEqBind := substFVars bodyAfterCtorIndex eqParamSubsts
+
+        let remainingMotiveArgs := info.motiveArgs.drop bindableEqCount
+        let innerBody := remainingMotiveArgs.foldl (init := bodyAfterEqBind) fun acc arg =>
+          mkApp acc arg
 
         -- Recursively decompile the inner body
         let (bodyTactics, _usedInBranch) ← decompileExpr innerBody newLctx telescopeInsts usedAfterCtorParams
@@ -247,7 +335,6 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
       -- Start with quasi-quote pattern that has no binders
       let baseAlt ← `(Lean.Parser.Tactic.inductionAlt| | $ctorIdent => $branchTacticSeq)
       
-      dbg_trace s!"[DEBUG] baseAlt structure: {baseAlt.raw}"
       
       -- If we have parameter names, modify the syntax tree to insert them as plain identifiers  
       -- This controls what names `cases` introduces (you were right!)
@@ -275,15 +362,12 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
                       let binderIdents : Array Syntax := ctorParamNames.toArray.map fun name =>
                         let ident : Ident := mkIdent (Name.mkSimple name)
                         ident.raw
-                      dbg_trace s!"[DEBUG] {ctorShortName}: Adding {binderIdents.size} binders: {ctorParamNames}"
                       
                       -- Create a null node containing the binder idents
                       let bindersNode := Syntax.node sourceInfo `null binderIdents
-                      dbg_trace s!"[DEBUG] bindersNode kind: {bindersNode.getKind}, children: {binderIdents.size}"
                       
                       -- REPLACE the third child (empty null) with our binders null node
                       let newChildren := children.set! 2 bindersNode
-                      dbg_trace s!"[DEBUG] altLHS children: {children.size} (replaced child 2)"
                       
                       let newAltLHS := Syntax.node altLHSInfo `Lean.Parser.Tactic.inductionAltLHS newChildren
                       let newLHSWrapper := Syntax.node lhsInfo `null #[newAltLHS]
@@ -300,13 +384,18 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
 
     let discriminantStx ← delabToRefinableSyntax info.discriminant
     let casesTac ← if let some (eqName, _) := eqInfo then do
+      let discName := getDiscriminantName info.discriminant lctx
+      let eqBinderName :=
+        if discName == some eqName then
+          s!"{eqName}_eq"
+        else
+          eqName
       let hIdent : TSyntax `Lean.binderIdent ←
-        `(Lean.binderIdent| $(mkIdent (Name.mkSimple eqName)):ident)
+        `(Lean.binderIdent| $(mkIdent (Name.mkSimple eqBinderName)):ident)
       `(tactic| cases $hIdent : $discriminantStx:term with $[$alts:inductionAlt]*)
     else
       `(tactic| cases $discriminantStx:term with $[$alts:inductionAlt]*)
 
-    dbg_trace s!"[DEBUG] Generated cases tactic:\n{casesTac}"
     return some (#[casesTac], used)
 
 end LeanDecomp
