@@ -1,6 +1,7 @@
 import Lean
 import Lean.Meta.Tactic.TryThis
 import Lean.PrettyPrinter
+import LeanDecomp.Helpers
 
 namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter
@@ -23,9 +24,11 @@ structure CasesOnInfo where
   indVal : InductiveVal
   /-- The discriminant expression (what we're matching on) -/
   discriminant : Expr
+  /-- The motive (first arg to casesOn) -/
+  motive : Expr
   /-- The case branches (one per constructor) -/
   caseBranches : List Expr
-  /-- Arguments passed after the case branches (motive arguments) -/
+  /-- Arguments passed after the case branches (motive arguments like Eq.refl) -/
   motiveArgs : List Expr
   deriving Inhabited
 
@@ -33,134 +36,132 @@ structure CasesOnInfo where
     Returns none if the expression is not a casesOn application. -/
 def parseCasesOn (expr : Expr) : MetaM (Option CasesOnInfo) := do
   let (fn, args) := peelArgs expr
-  -- Check if the head is a constant ending in `.casesOn`
   let some constName := Expr.constName? fn
     | return none
   let nameStr := constName.toString
   if !nameStr.endsWith ".casesOn" then
     return none
-  -- Get information about the inductive type
   let some indName := constName.eraseSuffix? `casesOn
     | return none
   let some indInfo := (← getEnv).find? indName
     | return none
   let .inductInfo indVal := indInfo
     | return none
-  -- casesOn arguments layout: [motive, params..., indices..., discriminant, cases...]
+  -- casesOn arguments layout: [motive, params..., indices..., discriminant, cases..., motiveArgs...]
   let numParams := indVal.numParams
   let numIndices := indVal.numIndices
   let numCtors := indVal.ctors.length
-  if args.length < 2 + numCtors then
-    return none
   let discriminantIdx := 1 + numParams + numIndices
   let casesStartIdx := discriminantIdx + 1
   if args.length < casesStartIdx + numCtors then
     return none
+  let motive := args[0]!
   let discriminant := args[discriminantIdx]!
   let caseBranches := (List.range numCtors).map fun i => args[casesStartIdx + i]!
-  -- Extract motive arguments (everything after the case branches)
   let motiveArgsStartIdx := casesStartIdx + numCtors
   let motiveArgs := args.drop motiveArgsStartIdx
   return some {
     indName := indName
     indVal := indVal
     discriminant := discriminant
+    motive := motive
     caseBranches := caseBranches
     motiveArgs := motiveArgs
   }
 
-/-- Check if a constructor could possibly match the discriminant by comparing
-    the constructor's result type indices with the discriminant's type indices.
-    Returns false if the indices have incompatible head constructors. -/
-def couldConstructorMatch (ctorName : Name) (discriminantType : Expr) : MetaM Bool := do
-  -- Get constructor info
-  let some ctorInfo := (← getEnv).find? ctorName
-    | return true  -- If we can't find info, assume it could match
-  let .ctorInfo _ := ctorInfo
-    | return true
-  -- Get the constructor's result type by applying it to fresh mvars
-  let ctorType ← inferType (mkConst ctorName)
-  -- The constructor type is a telescope ending in the inductive type applied to indices
-  -- We need to instantiate all the arguments to get the result type
-  forallTelescope ctorType fun _ resultType => do
-    -- resultType should be like `BigStep stmt s t` for BigStep constructors
-    -- discriminantType is also like `BigStep stmt' s' t'`
-    let (_, ctorIndices) := resultType.getAppFnArgs
-    let (_, discIndices) := discriminantType.getAppFnArgs
-    -- Compare indices pairwise - if any have incompatible head constructors, return false
-    for (ctorIdx, discIdx) in ctorIndices.zip discIndices do
-      -- Get the head of each index (after reducing)
-      let ctorIdxHead := ctorIdx.getAppFn
-      let discIdxHead := discIdx.getAppFn
-      -- If both are constructors of the same inductive but different constructors, impossible
-      if let (.const ctorIdxName _, .const discIdxName _) := (ctorIdxHead, discIdxHead) then
-        -- Check if they're both constructors
-        if let (some (.ctorInfo ctorIdxInfo), some (.ctorInfo discIdxInfo)) :=
-            ((← getEnv).find? ctorIdxName, (← getEnv).find? discIdxName) then
-          -- Same inductive type but different constructors = impossible
-          if ctorIdxInfo.induct == discIdxInfo.induct && ctorIdxName != discIdxName then
-            return false
-    return true
+/-- Check if the casesOn motive has equality parameters (from `cases h : disc`).
+    A motive like `fun (t : T) => ∀ (h : disc = t), Goal` indicates generalized equations.
+    For indexed families, there may be multiple: `∀ (h2 : s = a_1) (h3 : t = a_2) (h : HEq ...), Goal`.
+    Returns (name of first eq binder, total count of eq/heq forall binders) if found. -/
+private def motiveEqInfo (motive : Expr) : MetaM (Option (String × Nat)) := do
+  lambdaTelescope motive fun _ body => do
+    if body.isForall then
+      forallTelescope body fun binders _ => do
+        if binders.size < 1 then return none
+        -- Check if the first binder is an Eq or HEq
+        let firstBinderType ← inferType binders[0]!
+        let (fn, _) := peelArgs firstBinderType
+        if !(fn.isConstOf ``Eq || fn.isConstOf ``HEq) then return none
+        let some fvarId := binders[0]!.fvarId?
+          | return none
+        let decl ← fvarId.getDecl
+        let name := decl.userName.eraseMacroScopes.toString
+        -- Count how many consecutive Eq/HEq binders there are
+        let mut count := 0
+        for b in binders do
+          let bType ← inferType b
+          let (bfn, _) := peelArgs bType
+          if bfn.isConstOf ``Eq || bfn.isConstOf ``HEq then
+            count := count + 1
+          else
+            break
+        return some (name, count)
+    else return none
 
-/-- Type alias for the decompileExpr callback to avoid repetition -/
-abbrev DecompileCallback := Expr → LocalContext → LocalInstances → List String →
-    MetaM (Array (TSyntax `tactic) × List String)
-
-/-- Type alias for the assignIntroNames callback -/
-abbrev AssignIntroNamesCallback := Array Expr → List String →
-    MetaM (List String × LocalContext × List String)
-
-/-- Convert intro names to identifier syntax -/
-private def namesToIdents (names : List String) : Array Ident :=
-  names.toArray.map (fun n => mkIdent (Name.mkSimple n))
-
-/-- Extract the value from an Eq.refl or HEq.refl term.
-    For `@Eq.refl T val`, returns `val`.
-    For `@HEq.refl T val`, returns `val`. -/
-private def extractReflValue (e : Expr) : Option Expr := do
-  let (fn, args) := peelArgs e
-  let some constName := Expr.constName? fn | none
-  if constName == ``Eq.refl || constName == ``HEq.refl then
-    -- Eq.refl has args: [type, value]
-    -- HEq.refl has args: [type, value]
-    args.getLast?
+/-- Try to strip `Eq.ndrec` / `Eq.rec` wrappers from a branch body.
+    The casesOn generalized equation pattern produces:
+      `@Eq.ndrec α ctor motive (fun (h : disc = ctor) => actual_body) disc (Eq.symm h_eq) (Eq.refl disc)`
+    We want to extract `actual_body` from inside the inner lambda.
+    The equality proof lambda parameter is not needed because `cases h:` already
+    introduces the equality hypothesis. -/
+private partial def stripEqRec (body : Expr) (eqProofFvar : Option Expr) : MetaM Expr := do
+  let (fn, args) := peelArgs body
+  if let some constName := fn.constName? then
+    if (constName == ``Eq.ndrec || constName == ``Eq.rec) && args.length >= 4 then
+      let innerTerm := args[3]!
+      -- The body (args[3]) may be a lambda `fun h => actual_body`
+      -- which takes the eq proof. We need to enter this lambda and extract the body.
+      if innerTerm.isLambda then
+        Meta.lambdaTelescope innerTerm fun _xs lambdaBody => do
+          -- Recursively strip more Eq.ndrec wrappers
+          stripEqRec lambdaBody eqProofFvar
+      else
+        stripEqRec innerTerm eqProofFvar
+    else if constName == ``Eq.mpr && args.length >= 4 then
+      stripEqRec args[3]! eqProofFvar
+    else
+      return body
   else
-    none
+    return body
 
-/-- Try to extract constructor arguments from an expression.
-    For example, from `ifThenElse B S T`, extract `[B, S, T]`. -/
-private def extractConstructorArgs (e : Expr) : List Expr :=
-  let (_, args) := peelArgs e
-  args
+/-- Get the user name of an fvar expression, if it is one. -/
+private def getDiscriminantName (disc : Expr) (lctx : LocalContext) : Option String :=
+  if let .fvar fvarId := disc then
+    if let some decl := lctx.find? fvarId then
+      let name := decl.userName.eraseMacroScopes.toString
+      let lastSegment := (name.splitOn ".").reverse.headD name
+      some lastSegment
+    else none
+  else none
 
-/-- Find the value for an implicit parameter by matching it against index values.
-    Given an implicit param and the index expressions from the motive, try to find
-    the corresponding value by unification or pattern matching.
-    Uses a greedy left-to-right matching to avoid reusing the same value. -/
-private def findImplicitParamValue (param : Expr) (indexValues : List Expr) (usedIndices : List Nat) : MetaM (Option (Expr × Nat)) := do
-  let paramType ← inferType param
+/-- Detect if a branch body is a contradiction proof that should be omitted.
+    In grind-generated proofs, impossible branches use patterns like:
+    - `Lean.Grind.intro_with_eq` with an impossible equation
+    - `False.casesOn` / `False.elim`
+    - `noConfusion_of_Nat` with different constructors
+    We detect this by checking if the body (or the body after stripping
+    noConfusion wrappers) is a proof of False from contradictory constructor equalities. -/
+private def isBranchContradiction (body : Expr) : MetaM Bool := do
+  let (fn, _) := peelArgs body
+  if let some constName := fn.constName? then
+    -- Grind uses intro_with_eq for impossible branches
+    if constName == ``Lean.Grind.intro_with_eq then
+      return true
+    -- Direct False elimination
+    if constName == ``False.casesOn || constName == ``False.elim then
+      return true
+  return false
 
-  -- Try to find a matching index value by type (skip already used indices)
-  for indexIdx in List.range indexValues.length do
-    if usedIndices.contains indexIdx then
-      continue
-
-    let indexValue := indexValues[indexIdx]!
-    let indexType ← inferType indexValue
-    -- If the types match exactly, use this value
-    if ← isDefEq paramType indexType then
-      return some (indexValue, indexIdx)
-
-    -- If the index is a constructor application, check if any of its args match
-    let ctorArgs := extractConstructorArgs indexValue
-    for arg in ctorArgs do
-      let argType ← inferType arg
-      if ← isDefEq paramType argType then
-        return some (arg, indexIdx)
-
-  return none/-- Handle `*.casesOn` applications - generate a `cases` tactic.
+/-- Handle `*.casesOn` applications - generate a `cases` tactic.
     Detects when expr is an application of an inductive type's casesOn eliminator.
-    Takes callbacks for decompileExpr and assignIntroNames to avoid circular dependencies. -/
+    Takes callbacks for decompileExpr and assignIntroNames to avoid circular dependencies.
+    
+    NOTE: Works well for simple cases (constructors with no parameters).
+    For indexed inductive types with constructor parameters, the generated tactics
+    may fail because the proof term contains fvar references from the lambda telescope
+    that don't match the fvars created by the `cases` tactic at runtime. Future work
+    could address this by using explicit binders in case alternatives or generating
+    intro tactics to rebind the parameters. -/
 def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String)
     (decompileExpr : DecompileCallback)
@@ -170,97 +171,128 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     let some info ← parseCasesOn expr
       | return none
     let ctorNames := info.indVal.ctors
-    -- Get the discriminant as syntax (should be an fvar in most cases)
-    let discriminantStx ← delabToRefinableSyntax info.discriminant
-    -- Build the cases tactic with named alternatives
+
+    -- Check if the motive has equality parameters (generalized equation pattern)
+    -- If so, get the name of the first equality binder and the count
+    let eqInfo ← motiveEqInfo info.motive
+    let hasEqMotive := eqInfo.isSome
+
     let mut alts : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt) := #[]
     let mut used := used
-
-
-    -- TODO find actual name
-    let discriminantNameOpt : Option String := some "h"
-    let some discriminantName := discriminantNameOpt | return none
+    let mut ctorIdx := 0
 
     for (ctorName, caseBranch) in ctorNames.zip info.caseBranches do
-      -- Extract just the constructor name (last component)
       let ctorShortName := ctorName.getString!
       let ctorIdent := mkIdent (Name.mkSimple ctorShortName)
 
-      -- Each case branch is a lambda - use lambdaTelescope to enter it
-      -- and recursively decompile the body
-      let (branchTactics, used') ← Meta.lambdaTelescope caseBranch fun xs body => do
-        if xs.size > 0 then
-          let telescopeInsts ← getLocalInstances
+      -- Check if this branch is a contradiction (impossible constructor).
+      -- We enter the lambda telescope and check the body.
+      let isContradiction ← Meta.lambdaTelescope caseBranch fun _xs body => do
+        isBranchContradiction body
 
-          -- Count implicit and explicit parameters
-          let mut implicitParams : Array Expr := #[]
-          let mut explicitParams : Array Expr := #[]
+      if isContradiction then
+        ctorIdx := ctorIdx + 1
+        continue
 
-          for x in xs do
-            let some fvarId := x.fvarId?
-              | throwError "Unexpected non-fvar in case branch parameter"
-            let decl ← fvarId.getDecl
-            match decl.binderInfo with
-            | .implicit | .instImplicit | .strictImplicit =>
-                implicitParams := implicitParams.push x
-            | .default =>
-                explicitParams := explicitParams.push x
+      let (branchTactics, ctorParamNames, used') ← Meta.lambdaTelescope caseBranch fun xs body => do
+        let telescopeLctx ← getLCtx
+        let telescopeInsts ← getLocalInstances
 
-          -- First assign names for implicit params to track used names
-          let (implicitNames, lctxAfterImplicit, usedAfterImplicit) ←
-            if implicitParams.size > 0 then
-              assignIntroNames implicitParams used
+        -- Separate constructor params from the trailing equality proof params.
+        -- With generalized equations, the branch lambdas may have 1+ trailing
+        -- equality params appended by the casesOn elaboration. We detect them
+        -- by checking each trailing param's type for Eq/HEq.
+        let mut numTrailingEq := 0
+        if hasEqMotive then
+          -- Count trailing Eq/HEq params from the end
+          let mut i := xs.size
+          while i > 0 do
+            i := i - 1
+            let paramType ← inferType xs[i]!
+            let (fn, _) := peelArgs paramType
+            if fn.isConstOf ``Eq || fn.isConstOf ``HEq then
+              numTrailingEq := numTrailingEq + 1
             else
-              pure ([], ← getLCtx, used)
+              break
 
-          -- Generate let bindings for implicit parameters
-          -- Extract index values from motive arguments and match them to params
-          let indexValues ← info.motiveArgs.mapM fun arg => do
-            if let some val := extractReflValue arg then
-              return val
-            else
-              return arg  -- Fallback to the arg itself
+        let ctorParamCount := xs.size - numTrailingEq
+        let mut ctorParams : Array Expr := #[]
+        for i in List.range ctorParamCount do
+          ctorParams := ctorParams.push xs[i]!
 
-          let mut usedIndices : List Nat := []
-          let mut letTactics : List (TSyntax `tactic) := []
+        -- Assign names for constructor params and track them
+        let (ctorParamNames, newLctx, usedAfterCtorParams) ←
+          if ctorParams.size > 0 then
+            assignIntroNames ctorParams used
+          else
+            pure ([], telescopeLctx, used)
 
-          for idx in List.range implicitParams.size do
-            let param := implicitParams[idx]!
-            let name := implicitNames[idx]!
-            let ident := mkIdent (Name.mkSimple name)
+        dbg_trace s!"[casesOn] branch {ctorShortName}: ctorParams={ctorParamCount}, trailingEq={numTrailingEq}, names={ctorParamNames}"
 
-            -- Try to find the value for this parameter by matching types
-            if let some (value, usedIdx) ← findImplicitParamValue param indexValues usedIndices then
-              usedIndices := usedIdx :: usedIndices
-              let valueStx ← delabToRefinableSyntax value
-              letTactics := letTactics ++ [← `(tactic| let $ident := $valueStx)]
-            else
-              -- Fallback: use wildcard with type annotation
-              let typeStx ← delabToRefinableSyntax (← inferType param)
-              letTactics := letTactics ++ [← `(tactic| let $ident : $typeStx := _)]
+        -- Strip the Eq.ndrec/Eq.rec wrapper if present (the `cases` tactic
+        -- handles the substitution automatically, so we extract the inner body)
+        let innerBody ← if hasEqMotive then stripEqRec body none else pure body
 
-          -- The explicit parameters are already introduced by the `cases` tactic,
-          -- so we don't need to intro them again. We just need to track their names as used.
-          let (_, newLctx, usedFinal) ←
-            if explicitParams.size > 0 then
-              withLCtx lctxAfterImplicit telescopeInsts do
-                assignIntroNames explicitParams usedAfterImplicit
-            else
-              pure ([], lctxAfterImplicit, usedAfterImplicit)
+        -- Recursively decompile the inner body
+        let (bodyTactics, _usedInBranch) ← decompileExpr innerBody newLctx telescopeInsts usedAfterCtorParams
+        return (bodyTactics, ctorParamNames, used)
 
-          -- Recursively decompile the body (no intro needed for explicit params)
-          let (bodyTactics, usedResult) ← decompileExpr body newLctx telescopeInsts usedFinal
-
-          return (Array.mk letTactics ++ bodyTactics, usedResult)
-        else
-          decompileExpr body lctx localInsts used
       used := used'
-      -- Build the case alternative
       let branchTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$branchTactics]*)
-      let altStx ← `(Lean.Parser.Tactic.inductionAlt| | $ctorIdent => $branchTacticSeq)
+      
+      -- Start with quasi-quote pattern that has no binders
+      let baseAlt ← `(Lean.Parser.Tactic.inductionAlt| | $ctorIdent => $branchTacticSeq)
+      
+      -- If we have parameter names, modify the syntax tree to insert them as plain identifiers  
+      -- This controls what names `cases` introduces (you were right!)
+      let altStx := if ctorParamNames.isEmpty then
+        baseAlt
+      else 
+        -- Navigate into the AST and insert binder identifiers after the constructor ident
+        -- Structure: inductionAlt[null[inductionAltLHS[pipe, group[...]]],null[arrow, tacSeq]]
+        match baseAlt.raw with
+        | .node info kind #[lhsWrapper, rhsWrapper] =>
+            match lhsWrapper with
+            | .node lhsInfo `null #[altLHS] =>
+                match altLHS with
+                | .node altLHSInfo `Lean.Parser.Tactic.inductionAltLHS children =>
+                    if children.size >= 2 then
+                      let group := children[1]!
+                      match group with
+                      | .node groupInfo `group groupChildren =>
+                          -- Insert binders after existing children
+                          -- Original: [null[], ident]  → Target: [null[], ident, param1, param2, ...]
+                          if groupChildren.size >= 2 then 
+                            let binderIdents := ctorParamNames.toArray.map fun name =>
+                              (mkIdent (Name.mkSimple name)).raw
+                            dbg_trace s!"[DEBUG] {ctorShortName}: Adding {binderIdents.size} binders: {ctorParamNames}"
+                            let newGroupChildren := groupChildren ++ binderIdents
+                            dbg_trace s!"[DEBUG] Group before: {groupChildren.size} children, after: {newGroupChildren.size} children"
+                            let newGroup := Syntax.node groupInfo `group newGroupChildren
+                            let newAltLHS := Syntax.node altLHSInfo `Lean.Parser.Tactic.inductionAltLHS (children.set! 1 newGroup)
+                            let newLHSWrapper := Syntax.node lhsInfo `null #[newAltLHS]
+                            let newAlt := Syntax.node info kind #[newLHSWrapper, rhsWrapper]
+                            ⟨newAlt⟩
+                          else
+                            baseAlt
+                      | _ => baseAlt
+                    else
+                      baseAlt
+                | _ => baseAlt
+            | _ => baseAlt
+        | _ => baseAlt
+      
       alts := alts.push altStx
-    let hIdent : TSyntax `Lean.binderIdent ← `(Lean.binderIdent| $(mkIdent (Name.mkSimple discriminantName)):ident)
-    let casesTac ← `(tactic| cases $hIdent : $discriminantStx:term with $[$alts:inductionAlt]*)
+      ctorIdx := ctorIdx + 1
+
+    let discriminantStx ← delabToRefinableSyntax info.discriminant
+    let casesTac ← if let some (eqName, _) := eqInfo then do
+      let hIdent : TSyntax `Lean.binderIdent ←
+        `(Lean.binderIdent| $(mkIdent (Name.mkSimple eqName)):ident)
+      `(tactic| cases $hIdent : $discriminantStx:term with $[$alts:inductionAlt]*)
+    else
+      `(tactic| cases $discriminantStx:term with $[$alts:inductionAlt]*)
+
     return some (#[casesTac], used)
 
 end LeanDecomp

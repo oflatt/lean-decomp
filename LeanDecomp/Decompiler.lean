@@ -1,57 +1,12 @@
 import Lean
 import Lean.Meta.Tactic.TryThis
 import Lean.PrettyPrinter
+import LeanDecomp.Helpers
 import LeanDecomp.CasesOn
 
 namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
-
-private def binderBaseName (idx : Nat) (name : Name) : String :=
-  let raw := name.eraseMacroScopes.toString
-  let lastSegment := (raw.splitOn ".").reverse.headD raw
-  let cleaned := lastSegment.replace "'" ""
-  if cleaned = "" || cleaned = "_" then s!"x{idx + 1}" else cleaned
-
-private def mkUniqueName (base : String) (used : List String) : String :=
-  if !(used.contains base) then base
-  else
-    let rec loop (suffix remaining : Nat) : String :=
-      let candidate := s!"{base}_{suffix}"
-      match remaining with
-      | 0 => candidate
-      | Nat.succ remaining' =>
-          if used.contains candidate then
-            loop (suffix + 1) remaining'
-          else
-            candidate
-    loop 1 (used.length + 1)
-
-private def chooseIntroName (idx : Nat) (userName : Name) (used : List String) : (String × List String) :=
-  let base := binderBaseName idx userName
-  let introName := mkUniqueName base used
-  (introName, introName :: used)
-
-private def assignIntroNames (xs : Array Expr) (used0 : List String) : MetaM (List String × LocalContext × List String) := do
-  let mut used : List String := used0
-  let mut idx := 0
-  let mut names : List String := []
-  let mut lctx ← getLCtx
-  for x in xs do
-    let some fvarId := x.fvarId?
-      | throwError "Unexpected non-fvar binder in proof term"
-    let decl ← fvarId.getDecl
-    let (introName, used') := chooseIntroName idx decl.userName used
-    used := used'
-    names := introName :: names
-    let newName := Name.mkSimple introName
-    lctx := lctx.setUserName fvarId newName
-    idx := idx + 1
-  return (names.reverse, lctx, used)
-
-/-- Convert intro names to identifier syntax -/
-private def namesToIdents (names : List String) : Array Ident :=
-  names.toArray.map (fun n => mkIdent (Name.mkSimple n))
 
 /-- Build a tacticSeq from an array of tactics -/
 private def mkTacticSeq (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax ``Lean.Parser.Tactic.tacticSeq) := do
