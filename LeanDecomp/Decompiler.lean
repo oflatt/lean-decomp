@@ -3,6 +3,7 @@ import Lean.Meta.Tactic.TryThis
 import Lean.PrettyPrinter
 import LeanDecomp.Helpers
 import LeanDecomp.CasesOn
+import LeanDecomp.EqDecomp
 
 namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter
@@ -40,6 +41,11 @@ mutual
             tryDecompByContradiction expr lctx localInsts used,
             tryDecompCasesOn expr lctx localInsts used decompileExpr assignIntroNames,
             tryDecompNoConfusion expr lctx localInsts used,
+            LeanDecomp.tryDecompCongr expr lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompCongrArg expr lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompEqSymm expr lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompEqTrans expr lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompEqMp expr lctx localInsts used decompileExpr,
             tryDecompFalseRec expr lctx localInsts used,
             tryDecompBetaRedex expr lctx localInsts used,
             tryDecompId expr lctx localInsts used
@@ -185,10 +191,11 @@ mutual
       -- Otherwise, name the contradiction proof and eliminate it.
       let (prfFalseName, used') := chooseIntroName used.length `hFalse used
       let prfFalseIdent := mkIdent (Name.mkSimple prfFalseName)
-      let falseArgStx ← delabToRefinableSyntax falseArg
-      let letTac ← `(tactic| let $prfFalseIdent : False := by exact $falseArgStx)
+      let (falseTactics, used'') ← decompileExpr falseArg lctx localInsts used'
+      let falseTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$falseTactics]*)
+      let letTac ← `(tactic| let $prfFalseIdent : False := by $falseTacticSeq)
       let exactTac ← `(tactic| exact False.elim $prfFalseIdent)
-      return some (#[letTac, exactTac], used')
+      return some (#[letTac, exactTac], used'')
 
   /-- Handle `@id T body` - extract the body into a let binding with type annotation.
       Transform `@id T body` into `let prf : T := by <decompiled body>; exact prf` -/
