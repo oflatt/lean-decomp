@@ -39,6 +39,8 @@ mutual
           let specialized? ← firstSomeM [
             tryDecompByContradiction expr lctx localInsts used,
             tryDecompCasesOn expr lctx localInsts used decompileExpr assignIntroNames,
+            tryDecompNoConfusion expr lctx localInsts used,
+            tryDecompFalseRec expr lctx localInsts used,
             tryDecompBetaRedex expr lctx localInsts used,
             tryDecompId expr lctx localInsts used
           ]
@@ -124,6 +126,69 @@ mutual
       let argIdent := mkIdent argName
       let letTac ← `(tactic| let $letBinderIdent := $argIdent)
       return some (#[letTac] ++ bodyTactics, used'')
+
+  /-- Handle `*.noConfusion` applications by reducing them first.
+      This turns constructor-equality eliminators into simpler branch terms,
+      which usually decompile much better. -/
+  private partial def tryDecompNoConfusion (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+    withLCtx lctx localInsts do
+      let (fn, _) := peelArgs expr
+      let some constName := Expr.constName? fn
+        | return none
+      if !constName.toString.endsWith ".noConfusion" then
+        return none
+
+      -- Try weak-head reduction first; this is enough for typical
+      -- `noConfusion (Eq.refl ...) ...` terms.
+      let reduced ← Meta.whnf expr
+      if reduced != expr then
+        let (tactics, used') ← decompileExpr reduced lctx localInsts used
+        return some (tactics, used')
+
+      return none
+
+  /-- Handle `False.rec` terms.
+      For this decompiler path we only need the primitive recursor used in the
+      current example. -/
+  private partial def tryDecompFalseRec (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+    withLCtx lctx localInsts do
+      let (fn, args) := peelArgs expr
+      let some constName := Expr.constName? fn
+        | return none
+      if constName != ``False.rec then
+        return none
+
+      let falseTy := mkConst ``False
+      let rec findFalseArg (xs : List Expr) : MetaM (Option Expr) := do
+        match xs with
+        | [] => return none
+        | x :: xs' =>
+            let xTy ← Meta.inferType x
+            if (← Meta.isDefEq xTy falseTy) then
+              return some x
+            else
+              findFalseArg xs'
+
+      let some falseArg ← findFalseArg args
+        | return none
+
+      -- Best case: contradiction hypothesis is already a local variable.
+      if let some falseFVarId := falseArg.fvarId? then
+        let decl ← falseFVarId.getDecl
+        let hFalseTarget : TSyntax `Lean.Parser.Tactic.elimTarget ←
+          `(Lean.Parser.Tactic.elimTarget| $(mkIdent decl.userName):ident)
+        let casesTac ← `(tactic| cases $hFalseTarget)
+        return some (#[casesTac], used)
+
+      -- Otherwise, name the contradiction proof and eliminate it.
+      let (prfFalseName, used') := chooseIntroName used.length `hFalse used
+      let prfFalseIdent := mkIdent (Name.mkSimple prfFalseName)
+      let falseArgStx ← delabToRefinableSyntax falseArg
+      let letTac ← `(tactic| let $prfFalseIdent : False := by exact $falseArgStx)
+      let exactTac ← `(tactic| exact False.elim $prfFalseIdent)
+      return some (#[letTac, exactTac], used')
 
   /-- Handle `@id T body` - extract the body into a let binding with type annotation.
       Transform `@id T body` into `let prf : T := by <decompiled body>; exact prf` -/

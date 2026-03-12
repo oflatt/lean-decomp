@@ -223,7 +223,7 @@ private def isBranchContradiction (body : Expr) : MetaM Bool := do
 /-- Handle `*.casesOn` applications - generate a `cases` tactic.
     Detects when expr is an application of an inductive type's casesOn eliminator.
     Takes callbacks for decompileExpr and assignIntroNames to avoid circular dependencies.
-    
+
     NOTE: Works well for simple cases (constructors with no parameters).
     For indexed inductive types with constructor parameters, the generated tactics
     may fail because the proof term contains fvar references from the lambda telescope
@@ -331,16 +331,16 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
 
       used := used'
       let branchTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$branchTactics]*)
-      
+
       -- Start with quasi-quote pattern that has no binders
       let baseAlt ← `(Lean.Parser.Tactic.inductionAlt| | $ctorIdent => $branchTacticSeq)
-      
-      
-      -- If we have parameter names, modify the syntax tree to insert them as plain identifiers  
+
+
+      -- If we have parameter names, modify the syntax tree to insert them as plain identifiers
       -- This controls what names `cases` introduces (you were right!)
       let altStx := if ctorParamNames.isEmpty then
         baseAlt
-      else 
+      else
         -- Navigate into the AST and insert binder identifiers after the constructor group
         -- Working structure: inductionAltLHS[pipe, group[null[], ctorIdent], null[param1, param2, ...]]
         match baseAlt.raw with
@@ -357,18 +357,18 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
                         | .node info _ _ => info
                         | .atom info _ => info
                         | _ => SourceInfo.none
-                      
+
                       -- Create identifier syntax nodes for each parameter name
                       let binderIdents : Array Syntax := ctorParamNames.toArray.map fun name =>
                         let ident : Ident := mkIdent (Name.mkSimple name)
                         ident.raw
-                      
+
                       -- Create a null node containing the binder idents
                       let bindersNode := Syntax.node sourceInfo `null binderIdents
-                      
+
                       -- REPLACE the third child (empty null) with our binders null node
                       let newChildren := children.set! 2 bindersNode
-                      
+
                       let newAltLHS := Syntax.node altLHSInfo `Lean.Parser.Tactic.inductionAltLHS newChildren
                       let newLHSWrapper := Syntax.node lhsInfo `null #[newAltLHS]
                       let newAlt := Syntax.node info kind #[newLHSWrapper, rhsWrapper]
@@ -378,7 +378,7 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
                 | _ => baseAlt
             | _ => baseAlt
         | _ => baseAlt
-      
+
       alts := alts.push altStx
       ctorIdx := ctorIdx + 1
 
