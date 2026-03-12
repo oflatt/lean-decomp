@@ -77,7 +77,7 @@ private def motiveEqInfo (motive : Expr) : MetaM (Option (String × Nat)) := do
   lambdaTelescope motive fun _ body => do
     if body.isForall then
       forallTelescope body fun binders _ => do
-        if binders.size < 1 then return none
+        if binders.isEmpty then return none
         -- Check if the first binder is an Eq or HEq
         let firstBinderType ← inferType binders[0]!
         let (fn, _) := peelArgs firstBinderType
@@ -97,32 +97,6 @@ private def motiveEqInfo (motive : Expr) : MetaM (Option (String × Nat)) := do
             break
         return some (name, count)
     else return none
-
-/-- Try to strip `Eq.ndrec` / `Eq.rec` wrappers from a branch body.
-    The casesOn generalized equation pattern produces:
-      `@Eq.ndrec α ctor motive (fun (h : disc = ctor) => actual_body) disc (Eq.symm h_eq) (Eq.refl disc)`
-    We want to extract `actual_body` from inside the inner lambda.
-    The equality proof lambda parameter is not needed because `cases h:` already
-    introduces the equality hypothesis. -/
-private partial def stripEqRec (body : Expr) (eqProofFvar : Option Expr) : MetaM Expr := do
-  let (fn, args) := peelArgs body
-  if let some constName := fn.constName? then
-    if (constName == ``Eq.ndrec || constName == ``Eq.rec) && args.length >= 4 then
-      let innerTerm := args[3]!
-      -- The body (args[3]) may be a lambda `fun h => actual_body`
-      -- which takes the eq proof. We need to enter this lambda and extract the body.
-      if innerTerm.isLambda then
-        Meta.lambdaTelescope innerTerm fun _xs lambdaBody => do
-          -- Recursively strip more Eq.ndrec wrappers
-          stripEqRec lambdaBody eqProofFvar
-      else
-        stripEqRec innerTerm eqProofFvar
-    else if constName == ``Eq.mpr && args.length >= 4 then
-      stripEqRec args[3]! eqProofFvar
-    else
-      return body
-  else
-    return body
 
 /-- Substitute selected fvars in an expression. -/
 private def substFVars (e : Expr) (substs : Array (FVarId × Expr)) : Expr :=
@@ -223,13 +197,8 @@ private def isBranchContradiction (body : Expr) : MetaM Bool := do
 /-- Handle `*.casesOn` applications - generate a `cases` tactic.
     Detects when expr is an application of an inductive type's casesOn eliminator.
     Takes callbacks for decompileExpr and assignIntroNames to avoid circular dependencies.
-
-    NOTE: Works well for simple cases (constructors with no parameters).
-    For indexed inductive types with constructor parameters, the generated tactics
-    may fail because the proof term contains fvar references from the lambda telescope
-    that don't match the fvars created by the `cases` tactic at runtime. Future work
-    could address this by using explicit binders in case alternatives or generating
-    intro tactics to rebind the parameters. -/
+  Supports generalized equality motives by rebinding branch-local equality
+  parameters to the motive arguments and substituting constructor-local fvars. -/
 def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String)
     (decompileExpr : DecompileCallback)
@@ -247,7 +216,6 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
 
     let mut alts : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt) := #[]
     let mut used := used
-    let mut ctorIdx := 0
 
     for (ctorName, caseBranch) in ctorNames.zip info.caseBranches do
       let ctorShortName := ctorName.getString!
@@ -259,7 +227,6 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
         isBranchContradiction body
 
       if isContradiction then
-        ctorIdx := ctorIdx + 1
         continue
 
       let (branchTactics, ctorParamNames, used') ← Meta.lambdaTelescope caseBranch fun xs body => do
@@ -380,7 +347,6 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
         | _ => baseAlt
 
       alts := alts.push altStx
-      ctorIdx := ctorIdx + 1
 
     let discriminantStx ← delabToRefinableSyntax info.discriminant
     let casesTac ← if let some (eqName, _) := eqInfo then do
