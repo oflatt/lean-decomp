@@ -193,8 +193,8 @@ mutual
       let prfFalseIdent := mkIdent (Name.mkSimple prfFalseName)
       let (falseTactics, used'') ← decompileExpr falseArg lctx localInsts used'
       let falseTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$falseTactics]*)
-      let letTac ← `(tactic| let $prfFalseIdent : False := by $falseTacticSeq)
-      let exactTac ← `(tactic| exact False.elim $prfFalseIdent)
+      let letTac ← `(tactic| let $prfFalseIdent : $(mkIdent ``False) := by $falseTacticSeq)
+      let exactTac ← `(tactic| exact $(mkIdent ``False.elim) $prfFalseIdent)
       return some (#[letTac, exactTac], used'')
 
   /-- Handle `@id T body` - extract the body into a let binding with type annotation.
