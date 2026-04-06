@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Benchmark grind variants: original, grind only, grind script, decompile.
 
 Reads a Lean file containing `grind`, generates variants with `grind?` and
@@ -17,7 +16,11 @@ import statistics
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
+
+from bench_db import BenchDB
 
 # ---------------------------------------------------------------------------
 # Subprocess helpers
@@ -133,6 +136,31 @@ def _is_grind_line(trimmed: str) -> bool:
     return trimmed.startswith("grind ") or trimmed.startswith("grind[") or trimmed == "grind"
 
 
+def _find_grind_line(source: str) -> int:
+    """Return 1-indexed line number of first grind tactic, or 0 if none."""
+    for i, line in enumerate(source.split("\n"), 1):
+        if _is_grind_line(line.lstrip()):
+            return i
+    return 0
+
+
+def _ensure_profiler(source: str) -> str:
+    """Inject `set_option profiler true` if not already present."""
+    if "set_option profiler true" in source:
+        return source
+    # Insert after the last import/module block line
+    lines = source.split("\n")
+    insert_at = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if (stripped.startswith("import ")
+            or stripped.startswith("public import ")
+            or stripped == "module"):
+            insert_at = i + 1
+    lines.insert(insert_at, "set_option profiler true")
+    return "\n".join(lines)
+
+
 def _transform_grind_lines(source: str, fn) -> str:
     """Apply `fn(indent, trimmed)` to each grind line, keep others unchanged."""
     out = []
@@ -150,8 +178,38 @@ def make_query_source(source):
     return _transform_grind_lines(source, lambda ind, t: ind + "grind?" + t[5:])
 
 
+def _demodulify(source: str) -> str:
+    """Strip `module` keyword and convert `public import` to `import`.
+
+    Needed so we can add a regular (non-module) import to a module file.
+    Only affects the generated query file, not the original source.
+    """
+    lines = source.split("\n")
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "module":
+            continue
+        if stripped.startswith("public import "):
+            out.append(line.replace("public import ", "import ", 1))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def make_decompile_source(source):
-    return _transform_grind_lines(source, lambda ind, t: ind + "decompile " + t)
+    transformed = _transform_grind_lines(source, lambda ind, t: ind + "decompile " + t)
+    transformed = _demodulify(transformed)
+    # Ensure the decompile tactic is available — insert after last import line
+    if "import LeanDecomp" not in transformed:
+        lines = transformed.split("\n")
+        insert_at = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith("import "):
+                insert_at = i + 1
+        lines.insert(insert_at, "import LeanDecomp.ProofTermMacro")
+        transformed = "\n".join(lines)
+    return transformed
 
 
 def apply_replacement(source, suggestion):
@@ -164,18 +222,44 @@ def apply_replacement(source, suggestion):
     return _transform_grind_lines(source, replace)
 
 # ---------------------------------------------------------------------------
+# Treatments
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Treatment:
+    """A benchmark treatment that transforms grind into a variant tactic."""
+    name: str
+    query_transform: Callable[[str], str]  # source → query source
+    out_suffix: str         # file suffix for the compiled variant
+    filter: Callable[[str], bool]  # which suggestions from the query to try
+
+
+def _is_grind_only(suggestion: str) -> bool:
+    return suggestion.split("\n")[0].strip().startswith("grind only")
+
+
+TREATMENTS = [
+    Treatment("grindonly",   make_query_source,
+              ".grind_only.lean",   _is_grind_only),
+    Treatment("grindscript", make_query_source,
+              ".grind_script.lean", lambda s: not _is_grind_only(s)),
+    Treatment("decompile",    make_decompile_source,
+              ".decompiled.lean",   lambda _: True),
+]
+
+# ---------------------------------------------------------------------------
 # Suggestion extraction pipeline
 # ---------------------------------------------------------------------------
 
-def get_suggestions(workspace, variant_source, suffix, lean_file):
-    """Write variant source, run it, return (suggestions, query_path)."""
+def _get_suggestions(workspace, variant_source, suffix, lean_file):
+    """Write variant source, run it, return (suggestions, query_path, raw_output)."""
     query_path = Path(lean_file + suffix)
     (workspace / query_path).write_text(variant_source)
     _, _, combined = lake_env_lean(workspace, query_path)
-    return extract_suggestions(combined), query_path
+    return extract_suggestions(combined), query_path, combined
 
 
-def try_suggestions(workspace, source, suggestions, lean_file, out_suffix):
+def _try_suggestions(workspace, source, suggestions, lean_file, out_suffix):
     """Try each suggestion until one compiles. Return (suggestion, file) or (None, None)."""
     if not suggestions:
         return None, None
@@ -191,10 +275,51 @@ def try_suggestions(workspace, source, suggestions, lean_file, out_suffix):
     return None, None
 
 
-def is_grind_only(suggestion: str) -> bool:
-    """True if the suggestion is a `grind only [...]` style (not a tactic script)."""
-    first_line = suggestion.split("\n")[0].strip()
-    return first_line.startswith("grind only")
+def extract_treatments(workspace, source, lean_file, treatments=TREATMENTS):
+    """Run queries and extract working suggestions for each treatment.
+
+    Returns (variants, temp_files, errors) where variants is a list of
+    (label, file_path_str, suggestion_or_None) and errors is a list of
+    (treatment_name, error_message).
+    """
+    temp_files = []
+    variants = []
+    errors = []
+
+    for t in treatments:
+        query_suffix = f".{t.name}_query.lean"
+        print(f"\nExtracting {t.name} suggestions...")
+        all_suggestions, qf, raw_output = _get_suggestions(
+            workspace, t.query_transform(source), query_suffix, lean_file)
+        temp_files.append(qf)
+
+        if not all_suggestions:
+            print("  No suggestions found.")
+            errors.append((t.name, raw_output.strip() or "no output"))
+            continue
+
+        filtered = [s for s in all_suggestions if t.filter(s)]
+        if not filtered:
+            print(f"  No matching suggestions for {t.name}.")
+            errors.append((t.name, "no matching suggestions"))
+            continue
+
+        print(f"  Found {len(filtered)} suggestion(s):")
+        for s in filtered:
+            first_line = s.split("\n")[0]
+            ellipsis = " ..." if "\n" in s else ""
+            print(f"    {first_line}{ellipsis}")
+
+        print(f"  Trying {len(filtered)} '{t.name}' suggestion(s)...")
+        sug, sf = _try_suggestions(
+            workspace, source, filtered, lean_file, t.out_suffix)
+        if sug:
+            variants.append((t.name, str(sf), sug))
+            temp_files.append(sf)
+        else:
+            errors.append((t.name, "all suggestions failed to compile"))
+
+    return variants, temp_files, errors
 
 # ---------------------------------------------------------------------------
 # Benchmarking
@@ -214,7 +339,7 @@ def benchmark(workspace, lean_file, warmup, runs):
         ptimes = extract_profiler_times(output)
         t = ptimes.get("tactic execution")
         if t is None:
-            print(f"  run {i+1}/{runs}: no profiler output")
+            print(f"  run {i+1}/{runs}: no profiler output (exit {code})")
         else:
             print(f"  run {i+1}/{runs}: {t:.4f}s")
             samples.append(t)
@@ -234,85 +359,51 @@ def print_stats(label, samples):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Benchmark grind vs grind? suggestion vs decompile suggestion."
-    )
-    parser.add_argument("--runs", type=int, default=10)
-    parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--workspace", type=Path,
-                        default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--lean-file", default="LeanDecomp/BenchGrind.lean")
-    args = parser.parse_args()
+def add_bench_args(parser: argparse.ArgumentParser):
+    """Add bench_grind arguments to a parser."""
+    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--warmup", type=int, default=1)
 
-    workspace = args.workspace.resolve()
-    lean_file = args.lean_file
+
+def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
+                db: BenchDB | None = None):
+    """Benchmark grind variants for a single Lean file.
+
+    Args:
+        lean_file: Lean file to benchmark (relative to workspace).
+        workspace: Root workspace directory (where `lake` runs).
+        args: Parsed arguments with runs, warmup fields.
+        db: Optional results database to populate.
+
+    Returns:
+        0 on success, non-zero on failure.
+    """
+    workspace = workspace.resolve()
     if not (workspace / lean_file).exists():
         print(f"Not found: {workspace / lean_file}", file=sys.stderr)
         return 2
 
     source = (workspace / lean_file).read_text()
+    source = _ensure_profiler(source)
+    grind_line = _find_grind_line(source)
     temp_files = []
 
-    # Build dependencies
-    print("Building dependencies...")
-    code, _, output = run_cmd(["lake", "build"], workspace)
-    if code != 0:
-        print(output, file=sys.stderr)
-        return 1
+    # Write profiler-enabled original as a temp file for benchmarking
+    orig_path = Path(lean_file + ".original.lean")
+    (workspace / orig_path).write_text(source)
+    temp_files.append(orig_path)
 
-    # Extract suggestions for each variant
-    variants = [("original", lean_file, None)]
+    # Extract treatment variants
+    variants = [("original", str(orig_path), None)]
+    treatment_variants, treatment_temps, treatment_errors = extract_treatments(
+        workspace, source, lean_file)
+    variants.extend(treatment_variants)
+    temp_files.extend(treatment_temps)
 
-    print("\nExtracting grind? suggestions...")
-    grind_suggestions, qf = get_suggestions(
-        workspace, make_query_source(source), ".query.lean", lean_file)
-    temp_files.append(qf)
-    if grind_suggestions:
-        print(f"  Found {len(grind_suggestions)} suggestion(s):")
-        for s in grind_suggestions:
-            first_line = s.split("\n")[0]
-            ellipsis = " ..." if "\n" in s else ""
-            print(f"    {first_line}{ellipsis}")
-
-        only_sugs = [s for s in grind_suggestions if is_grind_only(s)]
-        script_sugs = [s for s in grind_suggestions if not is_grind_only(s)]
-
-        if only_sugs:
-            print(f"\n  Trying {len(only_sugs)} 'grind only' suggestion(s)...")
-            sug, sf = try_suggestions(
-                workspace, source, only_sugs, lean_file, ".grind_only.lean")
-            if sug:
-                variants.append(("grind only", str(sf), sug))
-                temp_files.append(sf)
-
-        if script_sugs:
-            print(f"\n  Trying {len(script_sugs)} 'grind script' suggestion(s)...")
-            sug, sf = try_suggestions(
-                workspace, source, script_sugs, lean_file, ".grind_script.lean")
-            if sug:
-                variants.append(("grind script", str(sf), sug))
-                temp_files.append(sf)
-    else:
-        print("  No suggestions found.")
-
-    print("\nExtracting decompile suggestion...")
-    decomp_suggestions, qf = get_suggestions(
-        workspace, make_decompile_source(source), ".decomp_query.lean", lean_file)
-    temp_files.append(qf)
-    if decomp_suggestions:
-        print(f"  Found {len(decomp_suggestions)} suggestion(s):")
-        for s in decomp_suggestions:
-            first_line = s.split("\n")[0]
-            ellipsis = " ..." if "\n" in s else ""
-            print(f"    {first_line}{ellipsis}")
-        sug, sf = try_suggestions(
-            workspace, source, decomp_suggestions, lean_file, ".decompiled.lean")
-        if sug:
-            variants.append(("decompile", str(sf), sug))
-            temp_files.append(sf)
-    else:
-        print("  No suggestions found.")
+    # Record extraction errors in the database
+    if db:
+        for tname, errmsg in treatment_errors:
+            db.add_error(lean_file, grind_line, tname, errmsg)
 
     # Show what each variant uses
     print("\n── Variants ──")
@@ -337,25 +428,38 @@ def main():
         print(f"\n── {label} ──")
         r = benchmark(workspace, file, args.warmup, args.runs)
         if r is None:
-            return 1
+            print(f"  FAILED — skipping {label}")
+            if db:
+                db.add_error(lean_file, grind_line, label, "benchmark failed")
+            continue
         results[label] = r
+        if db:
+            db.add_timing(lean_file, grind_line, label, r)
+
+    if not results:
+        print("\nAll variants failed.")
+        # Cleanup
+        for f in temp_files:
+            (workspace / f).unlink(missing_ok=True)
+        return 1
 
     # Report
     print("\n── Summary (tactic execution time) ──")
     for label, _, _ in variants:
-        print_stats(label, results[label])
+        if label in results:
+            print_stats(label, results[label])
+        else:
+            print(f"  {label}:  FAILED")
 
-    orig = statistics.mean(results["original"])
-    for label, _, _ in variants[1:]:
-        m = statistics.mean(results[label])
-        if m > 0:
-            print(f"  {label} speedup: {orig / m:.3f}x")
+    if "original" in results:
+        orig = statistics.mean(results["original"])
+        for label, _, _ in variants[1:]:
+            if label in results:
+                m = statistics.mean(results[label])
+                if m > 0:
+                    print(f"  {label} speedup: {orig / m:.3f}x")
 
     # Cleanup
     for f in temp_files:
         (workspace / f).unlink(missing_ok=True)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
