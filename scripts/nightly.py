@@ -141,7 +141,9 @@ def main():
                         help="Lean file or folder to evaluate (relative to workspace, default: mathlib4/Mathlib/Algebra)")
     parser.add_argument("--output", default="results.json",
                         help="Path to write JSON results database (default: results.json)")
-    parser.add_argument("--update", action="store_true",
+    parser.add_argument("--serve", action="store_true",
+                        help="Start a local HTTP server to view results after benchmarking")
+    parser.add_argument("--justserve", action="store_true",
                         help="Skip benchmarking and just serve existing results")
     parser.add_argument("--port", type=int, default=8080,
                         help="Port for the eval-live server (default: 8080)")
@@ -150,7 +152,7 @@ def main():
 
     workspace = Path(__file__).resolve().parents[1]
 
-    if args.update:
+    if args.justserve:
         results = Path(args.output)
         if not results.is_absolute():
             results = workspace / results
@@ -197,7 +199,8 @@ def main():
     db.save_json(args.output)
     print(f"\nResults saved to {args.output}")
 
-    serve_results(Path(args.output).resolve(), workspace, args.port)
+    if args.serve:
+        serve_results(Path(args.output).resolve(), workspace, args.port)
 
     return 0
 

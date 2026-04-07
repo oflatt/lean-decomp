@@ -30,7 +30,7 @@ mutual
   partial def decompileExpr (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Array (TSyntax `tactic) × List String) := do
     withLCtx lctx localInsts do
-      Meta.lambdaTelescope expr fun xs body => do
+      Meta.withReducible <| Meta.lambdaTelescope expr fun xs body => do
         if xs.size > 0 then
           -- Use the current local context from inside lambdaTelescope
           let telescopeLctx ← getLCtx
@@ -105,34 +105,34 @@ mutual
           return none
 
   /-- Handle beta redex: `(fun x => body) arg` where arg is an fvar.
-      Transform to `let x := arg; body` to avoid immediate application in output. -/
+      Transform to `let x := arg; body` to avoid immediate application in output.
+      When the argument is not an fvar, simply beta-reduce and recurse. -/
   private partial def tryDecompBetaRedex (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
-      -- Check if expr is `(fun x => body) arg` where arg is an fvar
+      -- Check if expr is `(fun x => body) arg`
       let .app fn arg := expr | return none
       let .lam binderName binderType body _binderInfo := fn | return none
-      let some argFvarId := arg.fvarId? | return none
-      -- Get the name of the argument variable
-      let argDecl ← argFvarId.getDecl
-      let argName := argDecl.userName
-      -- Use the lambda's binder name for the let binding (it will shadow)
-      let letBinderName := binderBaseName used.length binderName
-      let letBinderId := FVarId.mk (← mkFreshId)
-      -- Add the let declaration to the local context
-      let newLctx := lctx.mkLetDecl letBinderId (Name.mkSimple letBinderName) binderType arg
-      let newLocalInsts ← getLocalInstances
-      -- Mark the let binder name as used for future naming
-      let used' := letBinderName :: used
-      -- Substitute the new fvar for the bound variable in body
-      let newBody := body.instantiate1 (Expr.fvar letBinderId)
-      -- Recursively render the body
-      let (bodyTactics, used'') ← decompileExpr newBody newLctx newLocalInsts used'
-      -- Build the let tactic: `let letBinderName := argName`
-      let letBinderIdent := mkIdent (Name.mkSimple letBinderName)
-      let argIdent := mkIdent argName
-      let letTac ← `(tactic| let $letBinderIdent := $argIdent)
-      return some (#[letTac] ++ bodyTactics, used'')
+      -- If arg is an fvar, emit a let binding for readability
+      if let some argFvarId := arg.fvarId? then
+        let argDecl ← argFvarId.getDecl
+        let argName := argDecl.userName
+        let letBinderName := binderBaseName used.length binderName
+        let letBinderId := FVarId.mk (← mkFreshId)
+        let newLctx := lctx.mkLetDecl letBinderId (Name.mkSimple letBinderName) binderType arg
+        let newLocalInsts ← getLocalInstances
+        let used' := letBinderName :: used
+        let newBody := body.instantiate1 (Expr.fvar letBinderId)
+        let (bodyTactics, used'') ← decompileExpr newBody newLctx newLocalInsts used'
+        let letBinderIdent := mkIdent (Name.mkSimple letBinderName)
+        let argIdent := mkIdent argName
+        let letTac ← `(tactic| let $letBinderIdent := $argIdent)
+        return some (#[letTac] ++ bodyTactics, used'')
+      else
+        -- Non-fvar argument: just beta-reduce and recurse
+        let reduced := body.instantiate1 arg
+        let (tactics, used') ← decompileExpr reduced lctx localInsts used
+        return some (tactics, used')
 
   /-- Handle `*.noConfusion` applications by reducing them first.
       This turns constructor-equality eliminators into simpler branch terms,
