@@ -10,6 +10,12 @@
   line-height: 1.5;
 }
 
+.eval-live .eval-live-title {
+  font-size: 1.6rem;
+  font-weight: 700;
+  margin-bottom: 1.5rem;
+}
+
 .eval-live .table-section {
   margin-bottom: 3rem;
 }
@@ -108,4 +114,24 @@
 
 .eval-live .expand-btn:hover {
   background: #eee;
+}
+
+.eval-live .filter-input {
+  width: 100%;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.78rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  color: #333;
+}
+
+.eval-live .filter-input::placeholder {
+  color: #aaa;
+}
+
+.eval-live .filter-row th {
+  background: #f7f8fa;
+  border-bottom: 2px solid #ddd;
+  padding: 0.35rem 0.5rem;
 }

@@ -177,8 +177,9 @@ def make_query_source(source):
 
 
 def _demodulify(source: str) -> str:
-    """Strip `module` keyword and convert `public import` to `import`.
+    """Strip `module` keyword and convert module-only import forms to plain `import`.
 
+    Handles `public import`, `meta import`, and `public meta import`.
     Needed so we can add a regular (non-module) import to a module file.
     Only affects the generated query file, not the original source.
     """
@@ -188,10 +189,10 @@ def _demodulify(source: str) -> str:
         stripped = line.strip()
         if stripped == "module":
             continue
-        if stripped.startswith("public import "):
-            out.append(line.replace("public import ", "import ", 1))
-        else:
-            out.append(line)
+        new = line.replace("public ", "", 1) if stripped.startswith("public ") else line
+        new_stripped = new.strip()
+        new = new.replace("meta import", "import", 1) if new_stripped.startswith("meta import") else new
+        out.append(new)
     return "\n".join(out)
 
 

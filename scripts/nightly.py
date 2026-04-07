@@ -79,7 +79,7 @@ def find_lean_files_with_grind(path: Path) -> list[Path]:
     return result
 
 
-def serve_results(results_path: Path, workspace: Path, port: int = 8080):
+def serve_results(results_path: Path, workspace: Path, port: int = 8080, name: str = "Eval"):
     """Start a local HTTP server serving eval-live with the results JSON."""
     eval_live_dir = workspace / "eval-live"
     css = (eval_live_dir / "eval-live.css").read_text()
@@ -103,11 +103,11 @@ def serve_results(results_path: Path, workspace: Path, port: int = 8080):
   </style>
 </head>
 <body>
-  <h1>Eval Live</h1>
+  <h1>{name} \u2014 Eval Live</h1>
   <div id="tables"></div>
   <script>
     {js}
-    initEvalLive("tables", {results_json});
+    initEvalLive("tables", {results_json}, "{name}");
   </script>
 </body>
 </html>"""
@@ -148,6 +148,8 @@ def main():
                         help="Skip benchmarking and just serve existing results")
     parser.add_argument("--port", type=int, default=8080,
                         help="Port for the eval-live server (default: 8080)")
+    parser.add_argument("--name", default="Eval",
+                        help="Project name shown in the eval-live heading (default: Eval)")
     add_bench_args(parser)
     args = parser.parse_args()
 
@@ -160,7 +162,7 @@ def main():
         if not results.exists():
             print(f"Results file not found: {results}", file=sys.stderr)
             return 2
-        serve_results(results, workspace, args.port)
+        serve_results(results, workspace, args.port, args.name)
         return 0
 
     mathlib = ensure_mathlib(workspace)
@@ -201,7 +203,7 @@ def main():
     print(f"\nResults saved to {args.output}")
 
     if args.serve:
-        serve_results(Path(args.output).resolve(), workspace, args.port)
+        serve_results(Path(args.output).resolve(), workspace, args.port, args.name)
 
     return 0
 

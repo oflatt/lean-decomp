@@ -23,6 +23,9 @@
   <div class="file-picker">
     <label for="json-file">Load a results.json file:&nbsp;</label>
     <input type="file" id="json-file" accept=".json">
+    <br><br>
+    <label for="project-name">Project name (optional):&nbsp;</label>
+    <input type="text" id="project-name" placeholder="My Project">
   </div>
   <div id="tables"></div>
 
@@ -34,7 +37,8 @@
       const reader = new FileReader();
       reader.onload = (ev) => {
         try {
-          initEvalLive("tables", JSON.parse(ev.target.result));
+          const name = document.getElementById("project-name").value || undefined;
+          initEvalLive("tables", JSON.parse(ev.target.result), name);
         } catch (err) {
           document.getElementById("tables").textContent = "Error parsing JSON: " + err.message;
         }
