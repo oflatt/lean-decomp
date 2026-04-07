@@ -46,6 +46,7 @@ mutual
             LeanDecomp.tryDecompEqSymm expr lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqTrans expr lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqMp expr lctx localInsts used decompileExpr,
+            tryDecompIntroWithEq expr lctx localInsts used,
             tryDecompFalseRec expr lctx localInsts used,
             tryDecompBetaRedex expr lctx localInsts used,
             tryDecompId expr lctx localInsts used
@@ -152,6 +153,49 @@ mutual
         let (tactics, used') ← decompileExpr reduced lctx localInsts used
         return some (tactics, used')
 
+      return none
+
+  /-- Handle `Lean.Grind.intro_with_eq` and `Lean.Grind.intro_with_eq'` by
+      unfolding and reducing them, then recursively decompiling the result.
+      `intro_with_eq p p' q he k hp` reduces to `k (Eq.mp he hp)`.
+      We perform this reduction manually to avoid `whnf` over-reducing
+      inner terms like `Or.casesOn` into `Or.rec`. -/
+  private partial def tryDecompIntroWithEq (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+    withLCtx lctx localInsts do
+      let (fn, args) := peelArgs expr
+      let some constName := Expr.constName? fn
+        | return none
+      if constName != ``Lean.Grind.intro_with_eq && constName != ``Lean.Grind.intro_with_eq' then
+        return none
+      -- args layout: [p, p', q, he, k] (partial) or [p, p', q, he, k, hp] (full)
+      if args.length == 6 then
+        -- Fully applied: intro_with_eq p p' q he k hp ↝ k (Eq.mp he hp)
+        let p := args[0]!
+        let p' := args[1]!
+        let he := args[3]!
+        let k := args[4]!
+        let hp := args[5]!
+        let eqMpApp := mkApp4 (mkConst ``Eq.mp [Level.zero]) p p' he hp
+        let result := Expr.app k eqMpApp
+        -- Beta-reduce if k is a lambda
+        let result := result.headBeta
+        let (tactics, used') ← decompileExpr result lctx localInsts used
+        return some (tactics, used')
+      else if args.length == 5 then
+        -- Partially applied: returns p → q, construct lambda manually
+        let p := args[0]!
+        let p' := args[1]!
+        let he := args[3]!
+        let k := args[4]!
+        let body := Expr.lam `hp p
+          (Expr.app (k.liftLooseBVars 0 1)
+            (mkApp4 (mkConst ``Eq.mp [Level.zero])
+              (p.liftLooseBVars 0 1) (p'.liftLooseBVars 0 1)
+              (he.liftLooseBVars 0 1) (.bvar 0)))
+          .default
+        let (tactics, used') ← decompileExpr body lctx localInsts used
+        return some (tactics, used')
       return none
 
   /-- Handle `False.rec` terms.

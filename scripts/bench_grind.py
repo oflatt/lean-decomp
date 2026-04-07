@@ -132,16 +132,27 @@ def _skip_indented(lines, start):
 # Source transformation
 # ---------------------------------------------------------------------------
 
-def _is_grind_line(trimmed: str) -> bool:
-    return trimmed.startswith("grind ") or trimmed.startswith("grind[") or trimmed == "grind"
+# Pattern matching `grind` as a standalone tactic word (not inside another word).
+# Matches: `grind`, `grind `, `grind[`, end-of-line `grind`
+GRIND_RE = re.compile(r'(?<!\w)grind(?=\s|\[|$)')
+
+
+def _has_grind(line: str) -> bool:
+    """Return True if line contains a grind tactic call."""
+    return bool(GRIND_RE.search(line))
 
 
 def _find_grind_line(source: str) -> int:
     """Return 1-indexed line number of first grind tactic, or 0 if none."""
     for i, line in enumerate(source.split("\n"), 1):
-        if _is_grind_line(line.lstrip()):
+        if _has_grind(line):
             return i
     return 0
+
+
+def _find_all_grind_lines(source: str) -> list[int]:
+    """Return 1-indexed line numbers of all lines containing a grind tactic."""
+    return [i for i, line in enumerate(source.split("\n"), 1) if _has_grind(line)]
 
 
 def _ensure_profiler(source: str) -> str:
@@ -159,21 +170,68 @@ def _ensure_profiler(source: str) -> str:
     return "\n".join(lines)
 
 
-def _transform_grind_lines(source: str, fn) -> str:
-    """Apply `fn(indent, trimmed)` to each grind line, keep others unchanged."""
-    out = []
-    for line in source.split("\n"):
-        trimmed = line.lstrip()
-        if _is_grind_line(trimmed):
-            indent = line[: len(line) - len(trimmed)]
-            out.append(fn(indent, trimmed))
-        else:
-            out.append(line)
-    return "\n".join(out)
+def _replace_grind_on_line(line: str, replacement: str) -> str:
+    """Replace the grind tactic on a single line with replacement text."""
+    m = GRIND_RE.search(line)
+    if not m:
+        return line
+    # Replace from grind to end-of-line with the first line of replacement;
+    # preserve everything before grind (e.g. `use foo; `)
+    before = line[:m.start()]
+    return before + replacement
 
 
-def make_query_source(source):
-    return _transform_grind_lines(source, lambda ind, t: ind + "grind?" + t[5:])
+def _transform_grind_at_line(source: str, target_line: int, replacement: str) -> str:
+    """Replace the grind tactic at target_line (1-indexed) with replacement.
+
+    For multi-line replacements, additional lines are inserted after the target
+    line, indented to the column where grind started.
+
+    When grind follows a semicolon (e.g. ``use foo; grind``) and the
+    replacement spans multiple lines, the replacement is wrapped in ``{ … }``
+    so that Lean treats the whole block as a single tactic after the ``;``.
+    """
+    lines = source.split("\n")
+    idx = target_line - 1
+    line = lines[idx]
+    m = GRIND_RE.search(line)
+    if not m:
+        return source
+
+    before = line[:m.start()]
+    grind_col = m.start()
+    rep_lines = replacement.split("\n")
+
+    # Detect whether grind follows a semicolon (possibly with whitespace).
+    needs_braces = bool(re.search(r";\s*$", before)) and len(rep_lines) > 1
+
+    if needs_braces:
+        indent = " " * grind_col
+        new_lines = [before + "{"]
+        for rl in rep_lines:
+            if rl.strip():
+                new_lines.append(indent + "  " + rl)
+            else:
+                new_lines.append("")
+        new_lines.append(indent + "}")
+    else:
+        new_lines = [before + rep_lines[0]]
+        for rl in rep_lines[1:]:
+            if rl.strip():
+                new_lines.append(" " * grind_col + rl)
+            else:
+                new_lines.append("")
+
+    lines[idx:idx + 1] = new_lines
+    return "\n".join(lines)
+
+
+def _make_query_at_line(source: str, target_line: int) -> str:
+    """Replace the grind at target_line with grind? (preserving args)."""
+    lines = source.split("\n")
+    idx = target_line - 1
+    lines[idx] = GRIND_RE.sub("grind?", lines[idx], count=1)
+    return "\n".join(lines)
 
 
 def _demodulify(source: str) -> str:
@@ -196,8 +254,12 @@ def _demodulify(source: str) -> str:
     return "\n".join(out)
 
 
-def make_decompile_source(source):
-    transformed = _transform_grind_lines(source, lambda ind, t: ind + "decompile " + t)
+def _make_decompile_at_line(source: str, target_line: int) -> str:
+    """Replace the grind at target_line with 'decompile grind', demodulify, add import."""
+    lines = source.split("\n")
+    idx = target_line - 1
+    lines[idx] = GRIND_RE.sub("decompile grind", lines[idx], count=1)
+    transformed = "\n".join(lines)
     transformed = _demodulify(transformed)
     # Insert decompile tactic import after last import line
     lines = transformed.split("\n")
@@ -208,16 +270,6 @@ def make_decompile_source(source):
     lines.insert(insert_at, "import LeanDecomp.ProofTermMacro")
     return "\n".join(lines)
 
-
-def apply_replacement(source, suggestion):
-    def replace(indent, _trimmed):
-        sug_lines = suggestion.split("\n")
-        return "\n".join(
-            (indent + sl if i == 0 or sl.strip() else sl)
-            for i, sl in enumerate(sug_lines)
-        )
-    return _transform_grind_lines(source, replace)
-
 # ---------------------------------------------------------------------------
 # Treatments
 # ---------------------------------------------------------------------------
@@ -226,7 +278,7 @@ def apply_replacement(source, suggestion):
 class Treatment:
     """A benchmark treatment that transforms grind into a variant tactic."""
     name: str
-    query_transform: Callable[[str], str]  # source → query source
+    query_transform: Callable[[str, int], str]  # (source, grind_line) → query source
     out_suffix: str         # file suffix for the compiled variant
     filter: Callable[[str], bool]  # which suggestions from the query to try
 
@@ -236,11 +288,11 @@ def _is_grind_only(suggestion: str) -> bool:
 
 
 TREATMENTS = [
-    Treatment("grindonly",   make_query_source,
+    Treatment("grindonly",   _make_query_at_line,
               ".grind_only.lean",   _is_grind_only),
-    Treatment("grindscript", make_query_source,
+    Treatment("grindscript", _make_query_at_line,
               ".grind_script.lean", lambda s: not _is_grind_only(s)),
-    Treatment("decompile",    make_decompile_source,
+    Treatment("decompile",    _make_decompile_at_line,
               ".decompiled.lean",   lambda _: True),
 ]
 
@@ -248,22 +300,24 @@ TREATMENTS = [
 # Suggestion extraction pipeline
 # ---------------------------------------------------------------------------
 
-def _get_suggestions(workspace, variant_source, suffix, lean_file):
-    """Write variant source, run it, return (suggestions, query_path, raw_output)."""
+def _get_line_suggestions(workspace, source, grind_line, query_transform, suffix, lean_file):
+    """Run a query for one grind line. Return (suggestions, query_path, raw_output)."""
+    query_source = query_transform(source, grind_line)
     query_path = Path(lean_file + suffix)
-    (workspace / query_path).write_text(variant_source)
+    (workspace / query_path).write_text(query_source)
     _, _, combined = lake_env_lean(workspace, query_path)
     return extract_suggestions(combined), query_path, combined
 
 
-def _try_suggestions(workspace, source, suggestions, lean_file, out_suffix):
-    """Try each suggestion until one compiles. Return (suggestion, file, last_error)."""
+def _try_line_suggestion(workspace, source, grind_line, suggestions, lean_file, out_suffix):
+    """Try each suggestion for a specific grind line. Return (suggestion, path, last_error)."""
     if not suggestions:
         return None, None, None
-    result_path = Path(lean_file + out_suffix)
+    result_path = Path(lean_file + f".L{grind_line}" + out_suffix)
     last_output = ""
     for s in suggestions:
-        (workspace / result_path).write_text(apply_replacement(source, s))
+        replaced = _transform_grind_at_line(source, grind_line, s)
+        (workspace / result_path).write_text(replaced)
         code, _, output = lake_env_lean(workspace, result_path)
         if code == 0:
             return s, result_path, None
@@ -272,41 +326,71 @@ def _try_suggestions(workspace, source, suggestions, lean_file, out_suffix):
     return None, None, last_output.strip()
 
 
-def extract_treatments(workspace, source, lean_file, treatments=TREATMENTS):
-    """Run queries and extract working suggestions for each treatment.
+def extract_treatments(workspace, source, lean_file, grind_lines,
+                       treatments=TREATMENTS):
+    """Run per-line queries and build combined variant files for each treatment.
 
-    Returns (variants, temp_files, errors) where variants is a list of
-    (label, file_path_str, suggestion_or_None) and errors is a list of
-    (treatment_name, error_message).
+    Processes each grind line independently: runs the query transform for that
+    single line, collects suggestions, validates them, then combines all per-line
+    replacements into one variant file per treatment.
+
+    Returns (variants, temp_files, errors).
     """
     temp_files = []
     variants = []
     errors = []
 
+    # Per-treatment, per-line working suggestions
+    line_results: dict[str, dict[int, str]] = {t.name: {} for t in treatments}
+
+    for grind_line in grind_lines:
+        for t in treatments:
+            suffix = f".{t.name}_query_L{grind_line}.lean"
+            all_suggestions, qf, raw_output = _get_line_suggestions(
+                workspace, source, grind_line, t.query_transform, suffix, lean_file)
+            temp_files.append(qf)
+
+            filtered = [s for s in all_suggestions if t.filter(s)]
+            if not filtered:
+                msg = raw_output.strip()[:500] or "no output" if not all_suggestions else "no matching suggestions"
+                errors.append((t.name, f"L{grind_line}: {msg}"))
+                continue
+
+            sug, sf, last_error = _try_line_suggestion(
+                workspace, source, grind_line, filtered, lean_file,
+                f".{t.name}_L{grind_line}.lean")
+            if sug:
+                line_results[t.name][grind_line] = sug
+                if sf:
+                    temp_files.append(sf)
+            else:
+                suggestions_tried = "\n".join(f"  suggestion: {s}" for s in filtered)
+                error_msg = f"L{grind_line}:\n{suggestions_tried}"
+                if last_error:
+                    error_msg += f"\n{last_error}"
+                errors.append((t.name, error_msg))
+
+    # Build combined variant for each treatment (replace all successful lines)
     for t in treatments:
-        query_suffix = f".{t.name}_query.lean"
-        all_suggestions, qf, raw_output = _get_suggestions(
-            workspace, t.query_transform(source), query_suffix, lean_file)
-        temp_files.append(qf)
-
-        if not all_suggestions:
-            errors.append((t.name, raw_output.strip() or "no output"))
+        per_line = line_results[t.name]
+        if not per_line:
             continue
 
-        filtered = [s for s in all_suggestions if t.filter(s)]
-        if not filtered:
-            errors.append((t.name, "no matching suggestions"))
-            continue
+        combined = source
+        # Apply replacements bottom-to-top so line numbers stay valid
+        for gl in sorted(per_line.keys(), reverse=True):
+            combined = _transform_grind_at_line(combined, gl, per_line[gl])
 
-        sug, sf, last_error = _try_suggestions(
-            workspace, source, filtered, lean_file, t.out_suffix)
-        if sug:
-            variants.append((t.name, str(sf), sug))
-            temp_files.append(sf)
+        result_path = Path(lean_file + t.out_suffix)
+        (workspace / result_path).write_text(combined)
+
+        code, _, output = lake_env_lean(workspace, result_path)
+        if code == 0:
+            variants.append((t.name, str(result_path), None))
+            temp_files.append(result_path)
         else:
-            suggestions_tried = "\n".join(f"suggestion: {s}" for s in filtered)
-            error_msg = f"{suggestions_tried}\n{last_error}" if last_error else suggestions_tried
-            errors.append((t.name, error_msg))
+            (workspace / result_path).unlink(missing_ok=True)
+            errors.append((t.name, f"combined validation failed:\n{output.strip()[:500]}"))
 
     return variants, temp_files, errors
 
@@ -363,7 +447,8 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
 
     source = (workspace / lean_file).read_text()
     source = _ensure_profiler(source)
-    grind_line = _find_grind_line(source)
+    grind_lines = _find_all_grind_lines(source)
+    grind_line = grind_lines[0] if grind_lines else 0
     temp_files = []
 
     # Write profiler-enabled original as a temp file for benchmarking
@@ -374,7 +459,7 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
     # Extract treatment variants
     variants = [("original", str(orig_path), None)]
     treatment_variants, treatment_temps, treatment_errors = extract_treatments(
-        workspace, source, lean_file)
+        workspace, source, lean_file, grind_lines)
     variants.extend(treatment_variants)
     temp_files.extend(treatment_temps)
 
@@ -398,8 +483,10 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
         mean = statistics.mean(r)
         print(f"  ({lean_file}:{grind_line}, {label}) {mean:.4f}s")
 
-    # Print extraction errors briefly
-    for tname, _ in treatment_errors:
+    # Print extraction errors only for treatments that have no variant at all
+    successful_treatments = {label for label, _, _ in treatment_variants}
+    failed_treatments = {tname for tname, _ in treatment_errors if tname not in successful_treatments}
+    for tname in failed_treatments:
         print(f"  ({lean_file}:{grind_line}, {tname}) FAILED")
 
     if not results:

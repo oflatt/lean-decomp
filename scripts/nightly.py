@@ -6,6 +6,7 @@ bench_grind.py on each Lean file containing `grind` in the given path.
 """
 import argparse
 import http.server
+import re
 import subprocess
 import sys
 import webbrowser
@@ -72,19 +73,19 @@ def find_lean_files_with_grind(path: Path) -> list[Path]:
         except (OSError, UnicodeDecodeError):
             continue
         for line in text.splitlines():
-            trimmed = line.lstrip()
-            if trimmed.startswith("grind ") or trimmed.startswith("grind[") or trimmed == "grind":
+            if re.search(r'(?<!\w)grind(?=\s|\[|$)', line):
                 result.append(f)
                 break
     return result
 
 
-def serve_results(results_path: Path, workspace: Path, port: int = 8080, name: str = "Eval"):
+def serve_results(results_path: Path, workspace: Path, port: int = 8080):
     """Start a local HTTP server serving eval-live with the results JSON."""
     eval_live_dir = workspace / "eval-live"
     css = (eval_live_dir / "eval-live.css").read_text()
     js = (eval_live_dir / "eval-live.js").read_text()
     results_json = results_path.read_text()
+    name = "LeanDecomp"
 
     page = f"""<!DOCTYPE html>
 <html lang="en">
@@ -98,12 +99,10 @@ def serve_results(results_path: Path, workspace: Path, port: int = 8080, name: s
       margin: 0; padding: 2rem 3rem;
       background: #f5f6f8; color: #1a1a1a;
     }}
-    h1 {{ font-size: 1.6rem; font-weight: 700; margin-bottom: 1rem; }}
     {css}
   </style>
 </head>
 <body>
-  <h1>{name} \u2014 Eval Live</h1>
   <div id="tables"></div>
   <script>
     {js}
@@ -142,14 +141,10 @@ def main():
                         help="Lean file or folder to evaluate (relative to workspace, default: mathlib4/Mathlib/Algebra)")
     parser.add_argument("--output", default="results.json",
                         help="Path to write JSON results database (default: results.json)")
-    parser.add_argument("--serve", action="store_true",
-                        help="After benchmarking, start a local server to view results")
     parser.add_argument("--update", action="store_true",
                         help="Skip benchmarking and just serve existing results")
     parser.add_argument("--port", type=int, default=8080,
                         help="Port for the eval-live server (default: 8080)")
-    parser.add_argument("--name", default="Eval",
-                        help="Project name shown in the eval-live heading (default: Eval)")
     add_bench_args(parser)
     args = parser.parse_args()
 
@@ -162,13 +157,13 @@ def main():
         if not results.exists():
             print(f"Results file not found: {results}", file=sys.stderr)
             return 2
-        serve_results(results, workspace, args.port, args.name)
+        serve_results(results, workspace, args.port)
         return 0
 
     mathlib = ensure_mathlib(workspace)
 
     if args.path is None:
-        target = mathlib / "Mathlib" / "Algebra"
+        target = mathlib / "Mathlib" / "Algebra" / "Order" / "Group" / "Int" / "Sum.lean"
     else:
         target = workspace / args.path
     if not target.exists():
@@ -202,8 +197,7 @@ def main():
     db.save_json(args.output)
     print(f"\nResults saved to {args.output}")
 
-    if args.serve:
-        serve_results(Path(args.output).resolve(), workspace, args.port, args.name)
+    serve_results(Path(args.output).resolve(), workspace, args.port)
 
     return 0
 
