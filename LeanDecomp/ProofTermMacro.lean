@@ -10,7 +10,7 @@ private def isAuxiliaryProofName (name : Name) : Bool :=
   (name.toString.splitOn "_proof_").length > 1
 
 private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
-  Meta.deltaExpand e isAuxiliaryProofName
+  Meta.deltaExpand e isAuxiliaryProofName (allowOpaque := true)
 
 /-- Run tactics, throwing a decompile error if they give an error -/
 private def runDecompiled (tactics : TSyntax `Lean.Parser.Tactic.tacticSeq) : TacticM Unit := do

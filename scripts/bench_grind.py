@@ -145,9 +145,7 @@ def _find_grind_line(source: str) -> int:
 
 
 def _ensure_profiler(source: str) -> str:
-    """Inject `set_option profiler true` if not already present."""
-    if "set_option profiler true" in source:
-        return source
+    """Inject `set_option profiler true`."""
     # Insert after the last import/module block line
     lines = source.split("\n")
     insert_at = 0
@@ -200,16 +198,14 @@ def _demodulify(source: str) -> str:
 def make_decompile_source(source):
     transformed = _transform_grind_lines(source, lambda ind, t: ind + "decompile " + t)
     transformed = _demodulify(transformed)
-    # Ensure the decompile tactic is available — insert after last import line
-    if "import LeanDecomp" not in transformed:
-        lines = transformed.split("\n")
-        insert_at = 0
-        for i, line in enumerate(lines):
-            if line.strip().startswith("import "):
-                insert_at = i + 1
-        lines.insert(insert_at, "import LeanDecomp.ProofTermMacro")
-        transformed = "\n".join(lines)
-    return transformed
+    # Insert decompile tactic import after last import line
+    lines = transformed.split("\n")
+    insert_at = 0
+    for i, line in enumerate(lines):
+        if line.strip().startswith("import "):
+            insert_at = i + 1
+    lines.insert(insert_at, "import LeanDecomp.ProofTermMacro")
+    return "\n".join(lines)
 
 
 def apply_replacement(source, suggestion):
@@ -260,19 +256,19 @@ def _get_suggestions(workspace, variant_source, suffix, lean_file):
 
 
 def _try_suggestions(workspace, source, suggestions, lean_file, out_suffix):
-    """Try each suggestion until one compiles. Return (suggestion, file) or (None, None)."""
+    """Try each suggestion until one compiles. Return (suggestion, file, last_error)."""
     if not suggestions:
-        return None, None
+        return None, None, None
     result_path = Path(lean_file + out_suffix)
+    last_output = ""
     for s in suggestions:
         (workspace / result_path).write_text(apply_replacement(source, s))
-        code, _, _ = lake_env_lean(workspace, result_path)
+        code, _, output = lake_env_lean(workspace, result_path)
         if code == 0:
-            print(f"  Using: {s.split(chr(10))[0]}{'...' if chr(10) in s else ''}")
-            return s, result_path
-        print(f"  Tried and failed: {s.split(chr(10))[0]}")
+            return s, result_path, None
+        last_output = output
     (workspace / result_path).unlink(missing_ok=True)
-    return None, None
+    return None, None, last_output.strip()
 
 
 def extract_treatments(workspace, source, lean_file, treatments=TREATMENTS):
@@ -288,36 +284,28 @@ def extract_treatments(workspace, source, lean_file, treatments=TREATMENTS):
 
     for t in treatments:
         query_suffix = f".{t.name}_query.lean"
-        print(f"\nExtracting {t.name} suggestions...")
         all_suggestions, qf, raw_output = _get_suggestions(
             workspace, t.query_transform(source), query_suffix, lean_file)
         temp_files.append(qf)
 
         if not all_suggestions:
-            print("  No suggestions found.")
             errors.append((t.name, raw_output.strip() or "no output"))
             continue
 
         filtered = [s for s in all_suggestions if t.filter(s)]
         if not filtered:
-            print(f"  No matching suggestions for {t.name}.")
             errors.append((t.name, "no matching suggestions"))
             continue
 
-        print(f"  Found {len(filtered)} suggestion(s):")
-        for s in filtered:
-            first_line = s.split("\n")[0]
-            ellipsis = " ..." if "\n" in s else ""
-            print(f"    {first_line}{ellipsis}")
-
-        print(f"  Trying {len(filtered)} '{t.name}' suggestion(s)...")
-        sug, sf = _try_suggestions(
+        sug, sf, last_error = _try_suggestions(
             workspace, source, filtered, lean_file, t.out_suffix)
         if sug:
             variants.append((t.name, str(sf), sug))
             temp_files.append(sf)
         else:
-            errors.append((t.name, "all suggestions failed to compile"))
+            suggestions_tried = "\n".join(f"suggestion: {s}" for s in filtered)
+            error_msg = f"{suggestions_tried}\n{last_error}" if last_error else suggestions_tried
+            errors.append((t.name, error_msg))
 
     return variants, temp_files, errors
 
@@ -329,7 +317,6 @@ def benchmark(workspace, lean_file, warmup, runs):
     cmd = ["lake", "env", "lean", str(lean_file)]
     for i in range(warmup):
         code, _, _ = run_cmd(cmd, workspace)
-        print(f"  warmup {i+1}/{warmup}")
         if code != 0:
             return None
 
@@ -338,22 +325,12 @@ def benchmark(workspace, lean_file, warmup, runs):
         code, _, output = run_cmd(cmd, workspace)
         ptimes = extract_profiler_times(output)
         t = ptimes.get("tactic execution")
-        if t is None:
-            print(f"  run {i+1}/{runs}: no profiler output (exit {code})")
-        else:
-            print(f"  run {i+1}/{runs}: {t:.4f}s")
+        if t is not None:
             samples.append(t)
         if code != 0:
             return None
     return samples or None
 
-
-def print_stats(label, samples):
-    mean = statistics.mean(samples)
-    median = statistics.median(samples)
-    stdev = statistics.stdev(samples) if len(samples) > 1 else 0.0
-    print(f"  {label}:  mean={mean:.4f}s  median={median:.4f}s  "
-          f"stdev={stdev:.4f}s  min={min(samples):.4f}s  max={max(samples):.4f}s")
 
 # ---------------------------------------------------------------------------
 # Main
@@ -405,59 +382,39 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
         for tname, errmsg in treatment_errors:
             db.add_error(lean_file, grind_line, tname, errmsg)
 
-    # Show what each variant uses
-    print("\n── Variants ──")
-    # Find the original grind tactic from source
-    orig_tactic = None
-    for line in source.split("\n"):
-        trimmed = line.lstrip()
-        if _is_grind_line(trimmed):
-            orig_tactic = trimmed
-            break
-    for label, file, suggestion in variants:
-        tactic = suggestion if suggestion else orig_tactic
-        print(f"\n  {label}:")
-        if tactic:
-            for tl in tactic.split("\n"):
-                print(f"    {tl}")
-        print(f"    file: {file}")
-
     # Benchmark each variant
     results = {}
     for label, file, _ in variants:
-        print(f"\n── {label} ──")
         r = benchmark(workspace, file, args.warmup, args.runs)
         if r is None:
-            print(f"  FAILED — skipping {label}")
+            print(f"  ({lean_file}:{grind_line}, {label}) FAILED")
             if db:
                 db.add_error(lean_file, grind_line, label, "benchmark failed")
             continue
         results[label] = r
         if db:
             db.add_timing(lean_file, grind_line, label, r)
+        mean = statistics.mean(r)
+        print(f"  ({lean_file}:{grind_line}, {label}) {mean:.4f}s")
+
+    # Print extraction errors briefly
+    for tname, _ in treatment_errors:
+        print(f"  ({lean_file}:{grind_line}, {tname}) FAILED")
 
     if not results:
-        print("\nAll variants failed.")
         # Cleanup
         for f in temp_files:
             (workspace / f).unlink(missing_ok=True)
         return 1
 
-    # Report
-    print("\n── Summary (tactic execution time) ──")
-    for label, _, _ in variants:
-        if label in results:
-            print_stats(label, results[label])
-        else:
-            print(f"  {label}:  FAILED")
-
+    # Speedup summary
     if "original" in results:
         orig = statistics.mean(results["original"])
         for label, _, _ in variants[1:]:
             if label in results:
                 m = statistics.mean(results[label])
                 if m > 0:
-                    print(f"  {label} speedup: {orig / m:.3f}x")
+                    print(f"  ({lean_file}:{grind_line}, {label}) speedup: {orig / m:.3f}x")
 
     # Cleanup
     for f in temp_files:
