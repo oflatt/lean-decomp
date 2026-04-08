@@ -30,7 +30,11 @@ mutual
   partial def decompileExpr (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Array (TSyntax `tactic) × List String) := do
     withLCtx lctx localInsts do
-      Meta.withReducible <| Meta.lambdaTelescope expr fun xs body => do
+      -- Try intro_with_eq BEFORE lambdaTelescope, since the telescope would
+      -- transparently unfold it (it reduces to a lambda).
+      if let some res ← tryDecompIntroWithEq expr lctx localInsts used then
+        return res
+      Meta.lambdaTelescope expr fun xs body => do
         if xs.size > 0 then
           -- Use the current local context from inside lambdaTelescope
           let telescopeLctx ← getLCtx
@@ -46,7 +50,6 @@ mutual
             LeanDecomp.tryDecompEqSymm expr lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqTrans expr lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqMp expr lctx localInsts used decompileExpr,
-            tryDecompIntroWithEq expr lctx localInsts used,
             tryDecompFalseRec expr lctx localInsts used,
             tryDecompBetaRedex expr lctx localInsts used,
             tryDecompId expr lctx localInsts used
