@@ -1,4 +1,5 @@
 import LeanDecomp.ProofTermMacro
+import Lean.Elab.GuardMsgs
 
 namespace LeanDecomp.SimpleTest
 
@@ -12,6 +13,13 @@ deriving instance BEq for LeanDecomp.SimpleTest.Stmt
 -- Test: decompile on a `cases h : s` proof with generalized equations.
 -- The casesOn handler strips the Eq.ndrec transport wrappers, allowing
 -- the branch bodies to re-elaborate correctly under `cases h : s with`.
+/--
+info: Try this:
+  [apply] cases h : s with
+    | skip => decide
+    | other => decide
+-/
+#guard_msgs in
 example (s: Stmt) : (s == Stmt.skip) || (s == Stmt.other) := by
   decompile
     cases h: s with

@@ -9,19 +9,7 @@ theorem simple_arith : 2 + 2 = 4 :=
 
 /--
 info: Try this:
-  [apply] exact
-      @of_decide_eq_true
-        (@Eq.{1} Nat
-          (@HAdd.hAdd.{0, 0, 0} Nat Nat Nat (@instHAdd.{0} Nat instAddNat)
-            (@OfNat.ofNat.{0} Nat (nat_lit 2) (instOfNatNat (nat_lit 2)))
-            (@OfNat.ofNat.{0} Nat (nat_lit 2) (instOfNatNat (nat_lit 2))))
-          (@OfNat.ofNat.{0} Nat (nat_lit 4) (instOfNatNat (nat_lit 4))))
-        (instDecidableEqNat
-          (@HAdd.hAdd.{0, 0, 0} Nat Nat Nat (@instHAdd.{0} Nat instAddNat)
-            (@OfNat.ofNat.{0} Nat (nat_lit 2) (instOfNatNat (nat_lit 2)))
-            (@OfNat.ofNat.{0} Nat (nat_lit 2) (instOfNatNat (nat_lit 2))))
-          (@OfNat.ofNat.{0} Nat (nat_lit 4) (instOfNatNat (nat_lit 4))))
-        (@Eq.refl.{1} Bool Bool.true)
+  [apply] decide
 -/
 #guard_msgs in
 example : 2 + 2 = 4 := by
@@ -30,7 +18,7 @@ example : 2 + 2 = 4 := by
 -- Test 2: Simple implication with intro
 /--
 info: Try this:
-  [apply] 
+  [apply]
     intro h
     exact h
 -/
@@ -59,7 +47,7 @@ example (P Q : Prop) (h : P → Q) (a : P) : Q := by
 -- Test 5: Universal statement
 /--
 info: Try this:
-  [apply] 
+  [apply]
     intro n
     exact Nat.zero_add n
 -/

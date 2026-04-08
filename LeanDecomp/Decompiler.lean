@@ -54,7 +54,8 @@ mutual
             LeanDecomp.tryDecompEqMp body lctx localInsts used decompileExpr,
             tryDecompFalseRec body lctx localInsts used,
             tryDecompFalseType body lctx localInsts used,
-            tryDecompBetaRedex body lctx localInsts used
+            tryDecompBetaRedex body lctx localInsts used,
+            tryDecompDecide body lctx localInsts used
           ]
           match specialized? with
           | some res => pure res
@@ -182,6 +183,18 @@ mutual
       -- use `contradiction` which handles noConfusion automatically.
       let contradictionTac ← `(tactic| contradiction)
       return some (#[contradictionTac], used)
+
+  /-- Handle `of_decide_eq_true` — emit `decide`.
+      `decide` elaborates to `of_decide_eq_true <proof>`, so we recognize
+      this pattern and replace the entire term with the `decide` tactic. -/
+  private partial def tryDecompDecide (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+    withLCtx lctx localInsts do
+      let (fn, _) := peelArgs expr
+      let some constName := fn.constName? | return none
+      if constName != ``of_decide_eq_true then return none
+      let tac ← `(tactic| decide)
+      return some (#[tac], used)
 
   /-- Handle any expression whose type is `False` — emit `contradiction`.
       This catches noConfusion-derived `Eq.ndrec` patterns and other complex

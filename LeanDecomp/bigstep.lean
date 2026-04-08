@@ -39,8 +39,14 @@ notation:55 "(" S:55 "," s:55 ")" " ==> " t:55 => BigStep S s t
 
 
 
-example {B S T s t} (hcond : B s) : (ifThenElse B S T, s) ==> t → (S, s) ==> t := by
-  decompile grind [BigStep]
+example {B T E s t} (hcond : B s) :
+  (ifThenElse B T E, s) ==> t → (T, s) ==> t := by
+    intro h
+    apply Classical.byContradiction
+    intro h_1
+    cases h_eq : h with
+    | if_true hcond_1 S T_1 hbody => contradiction
+    | if_false hcond_1 S T_1 hbody => contradiction
 
 
 
