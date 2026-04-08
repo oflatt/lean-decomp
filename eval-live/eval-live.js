@@ -250,7 +250,7 @@ async function initGraphEngine(section, status, data, graphScript, evalLivePy, c
     async function renderGraphs(inputData) {
       pyodide.globals.set("__eval_live_data__", pyodide.toPy(inputData));
       const resultProxy = await pyodide.runPythonAsync(
-        "from eval_live import run_graphs; run_graphs(__eval_live_data__)"
+        "import eval_live; eval_live.registry.run_graphs(__eval_live_data__)"
       );
       const graphs = resultProxy.toJs({ create_proxies: false });
       resultProxy.destroy();
@@ -260,7 +260,7 @@ async function initGraphEngine(section, status, data, graphScript, evalLivePy, c
     async function renderTables(inputData) {
       pyodide.globals.set("__eval_live_data__", pyodide.toPy(inputData));
       const resultProxy = await pyodide.runPythonAsync(
-        "from eval_live import run_tables; run_tables(__eval_live_data__)"
+        "import eval_live; eval_live.registry.run_tables(__eval_live_data__)"
       );
       const tables = resultProxy.toJs({ create_proxies: false });
       resultProxy.destroy();
@@ -275,7 +275,7 @@ async function initGraphEngine(section, status, data, graphScript, evalLivePy, c
       pyodide.globals.set("__eval_live_data__", pyodide.toPy(inputData));
       pyodide.globals.set("__eval_live_table_filters__", pyodide.toPy(tableFilters));
       const resultProxy = await pyodide.runPythonAsync(
-        "from eval_live import apply_table_filters; apply_table_filters(__eval_live_table_filters__, __eval_live_data__)"
+        "import eval_live; eval_live.registry.apply_table_filters(__eval_live_table_filters__, __eval_live_data__)"
       );
       const result = resultProxy.toJs({ create_proxies: false });
       resultProxy.destroy();
@@ -396,9 +396,8 @@ async function initGraphEngine(section, status, data, graphScript, evalLivePy, c
     function rerender(filteredData) {
       clearTimeout(rerenderTimer);
       rerenderTimer = setTimeout(async () => {
-        pyodide.runPython(
-          "from eval_live import _graph_registry, _table_registry; _graph_registry.clear(); _table_registry.clear()"
-        );
+        // Re-run script to rebuild the registry
+        pyodide.runPython("import eval_live; eval_live.registry = None");
         await pyodide.runPythonAsync(graphScript);
         await showGraphs(filteredData);
         await showComputedTables(filteredData);

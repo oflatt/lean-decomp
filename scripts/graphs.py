@@ -1,13 +1,11 @@
-"""Sample graph script for eval-live. Runs in the browser via Pyodide."""
-from eval_live import graph, table
+"""Graph and table definitions for eval-live. Runs in the browser via Pyodide."""
+import eval_live
 
 
-@graph("Timings by Treatment")
 def timings_by_treatment(data):
     import matplotlib.pyplot as plt
     from collections import defaultdict
 
-    # Group timings by (file, grind_line) -> {treatment: [times]}
     by_key = defaultdict(lambda: defaultdict(list))
     for row in data.get("timings", []):
         key = (row.get("file"), row.get("grind_line"))
@@ -18,7 +16,6 @@ def timings_by_treatment(data):
     for treatments in by_key.values():
         all_treatments.update(treatments.keys())
 
-    # Only include keys where every treatment has data
     complete_keys = [k for k, ts in by_key.items() if ts.keys() == all_treatments]
 
     by_treatment = defaultdict(list)
@@ -36,7 +33,6 @@ def timings_by_treatment(data):
     return fig
 
 
-@graph("Error Count by Treatment")
 def error_count_by_treatment(data):
     import matplotlib.pyplot as plt
     from collections import Counter
@@ -51,8 +47,7 @@ def error_count_by_treatment(data):
     return fig
 
 
-@table("Mean Timing per Treatment")
-def mean_timing_per_treatment(data):
+def mean_timing(data):
     """Like the raw timings table but with mean/std instead of timing_list."""
     import math
 
@@ -73,8 +68,7 @@ def mean_timing_per_treatment(data):
     return result
 
 
-@mean_timing_per_treatment.filter_source
-def _(filtered_rows, data):
+def mean_timing_filter(filtered_rows, data):
     """Filter raw timings to rows matching the visible computed rows by primary key."""
     keys = {(r["file"], r["grind_line"], r["treatment"]) for r in filtered_rows}
     return {
@@ -82,3 +76,11 @@ def _(filtered_rows, data):
         "timings": [r for r in data.get("timings", [])
                      if (r.get("file"), r.get("grind_line"), r.get("treatment")) in keys],
     }
+
+
+# Register everything
+reg = eval_live.Registry()
+reg.graph("Timings by Treatment", timings_by_treatment)
+reg.graph("Error Count by Treatment", error_count_by_treatment)
+reg.table("Mean Timing per Treatment", mean_timing, filter_source=mean_timing_filter)
+eval_live.registry = reg
