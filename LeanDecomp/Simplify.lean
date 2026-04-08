@@ -88,14 +88,6 @@ private def simplifyId (e : Expr) : Option Expr := do
   guard (cname == ``id)
   return body
 
-/-- Beta-reduce `(fun x => body) arg` only when arg is an fvar (size-preserving).
-    Complex arguments are left for the decompiler to handle with `let` bindings. -/
-private def simplifyBetaRedexFVar (e : Expr) : Option Expr := do
-  let .app fn arg := e | failure
-  let .lam _name _type body _bi := fn | failure
-  guard arg.isFVar
-  return body.instantiate1 arg
-
 /-- Reduce `intro_with_eq p p' q he k hp` → `k (Eq.mp he hp)` (or `k hp` when p ≡ p'). -/
 private def simplifyIntroWithEq (e : Expr) : MetaM (Option Expr) := do
   let (fn, args) := peelArgs e
@@ -142,44 +134,27 @@ private def simplifyNoConfusion (e : Expr) : MetaM (Option Expr) := do
 -- Main traversal
 -- ═══════════════════════════════════════════════════════
 
-/-- Apply all simplification rules to a single node. -/
-private def simplifyNode (e : Expr) : MetaM (Option Expr) := do
-  -- Pure rules first (cheap)
-  if let some r := simplifyId e then return some r
-  if let some r := simplifyBetaRedexFVar e then return some r
-  -- MetaM rules
-  if let some r ← simplifyIntroWithEq e then return some r
-  if let some r ← simplifyNoConfusion e then return some r
-  if let some r ← simplifyFalseElim e then return some r
-  return none
+/-- Pre-step: cheap pure rewrites applied before recursing into children.
+    Returns `.visit` to re-traverse after rewriting, `.continue` to recurse normally. -/
+private def simplifyPre (e : Expr) : MetaM TransformStep := do
+  -- Beta reduction (all beta redexes, not just fvar args)
+  if e.isHeadBetaTarget then return .visit e.headBeta
+  -- Strip `@id T body`
+  if let some r := simplifyId e then return .visit r
+  return .continue
 
-/-- Recursively simplify a proof term bottom-up, using `lambdaTelescope` so that
-    bound variables become fvars with proper types in the MetaM context. -/
-partial def simplifyProofTerm (e : Expr) : MetaM Expr := do
-  -- For lambdas, open ONE binder at a time WITHOUT whnf (preserving intro_with_eq etc.)
-  if let .lam n t body bi := e then
-    let t' ← simplifyProofTerm t
-    withLocalDecl n bi t' fun fvar => do
-      let body' := body.instantiate1 fvar
-      let simplified ← simplifyProofTerm body'
-      return .lam n t' (simplified.abstract #[fvar]) bi
-  else
-    -- Recurse into subexpressions
-    let e' ← match e with
-      | .app f a => do
-        pure (.app (← simplifyProofTerm f) (← simplifyProofTerm a))
-      | .forallE n t b bi => do
-        pure (.forallE n (← simplifyProofTerm t) (← simplifyProofTerm b) bi)
-      | .letE n t v b nd => do
-        pure (.letE n (← simplifyProofTerm t) (← simplifyProofTerm v) (← simplifyProofTerm b) nd)
-      | .mdata m b => do
-        pure (.mdata m (← simplifyProofTerm b))
-      | .proj t i s => do
-        pure (.proj t i (← simplifyProofTerm s))
-      | _ => pure e
-    -- Apply simplification rules to the node, then re-simplify if it changed
-    match ← simplifyNode e' with
-    | some simplified => simplifyProofTerm simplified
-    | none => pure e'
+/-- Post-step: MetaM rewrites applied after children are simplified.
+    Returns `.visit` to re-traverse after rewriting, `.done` to keep as-is. -/
+private def simplifyPost (e : Expr) : MetaM TransformStep := do
+  if let some r ← simplifyIntroWithEq e then return .visit r
+  if let some r ← simplifyNoConfusion e then return .visit r
+  if let some r ← simplifyFalseElim e then return .visit r
+  return .done e
+
+/-- Recursively simplify a proof term bottom-up using `Meta.transform`.
+    Uses `withLocalDecl` internally (not `lambdaTelescope`) so definitions
+    like `intro_with_eq` are not unfolded during binder opening. -/
+def simplifyProofTerm (e : Expr) : MetaM Expr :=
+  Meta.transform e (pre := simplifyPre) (post := simplifyPost)
 
 end LeanDecomp
