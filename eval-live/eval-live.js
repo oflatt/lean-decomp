@@ -3,7 +3,7 @@
  * @param {HTMLElement|string} container - DOM element or element ID
  * @param {Object} data - Dict of table name -> array of row objects
  * @param {string} [name] - Project name shown in the heading
- * @param {string} [graphScript] - Python script using eval_live decorators
+ * @param {string} [graphScript] - Python script that builds an eval_live.Registry
  * @param {string} [evalLivePy] - Source of the eval_live.py library
  */
 function initEvalLive(container, data, name, graphScript, evalLivePy) {
@@ -20,10 +20,35 @@ function initEvalLive(container, data, name, graphScript, evalLivePy) {
     container.appendChild(h1);
   }
 
-  // Graph engine — initialized async
-  let graphEngine = null;
+  // Shared state between initEvalLive and the Pyodide engine
+  const state = {
+    tableStates: [],
+    computedTableStates: [],
+    computedContainer: document.createElement("div"),
+    originalData: data,
+    onRawFilterChange: null,
+    onComputedFilterChange: null,
+  };
 
-  // Graphs section
+  let pyodideEngine = null;
+
+  state.onRawFilterChange = function () {
+    const filteredData = {};
+    for (const ts of state.tableStates) {
+      filteredData[ts.tableName] = ts.visibleRows;
+    }
+    if (pyodideEngine) {
+      pyodideEngine.rerender(filteredData);
+    }
+  };
+
+  state.onComputedFilterChange = function () {
+    if (pyodideEngine) {
+      pyodideEngine.applyComputedFilters();
+    }
+  };
+
+  // Pyodide engine (graphs + computed tables)
   if (graphScript && evalLivePy) {
     const graphSection = document.createElement("div");
     graphSection.className = "graph-section";
@@ -33,51 +58,18 @@ function initEvalLive(container, data, name, graphScript, evalLivePy) {
     graphSection.appendChild(graphStatus);
     container.appendChild(graphSection);
 
-    initGraphEngine(graphSection, graphStatus, data, graphScript, evalLivePy, container).then((engine) => {
-      graphEngine = engine;
+    initPyodideEngine(graphSection, graphStatus, data, graphScript, evalLivePy, state).then((engine) => {
+      pyodideEngine = engine;
     });
   }
 
-  // Track per-table filter state
-  const tableStates = [];
-  // Computed tables added later by the engine
-  const computedTableStates = [];
-  // Placeholder for computed tables
-  const computedTablesContainer = document.createElement("div");
-
-  // Called when a RAW table's text filter changes
-  function onRawFilterChange() {
-    const filteredData = {};
-    for (const ts of tableStates) {
-      filteredData[ts.tableName] = ts.visibleRows;
-    }
-    if (graphEngine) {
-      graphEngine.rerender(filteredData);
-    }
-  }
-
-  // Called when a COMPUTED table's text filter changes
-  function onComputedFilterChange() {
-    if (graphEngine) {
-      graphEngine.applyComputedFilters();
-    }
-  }
-
-  // Expose state for the graph engine
-  container._evalLiveOnRawFilterChange = onRawFilterChange;
-  container._evalLiveOnComputedFilterChange = onComputedFilterChange;
-  container._evalLiveTableStates = tableStates;
-  container._evalLiveComputedTableStates = computedTableStates;
-  container._evalLiveComputedContainer = computedTablesContainer;
-  container._evalLiveOriginalData = data;
-
   for (const [tableName, rows] of Object.entries(data)) {
     if (!Array.isArray(rows) || rows.length === 0) continue;
-    const section = buildTable(tableName, rows, tableStates, onRawFilterChange);
+    const section = buildTable(tableName, rows, state.tableStates, state.onRawFilterChange);
     container.appendChild(section);
   }
 
-  container.appendChild(computedTablesContainer);
+  container.appendChild(state.computedContainer);
 }
 
 /**
@@ -231,7 +223,7 @@ function applyFilteredDataToRawTables(filteredData, rawTableStates) {
   }
 }
 
-async function initGraphEngine(section, status, data, graphScript, evalLivePy, container) {
+async function initPyodideEngine(section, status, data, graphScript, evalLivePy, state) {
   try {
     const pyodide = await loadPyodide();
     status.textContent = "Installing matplotlib...";
@@ -307,37 +299,38 @@ async function initGraphEngine(section, status, data, graphScript, evalLivePy, c
         graphMap.set(g.get("name"), g.get("src"));
       }
 
-      if (bar.children.length === 0) {
-        for (const g of graphs) {
-          const gName = g.get("name");
-          const btn = document.createElement("button");
-          btn.className = "graph-btn";
-          btn.textContent = gName;
-          btn.addEventListener("click", () => {
-            for (const b of bar.querySelectorAll(".graph-btn")) b.classList.remove("active");
-            btn.classList.add("active");
-            activeGraphName = gName;
-            display.innerHTML = "";
-            const src = graphMap.get(gName);
-            if (src) {
-              const img = document.createElement("img");
-              img.src = src;
-              img.alt = gName;
-              display.appendChild(img);
-            }
-          });
-          bar.appendChild(btn);
-        }
-        activeGraphName = graphs[0].get("name");
-        bar.querySelector(".graph-btn").click();
-      } else {
-        if (activeGraphName && graphMap.has(activeGraphName)) {
+      // Always rebuild buttons and display
+      bar.innerHTML = "";
+      display.innerHTML = "";
+
+      for (const g of graphs) {
+        const gName = g.get("name");
+        const btn = document.createElement("button");
+        btn.className = "graph-btn";
+        btn.textContent = gName;
+        btn.addEventListener("click", () => {
+          for (const b of bar.querySelectorAll(".graph-btn")) b.classList.remove("active");
+          btn.classList.add("active");
+          activeGraphName = gName;
           display.innerHTML = "";
-          const img = document.createElement("img");
-          img.src = graphMap.get(activeGraphName);
-          img.alt = activeGraphName;
-          display.appendChild(img);
-        }
+          const src = graphMap.get(gName);
+          if (src) {
+            const img = document.createElement("img");
+            img.src = src;
+            img.alt = gName;
+            display.appendChild(img);
+          }
+        });
+        bar.appendChild(btn);
+      }
+
+      // Preserve active selection, or default to first
+      const selected = activeGraphName && graphMap.has(activeGraphName)
+        ? activeGraphName
+        : graphs[0].get("name");
+      activeGraphName = selected;
+      for (const btn of bar.querySelectorAll(".graph-btn")) {
+        if (btn.textContent === selected) { btn.click(); break; }
       }
     }
 
@@ -346,12 +339,9 @@ async function initGraphEngine(section, status, data, graphScript, evalLivePy, c
 
     async function showComputedTables(inputData) {
       const tables = await renderTables(inputData);
-      const ctContainer = container._evalLiveComputedContainer;
-      const ctStates = container._evalLiveComputedTableStates;
-      const onComputedFilterChange = container._evalLiveOnComputedFilterChange;
 
-      ctContainer.innerHTML = "";
-      ctStates.length = 0;
+      state.computedContainer.innerHTML = "";
+      state.computedTableStates.length = 0;
       computedTableMeta = tables.map(t => ({
         name: t.name,
         hasFilterSource: t.hasFilterSource,
@@ -359,8 +349,8 @@ async function initGraphEngine(section, status, data, graphScript, evalLivePy, c
 
       for (const { name, rows, hasFilterSource } of tables) {
         if (!rows || rows.length === 0) continue;
-        const sect = buildTable(name, rows, ctStates, onComputedFilterChange, hasFilterSource);
-        ctContainer.appendChild(sect);
+        const sect = buildTable(name, rows, state.computedTableStates, state.onComputedFilterChange, hasFilterSource);
+        state.computedContainer.appendChild(sect);
       }
     }
 
@@ -371,13 +361,9 @@ async function initGraphEngine(section, status, data, graphScript, evalLivePy, c
      * then applies that to the raw table DOM.
      */
     async function applyComputedFilters() {
-      const ctStates = container._evalLiveComputedTableStates;
-      const rawTableStates = container._evalLiveTableStates;
-      const originalData = container._evalLiveOriginalData;
-
       // Build table_filters list for Python
       const tableFilters = [];
-      for (const ct of ctStates) {
+      for (const ct of state.computedTableStates) {
         const meta = computedTableMeta.find(m => m.name === ct.tableName);
         if (meta && meta.hasFilterSource) {
           tableFilters.push({ name: ct.tableName, filtered_rows: ct.visibleRows });
@@ -386,8 +372,8 @@ async function initGraphEngine(section, status, data, graphScript, evalLivePy, c
 
       if (tableFilters.length === 0) return;
 
-      const filteredData = await callApplyTableFilters(tableFilters, originalData);
-      applyFilteredDataToRawTables(filteredData, rawTableStates);
+      const filteredData = await callApplyTableFilters(tableFilters, state.originalData);
+      applyFilteredDataToRawTables(filteredData, state.tableStates);
     }
 
     // Initial render
