@@ -287,22 +287,65 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
         let ctorIndexSubsts ← mkCtorIndexSubsts ctorParamsAll body
         let bodyAfterCtorIndex := substFVars body ctorIndexSubsts
 
-        -- Bind branch-local trailing Eq/HEq params (e.g. `h_2`) to the matching
-        -- casesOn motive arguments (e.g. `Eq.refl ...`) and then apply any
-        -- leftover motive args that the branch body still expects.
-        let mut eqParamSubsts : Array (FVarId × Expr) := #[]
+        -- Handle trailing Eq/HEq params from generalized equation motives.
+        --
+        -- When casesOn has a generalized equation motive (`cases h : disc`),
+        -- each branch has trailing eq params (e.g., `h : s = Stmt.skip`) and
+        -- the body may be wrapped in Eq.ndrec/Eq.rec for transport.
+        --
+        -- We substitute eq params with the corresponding motive args (e.g.,
+        -- `Eq.refl s`), apply remaining motive args, then clean up any
+        -- Eq.rec transport artifacts.
+        --
+        -- The substitution is type-incorrect at the Expr level (Eq.refl s
+        -- has type s = s, not s = Stmt.skip), but downstream handlers
+        -- (contradiction, noConfusion) consume these terms before
+        -- re-elaboration. For cases where Eq.rec remains at the top level,
+        -- we strip it when the base is a lambda (the generalized equation
+        -- transport pattern), as opposed to noConfusion's Eq.rec which has
+        -- a constant-headed base.
         let motiveArgCount := info.motiveArgs.length
         let bindableEqCount := Nat.min numTrailingEq motiveArgCount
+
+        let mut innerBody : Expr := bodyAfterCtorIndex
+
+        -- Substitute trailing eq params with corresponding motive args, then
+        -- apply any remaining motive args as function arguments.
+        let mut eqParamSubsts : Array (FVarId × Expr) := #[]
         for i in List.range bindableEqCount do
           let eqParam := trailingEqParams[i]!
           if let some fid := eqParam.fvarId? then
             eqParamSubsts := eqParamSubsts.push (fid, info.motiveArgs[i]!)
-
-        let bodyAfterEqBind := substFVars bodyAfterCtorIndex eqParamSubsts
-
+        innerBody := substFVars innerBody eqParamSubsts
         let remainingMotiveArgs := info.motiveArgs.drop bindableEqCount
-        let innerBody := remainingMotiveArgs.foldl (init := bodyAfterEqBind) fun acc arg =>
+        innerBody := remainingMotiveArgs.foldl (init := innerBody) fun acc arg =>
           mkApp acc arg
+
+        -- Clean up Eq.ndrec/Eq.rec artifacts from the substitution.
+        -- When a generalized equation motive produces `Eq.ndrec ... (Eq.symm h) h`,
+        -- substituting `h ↦ Eq.refl s` yields a type-incorrect intermediate:
+        --   `Eq.rec ... base ... (Eq.symm (Eq.refl s)) (Eq.refl s)`
+        -- where base is a lambda. Beta-reduce to collapse inlined Eq.ndrec,
+        -- then strip Eq.rec when the base is a lambda (the eq transport pattern).
+        -- We do NOT strip Eq.rec with non-lambda bases (e.g. noConfusion internals).
+        if bindableEqCount > 0 then
+          while innerBody.isHeadBetaTarget do
+            innerBody := innerBody.headBeta
+          let mut stripping := true
+          while stripping do
+            let (topFn, topArgs) := peelArgs innerBody
+            if let some cname := topFn.constName? then
+              if (cname == ``Eq.ndrec || cname == ``Eq.rec) && topArgs.length >= 6 then
+                let base := topArgs[3]!
+                if base.isLambda then
+                  let extraArgs := topArgs.drop 6
+                  let result := extraArgs.foldl (init := base) fun acc arg => mkApp acc arg
+                  let mut r := result
+                  while r.isHeadBetaTarget do
+                    r := r.headBeta
+                  innerBody := r
+                  continue
+            stripping := false
 
         -- Recursively decompile the inner body
         let (bodyTactics, _usedInBranch) ← decompileExpr innerBody newLctx telescopeInsts usedAfterCtorParams

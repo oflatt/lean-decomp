@@ -15,4 +15,4 @@ lean_exe «lean-decomp» where
 
 /-- Test library - build with `lake build LeanDecompTest` to run tests -/
 lean_lib «LeanDecompTest» where
-  globs := #[.one `LeanDecomp.Test, .one `LeanDecomp.bigstep]
+  globs := #[.one `LeanDecomp.Test, .one `LeanDecomp.bigstep, .one `LeanDecomp.simple]

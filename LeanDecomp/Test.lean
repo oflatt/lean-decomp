@@ -21,21 +21,7 @@ info: Try this:
             (@OfNat.ofNat.{0} Nat (nat_lit 2) (instOfNatNat (nat_lit 2)))
             (@OfNat.ofNat.{0} Nat (nat_lit 2) (instOfNatNat (nat_lit 2))))
           (@OfNat.ofNat.{0} Nat (nat_lit 4) (instOfNatNat (nat_lit 4))))
-        (@id.{0}
-          (@Eq.{1} Bool
-            (@Decidable.decide
-              (@Eq.{1} Nat
-                (@HAdd.hAdd.{0, 0, 0} Nat Nat Nat (@instHAdd.{0} Nat instAddNat)
-                  (@OfNat.ofNat.{0} Nat (nat_lit 2) (instOfNatNat (nat_lit 2)))
-                  (@OfNat.ofNat.{0} Nat (nat_lit 2) (instOfNatNat (nat_lit 2))))
-                (@OfNat.ofNat.{0} Nat (nat_lit 4) (instOfNatNat (nat_lit 4))))
-              (instDecidableEqNat
-                (@HAdd.hAdd.{0, 0, 0} Nat Nat Nat (@instHAdd.{0} Nat instAddNat)
-                  (@OfNat.ofNat.{0} Nat (nat_lit 2) (instOfNatNat (nat_lit 2)))
-                  (@OfNat.ofNat.{0} Nat (nat_lit 2) (instOfNatNat (nat_lit 2))))
-                (@OfNat.ofNat.{0} Nat (nat_lit 4) (instOfNatNat (nat_lit 4)))))
-            Bool.true)
-          (@Eq.refl.{1} Bool Bool.true))
+        (@Eq.refl.{1} Bool Bool.true)
 -/
 #guard_msgs in
 example : 2 + 2 = 4 := by
@@ -44,7 +30,7 @@ example : 2 + 2 = 4 := by
 -- Test 2: Simple implication with intro
 /--
 info: Try this:
-  [apply]
+  [apply] 
     intro h
     exact h
 -/
@@ -73,7 +59,7 @@ example (P Q : Prop) (h : P → Q) (a : P) : Q := by
 -- Test 5: Universal statement
 /--
 info: Try this:
-  [apply]
+  [apply] 
     intro n
     exact Nat.zero_add n
 -/

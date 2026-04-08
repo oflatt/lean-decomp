@@ -1,16 +1,17 @@
 import LeanDecomp.ProofTermMacro
-import Lean.Elab.GuardMsgs
 
-namespace LeanDecomp.BigStepTest
+namespace LeanDecomp.SimpleTest
 
 
 inductive Stmt : Type where
   | skip : Stmt
   | other : Stmt
 
-deriving instance BEq for LeanDecomp.BigStepTest.Stmt
+deriving instance BEq for LeanDecomp.SimpleTest.Stmt
 
-
+-- Test: decompile on a `cases h : s` proof with generalized equations.
+-- The casesOn handler strips the Eq.ndrec transport wrappers, allowing
+-- the branch bodies to re-elaborate correctly under `cases h : s with`.
 example (s: Stmt) : (s == Stmt.skip) || (s == Stmt.other) := by
   decompile
     cases h: s with
@@ -20,6 +21,7 @@ example (s: Stmt) : (s == Stmt.skip) || (s == Stmt.other) := by
       exact of_decide_eq_true (id (Eq.refl true))
 
 
+-- Direct proof term for reference (this works fine)
 example (s: Stmt) : (s == Stmt.skip) || (s == Stmt.other) := by
   let motive := fun t => s = t → (s == Stmt.skip || s == Stmt.other) = true
   exact
@@ -29,4 +31,4 @@ example (s: Stmt) : (s == Stmt.skip) || (s == Stmt.other) := by
 
 
 
-end LeanDecomp.BigStepTest
+end LeanDecomp.SimpleTest

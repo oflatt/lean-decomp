@@ -130,6 +130,18 @@ private def simplifyNoConfusion (e : Expr) : MetaM (Option Expr) := do
   if reduced != e then return some reduced
   return none
 
+/-- Reduce `Eq.ndrec`/`Eq.rec` applications where the eq proof computes to `Eq.refl`.
+    This handles the common pattern from generalized equation motives in casesOn:
+    `Eq.ndrec motive base (Eq.symm (Eq.refl a)) (Eq.refl a)` reduces to `base (Eq.refl a)`.
+    We use whnf to perform the reduction. -/
+private def simplifyEqRec (e : Expr) : MetaM (Option Expr) := do
+  let (fn, _) := peelArgs e
+  let some cname := fn.constName? | return none
+  if cname != ``Eq.ndrec && cname != ``Eq.rec && cname != ``Eq.mpr then return none
+  let reduced ← Meta.whnf e
+  if reduced != e then return some reduced
+  return none
+
 -- ═══════════════════════════════════════════════════════
 -- Main traversal
 -- ═══════════════════════════════════════════════════════
@@ -148,6 +160,7 @@ private def simplifyPre (e : Expr) : MetaM TransformStep := do
 private def simplifyPost (e : Expr) : MetaM TransformStep := do
   if let some r ← simplifyIntroWithEq e then return .visit r
   if let some r ← simplifyNoConfusion e then return .visit r
+  if let some r ← simplifyEqRec e then return .visit r
   if let some r ← simplifyFalseElim e then return .visit r
   return .done e
 
