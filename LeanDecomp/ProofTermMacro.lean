@@ -1,6 +1,7 @@
 import Lean
 import Lean.Meta.Tactic.TryThis
 import LeanDecomp.Decompiler
+import LeanDecomp.Simplify
 
 namespace LeanDecomp
 open Lean Elab Command Meta Tactic
@@ -51,11 +52,12 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   let proof ← instantiateMVars (mkMVar goalMVar)
 
   let expandedProof ← expandAuxiliaryProofs proof
+  let simplifiedProof ← simplifyProofTerm expandedProof
   let lctx ← getLCtx
   let localInstances ← getLocalInstances
   -- Decompile to syntax with pp.all for re-elaboration
   let (tactics, _) ← withOptions (fun o => o.setBool `pp.all true) do
-    decompileExpr expandedProof lctx localInstances []
+    decompileExpr simplifiedProof lctx localInstances []
 
   -- restore the original state with the original goal
   stateBefore.restore

@@ -190,7 +190,19 @@ private def isBranchContradiction (body : Expr) : MetaM Bool := do
     if constName == ``Lean.Grind.intro_with_eq then
       return true
     -- Direct False elimination
-    if constName == ``False.casesOn || constName == ``False.elim then
+    if constName == ``False.casesOn || constName == ``False.elim || constName == ``False.rec then
+      return true
+    -- absurd produces False.elim after unfolding
+    if constName == ``absurd then
+      return true
+  -- After simplification, noConfusion may leave Eq.ndrec patterns.
+  -- Check if the return type is provably False-based by trying headBeta.
+  let mut reduced := body
+  while reduced.isApp && reduced.getAppFn.isLambda do
+    reduced := reduced.headBeta
+  let (rfn, _) := peelArgs reduced
+  if let some rname := rfn.constName? then
+    if rname == ``False.casesOn || rname == ``False.elim || rname == ``False.rec || rname == ``absurd then
       return true
   return false
 
