@@ -111,8 +111,9 @@ class Registry:
         filter_source : callable or None
             Optional.  ``filter_source(filtered_rows, data) -> data``
             Called when the user filters this computed table.  Receives
-            the visible computed rows and the original data; returns a
-            new data dict with raw rows narrowed accordingly.
+            the visible computed rows and the current data dict (which
+            may already be narrowed by a previous table's filter_source);
+            returns a new data dict with raw rows narrowed accordingly.
             See the module docstring for a full example.
         """
         self._tables.append((name, fn, filter_source))
@@ -166,7 +167,10 @@ class Registry:
             Each entry is ``{"name": str, "filtered_rows": list[dict]}``
             representing a computed table whose text filter is active.
         data : dict
-            The original (unfiltered) data dict.
+            The original (unfiltered) data dict passed in by the JS
+            engine.  Each ``filter_source`` is called in registration
+            order, and each one receives the data already narrowed by
+            the previous ``filter_source`` calls.
 
         Returns
         -------

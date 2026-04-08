@@ -86,9 +86,11 @@ function initEvalLive(container, data, name, graphScript, evalLivePy) {
  * @param {Array} rows
  * @param {Array} tableStates - array to push state into
  * @param {Function} onFilterChange - called when filters change
+ * @param {boolean} [filterable=true] - whether to show filter inputs
  * @returns {HTMLElement}
  */
-function buildTable(tableName, rows, tableStates, onFilterChange) {
+function buildTable(tableName, rows, tableStates, onFilterChange, filterable) {
+  if (filterable === undefined) filterable = true;
   const tableState = { tableName, rows, visibleRows: rows };
   tableStates.push(tableState);
 
@@ -119,24 +121,26 @@ function buildTable(tableName, rows, tableStates, onFilterChange) {
   }
   thead.appendChild(headerRow);
 
-  // Filter row
-  const filterRow = document.createElement("tr");
-  filterRow.className = "filter-row";
-  const filterExpandTh = document.createElement("th");
-  filterExpandTh.className = "expand-col";
-  filterRow.appendChild(filterExpandTh);
+  // Filter row (only if filterable)
   const filters = [];
-  for (const col of cols) {
-    const th = document.createElement("th");
-    const input = document.createElement("input");
-    input.type = "text";
-    input.className = "filter-input";
-    input.placeholder = "filter...";
-    filters.push({ col, input });
-    th.appendChild(input);
-    filterRow.appendChild(th);
+  if (filterable) {
+    const filterRow = document.createElement("tr");
+    filterRow.className = "filter-row";
+    const filterExpandTh = document.createElement("th");
+    filterExpandTh.className = "expand-col";
+    filterRow.appendChild(filterExpandTh);
+    for (const col of cols) {
+      const th = document.createElement("th");
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "filter-input";
+      input.placeholder = "filter...";
+      filters.push({ col, input });
+      th.appendChild(input);
+      filterRow.appendChild(th);
+    }
+    thead.appendChild(filterRow);
   }
-  thead.appendChild(filterRow);
   table.appendChild(thead);
 
   const tbody = document.createElement("tbody");
@@ -353,9 +357,9 @@ async function initGraphEngine(section, status, data, graphScript, evalLivePy, c
         hasFilterSource: t.hasFilterSource,
       }));
 
-      for (const { name, rows } of tables) {
+      for (const { name, rows, hasFilterSource } of tables) {
         if (!rows || rows.length === 0) continue;
-        const sect = buildTable(name, rows, ctStates, onComputedFilterChange);
+        const sect = buildTable(name, rows, ctStates, onComputedFilterChange, hasFilterSource);
         ctContainer.appendChild(sect);
       }
     }
