@@ -20,6 +20,9 @@ function initEvalLive(container, data, name, graphScript, evalLivePy) {
     container.appendChild(h1);
   }
 
+  // Graph engine — initialized async, tables call onFilterChange when filters update
+  let graphEngine = null;
+
   // Graphs section (populated async if graphScript provided)
   if (graphScript && evalLivePy) {
     const graphSection = document.createElement("div");
@@ -30,11 +33,19 @@ function initEvalLive(container, data, name, graphScript, evalLivePy) {
     graphSection.appendChild(graphStatus);
     container.appendChild(graphSection);
 
-    runGraphs(graphSection, graphStatus, data, graphScript, evalLivePy);
+    initGraphEngine(graphSection, graphStatus, data, graphScript, evalLivePy).then((engine) => {
+      graphEngine = engine;
+    });
   }
+
+  // Track per-table filter state so we can build filtered data dict
+  const tableStates = [];
 
   for (const [tableName, rows] of Object.entries(data)) {
     if (!Array.isArray(rows) || rows.length === 0) continue;
+
+    const tableState = { tableName, rows, visibleRows: rows };
+    tableStates.push(tableState);
 
     const section = document.createElement("div");
     section.className = "table-section";
@@ -114,6 +125,7 @@ function initEvalLive(container, data, name, graphScript, evalLivePy) {
 
     function applyFilters() {
       let visible = 0;
+      const filtered = [];
       for (const { tr, row } of rowEls) {
         let show = true;
         for (const { col, input } of filters) {
@@ -127,9 +139,19 @@ function initEvalLive(container, data, name, graphScript, evalLivePy) {
           }
         }
         tr.style.display = show ? "" : "none";
-        if (show) visible++;
+        if (show) { visible++; filtered.push(row); }
       }
       rowCount.textContent = `(${visible}/${rows.length} rows)`;
+      tableState.visibleRows = filtered;
+
+      // Re-render current graph with filtered data
+      if (graphEngine) {
+        const filteredData = {};
+        for (const ts of tableStates) {
+          filteredData[ts.tableName] = ts.visibleRows;
+        }
+        graphEngine.rerender(filteredData);
+      }
     }
     for (const { input } of filters) {
       input.addEventListener("input", applyFilters);
@@ -144,65 +166,106 @@ function initEvalLive(container, data, name, graphScript, evalLivePy) {
   }
 }
 
-async function runGraphs(section, status, data, graphScript, evalLivePy) {
+async function initGraphEngine(section, status, data, graphScript, evalLivePy) {
   try {
     const pyodide = await loadPyodide();
     status.textContent = "Installing matplotlib...";
     await pyodide.loadPackage("matplotlib");
     status.textContent = "Running graph script...";
 
-    // Register the eval_live module
+    // Register the eval_live module and run the user script
     pyodide.FS.writeFile("/home/pyodide/eval_live.py", evalLivePy);
-
-    // Run the user script then call run_graphs(data)
     await pyodide.runPythonAsync(graphScript);
-    pyodide.globals.set("__eval_live_data__", pyodide.toPy(data));
-    const resultProxy = await pyodide.runPythonAsync(
-      "from eval_live import run_graphs; run_graphs(__eval_live_data__)"
-    );
-    const graphs = resultProxy.toJs({ create_proxies: false });
-    resultProxy.destroy();
 
-    status.textContent = "";
-    if (!graphs || graphs.length === 0) {
-      status.textContent = "No graphs registered.";
-      return;
-    }
-
-    // Button bar
+    // Button bar and display area
     const bar = document.createElement("div");
     bar.className = "graph-bar";
     section.appendChild(bar);
-
-    // Display area
     const display = document.createElement("div");
     display.className = "graph-display";
     section.appendChild(display);
 
-    for (const g of graphs) {
-      const name = g.get("name");
-      const src = g.get("src");
+    let activeGraphName = null;
 
-      const btn = document.createElement("button");
-      btn.className = "graph-btn";
-      btn.textContent = name;
-      btn.addEventListener("click", () => {
-        // Toggle active state
-        for (const b of bar.querySelectorAll(".graph-btn")) b.classList.remove("active");
-        btn.classList.add("active");
-        display.innerHTML = "";
-        const img = document.createElement("img");
-        img.src = src;
-        img.alt = name;
-        display.appendChild(img);
-      });
-      bar.appendChild(btn);
+    async function renderGraphs(inputData) {
+      pyodide.globals.set("__eval_live_data__", pyodide.toPy(inputData));
+      const resultProxy = await pyodide.runPythonAsync(
+        "from eval_live import run_graphs; run_graphs(__eval_live_data__)"
+      );
+      const graphs = resultProxy.toJs({ create_proxies: false });
+      resultProxy.destroy();
+      return graphs;
     }
 
-    // Show first graph by default
-    bar.querySelector(".graph-btn").click();
+    async function showGraphs(inputData) {
+      const graphs = await renderGraphs(inputData);
+      if (!graphs || graphs.length === 0) {
+        status.textContent = "No graphs registered.";
+        return;
+      }
+
+      // Build name->src map
+      const graphMap = new Map();
+      for (const g of graphs) {
+        graphMap.set(g.get("name"), g.get("src"));
+      }
+
+      // Rebuild buttons only on first call
+      if (bar.children.length === 0) {
+        for (const g of graphs) {
+          const gName = g.get("name");
+          const btn = document.createElement("button");
+          btn.className = "graph-btn";
+          btn.textContent = gName;
+          btn.addEventListener("click", () => {
+            for (const b of bar.querySelectorAll(".graph-btn")) b.classList.remove("active");
+            btn.classList.add("active");
+            activeGraphName = gName;
+            display.innerHTML = "";
+            const src = graphMap.get(gName);
+            if (src) {
+              const img = document.createElement("img");
+              img.src = src;
+              img.alt = gName;
+              display.appendChild(img);
+            }
+          });
+          bar.appendChild(btn);
+        }
+        // Show first graph by default
+        activeGraphName = graphs[0].get("name");
+        bar.querySelector(".graph-btn").click();
+      } else {
+        // Update the currently active graph
+        if (activeGraphName && graphMap.has(activeGraphName)) {
+          display.innerHTML = "";
+          const img = document.createElement("img");
+          img.src = graphMap.get(activeGraphName);
+          img.alt = activeGraphName;
+          display.appendChild(img);
+        }
+      }
+    }
+
+    // Initial render
+    status.textContent = "";
+    await showGraphs(data);
+
+    // Debounced re-render for filter changes
+    let rerenderTimer = null;
+    function rerender(filteredData) {
+      clearTimeout(rerenderTimer);
+      rerenderTimer = setTimeout(() => {
+        // Reset the registry so decorators don't re-append
+        pyodide.runPython("from eval_live import _registry; _registry.clear()");
+        pyodide.runPythonAsync(graphScript).then(() => showGraphs(filteredData));
+      }, 300);
+    }
+
+    return { rerender };
   } catch (err) {
     status.textContent = "Graph error: " + err.message;
     console.error(err);
+    return null;
   }
 }
