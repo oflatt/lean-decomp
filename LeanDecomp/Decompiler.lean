@@ -4,6 +4,7 @@ import Lean.PrettyPrinter
 import LeanDecomp.Helpers
 import LeanDecomp.CasesOn
 import LeanDecomp.EqDecomp
+import LeanDecomp.Simplify
 
 namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter
@@ -30,10 +31,6 @@ mutual
   partial def decompileExpr (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Array (TSyntax `tactic) × List String) := do
     withLCtx lctx localInsts do
-      -- Try intro_with_eq BEFORE lambdaTelescope, since the telescope would
-      -- transparently unfold it (it reduces to a lambda).
-      if let some res ← tryDecompIntroWithEq expr lctx localInsts used then
-        return res
       Meta.lambdaTelescope expr fun xs body => do
         if xs.size > 0 then
           -- Use the current local context from inside lambdaTelescope
@@ -41,23 +38,28 @@ mutual
           let telescopeInsts ← getLocalInstances
           tryDecompIntro xs body telescopeLctx telescopeInsts used
         else
+          -- Pure beta reduction for lambda-headed applications.
+          -- lambdaTelescope's whnfD also does delta reduction (unfolding casesOn to rec),
+          -- so we reduce only beta-redexes here to preserve structure.
+          let mut body := body
+          while body.isApp && body.getAppFn.isLambda do
+            body := body.headBeta
           let specialized? ← firstSomeM [
-            tryDecompByContradiction expr lctx localInsts used,
-            tryDecompCasesOn expr lctx localInsts used decompileExpr assignIntroNames,
-            tryDecompNoConfusion expr lctx localInsts used,
-            LeanDecomp.tryDecompCongr expr lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompCongrArg expr lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompEqSymm expr lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompEqTrans expr lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompEqMp expr lctx localInsts used decompileExpr,
-            tryDecompFalseRec expr lctx localInsts used,
-            tryDecompBetaRedex expr lctx localInsts used,
-            tryDecompId expr lctx localInsts used
+            tryDecompByContradiction body lctx localInsts used,
+            tryDecompCasesOn body lctx localInsts used decompileExpr assignIntroNames,
+            LeanDecomp.tryDecompCongr body lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompCongrArg body lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompEqSymm body lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompEqTrans body lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompEqMp body lctx localInsts used decompileExpr,
+            tryDecompFalseRec body lctx localInsts used,
+            tryDecompFalseType body lctx localInsts used,
+            tryDecompBetaRedex body lctx localInsts used
           ]
           match specialized? with
           | some res => pure res
           | none => do
-              let termStx ← delabToRefinableSyntax expr
+              let termStx ← delabToRefinableSyntax body
               let tac ← `(tactic| exact $termStx)
               return (#[tac], used)
 
@@ -107,16 +109,14 @@ mutual
         else
           return none
 
-  /-- Handle beta redex: `(fun x => body) arg` where arg is an fvar.
-      Transform to `let x := arg; body` to avoid immediate application in output.
-      When the argument is not an fvar, simply beta-reduce and recurse. -/
+  /-- Handle beta redex: `(fun x => body) arg`.
+      For fvar arguments, emit a let binding for readability.
+      For non-fvar arguments, beta-reduce and recurse. -/
   private partial def tryDecompBetaRedex (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
-      -- Check if expr is `(fun x => body) arg`
       let .app fn arg := expr | return none
       let .lam binderName binderType body _binderInfo := fn | return none
-      -- If arg is an fvar, emit a let binding for readability
       if let some argFvarId := arg.fvarId? then
         let argDecl ← argFvarId.getDecl
         let argName := argDecl.userName
@@ -132,95 +132,18 @@ mutual
         let letTac ← `(tactic| let $letBinderIdent := $argIdent)
         return some (#[letTac] ++ bodyTactics, used'')
       else
-        -- Non-fvar argument: just beta-reduce and recurse
         let reduced := body.instantiate1 arg
         let (tactics, used') ← decompileExpr reduced lctx localInsts used
         return some (tactics, used')
 
-  /-- Handle `*.noConfusion` applications by reducing them first.
-      This turns constructor-equality eliminators into simpler branch terms,
-      which usually decompile much better. -/
-  private partial def tryDecompNoConfusion (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
-    withLCtx lctx localInsts do
-      let (fn, _) := peelArgs expr
-      let some constName := Expr.constName? fn
-        | return none
-      if !constName.toString.endsWith ".noConfusion" then
-        return none
-
-      -- Try weak-head reduction first; this is enough for typical
-      -- `noConfusion (Eq.refl ...) ...` terms.
-      let reduced ← Meta.whnf expr
-      if reduced != expr then
-        let (tactics, used') ← decompileExpr reduced lctx localInsts used
-        return some (tactics, used')
-
-      return none
-
-  /-- Handle `Lean.Grind.intro_with_eq` and `Lean.Grind.intro_with_eq'` by
-      unfolding and reducing them, then recursively decompiling the result.
-      `intro_with_eq p p' q he k hp` reduces to `k (Eq.mp he hp)`.
-      When `p` and `p'` are definitionally equal (common with `alreadyNorm`),
-      `Eq.mp he hp` is definitionally equal to `hp`, so we skip the rewrite. -/
-  private partial def tryDecompIntroWithEq (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
-    withLCtx lctx localInsts do
-      let (fn, args) := peelArgs expr
-      let some constName := Expr.constName? fn
-        | return none
-      if constName != ``Lean.Grind.intro_with_eq && constName != ``Lean.Grind.intro_with_eq' then
-        return none
-      -- args layout: [p, p', q, he, k] (partial) or [p, p', q, he, k, hp] (full)
-      if args.length == 6 then
-        -- Fully applied: intro_with_eq p p' q he k hp
-        let p := args[0]!
-        let p' := args[1]!
-        let k := args[4]!
-        let hp := args[5]!
-        -- When p ≡ p', Eq.mp he hp ≡ hp, so skip the rewrite
-        -- Use default transparency so isDefEq can see through alreadyNorm etc.
-        let arg ← if (← Meta.withDefault <| Meta.isDefEq p p') then
-          pure hp
-        else
-          let he := args[3]!
-          pure (mkApp4 (mkConst ``Eq.mp [Level.zero]) p p' he hp)
-        let result := (Expr.app k arg).headBeta
-        let (tactics, used') ← decompileExpr result lctx localInsts used
-        return some (tactics, used')
-      else if args.length == 5 then
-        -- Partially applied: returns p → q, construct lambda manually
-        let p := args[0]!
-        let p' := args[1]!
-        let k := args[4]!
-        -- When p ≡ p', just return fun hp => k hp
-        let isDefeq ← Meta.withDefault <| Meta.isDefEq p p'
-        let body ← if isDefeq then
-          pure (Expr.lam `hp p
-            (Expr.app (k.liftLooseBVars 0 1) (.bvar 0))
-            .default)
-        else
-          let he := args[3]!
-          pure (Expr.lam `hp p
-            (Expr.app (k.liftLooseBVars 0 1)
-              (mkApp4 (mkConst ``Eq.mp [Level.zero])
-                (p.liftLooseBVars 0 1) (p'.liftLooseBVars 0 1)
-                (he.liftLooseBVars 0 1) (.bvar 0)))
-            .default)
-        let (tactics, used') ← decompileExpr body lctx localInsts used
-        return some (tactics, used')
-      return none
-
-  /-- Handle `False.rec` terms.
-      For this decompiler path we only need the primitive recursor used in the
-      current example. -/
+  /-- Handle `False.rec`, `False.elim`, and `False.casesOn` terms. -/
   private partial def tryDecompFalseRec (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let (fn, args) := peelArgs expr
       let some constName := Expr.constName? fn
         | return none
-      if constName != ``False.rec then
+      if constName != ``False.rec && constName != ``False.elim && constName != ``False.casesOn then
         return none
 
       let falseTy := mkConst ``False
@@ -237,6 +160,16 @@ mutual
       let some falseArg ← findFalseArg args
         | return none
 
+      -- Try to simplify: detect `Eq.mp (eq_true h ... eq_false h') True.intro`
+      -- and replace with `exact absurd h h'`. This works at tactic level because
+      -- casesOn branches unify the types that differ at the Expr level.
+      if let some (h, h') := extractContradiction falseArg then
+        let hStx ← delabToRefinableSyntax h
+        let h'Stx ← delabToRefinableSyntax h'
+        let absurdId := mkIdent ``absurd
+        let tac ← `(tactic| exact $absurdId $hStx $h'Stx)
+        return some (#[tac], used)
+
       -- Best case: contradiction hypothesis is already a local variable.
       if let some falseFVarId := falseArg.fvarId? then
         let decl ← falseFVarId.getDecl
@@ -245,38 +178,21 @@ mutual
         let casesTac ← `(tactic| cases $hFalseTarget)
         return some (#[casesTac], used)
 
-      -- Otherwise, name the contradiction proof and eliminate it.
-      let (prfFalseName, used') := chooseIntroName used.length `hFalse used
-      let prfFalseIdent := mkIdent (Name.mkSimple prfFalseName)
-      let (falseTactics, used'') ← decompileExpr falseArg lctx localInsts used'
-      let falseTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$falseTactics]*)
-      let letTac ← `(tactic| let $prfFalseIdent : $(mkIdent ``False) := by $falseTacticSeq)
-      let exactTac ← `(tactic| exact $(mkIdent ``False.elim) $prfFalseIdent)
-      return some (#[letTac, exactTac], used'')
+      -- For complex proofs of False (e.g., noConfusion-derived Eq.ndrec),
+      -- use `contradiction` which handles noConfusion automatically.
+      let contradictionTac ← `(tactic| contradiction)
+      return some (#[contradictionTac], used)
 
-  /-- Handle `@id T body` - extract the body into a let binding with type annotation.
-      Transform `@id T body` into `let prf : T := by <decompiled body>; exact prf` -/
-  private partial def tryDecompId (expr : Expr) (lctx : LocalContext)
+  /-- Handle any expression whose type is `False` — emit `contradiction`.
+      This catches noConfusion-derived `Eq.ndrec` patterns and other complex
+      proofs of False that aren't directly `False.rec/elim/casesOn`. -/
+  private partial def tryDecompFalseType (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
-      -- Check if expr is `@id T body`
-      let .app fn body := expr | return none
-      let .app idConst typeArg := fn | return none
-      let some constName := idConst.constName? | return none
-      if constName != ``id then return none
-      -- Decompile the body
-      let (bodyTactics, used') ← decompileExpr body lctx localInsts used
-      -- Create a fresh name for the proof
-      let (prfName, used'') := chooseIntroName used'.length `prf used'
-      let prfIdent := mkIdent (Name.mkSimple prfName)
-      -- Delaborate the type
-      let typeStx ← delabToRefinableSyntax typeArg
-      -- Build: let prf : T := by <bodyTactics>
-      let bodyTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$bodyTactics]*)
-      let letTac ← `(tactic| let $prfIdent : $typeStx := by $bodyTacticSeq)
-      -- Build: exact prf
-      let exactTac ← `(tactic| exact $prfIdent)
-      return some (#[letTac, exactTac], used'')
+      let exprTy ← Meta.inferType expr
+      if !exprTy.isConstOf ``False then return none
+      let contradictionTac ← `(tactic| contradiction)
+      return some (#[contradictionTac], used)
 
 end
 
