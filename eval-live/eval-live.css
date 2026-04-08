@@ -135,3 +135,54 @@
   border-bottom: 2px solid #ddd;
   padding: 0.35rem 0.5rem;
 }
+
+/* Graphs */
+.eval-live .graph-section {
+  margin-bottom: 2.5rem;
+}
+
+.eval-live .graph-status {
+  color: #666;
+  font-size: 0.85rem;
+  margin-bottom: 0.75rem;
+}
+
+.eval-live .graph-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+}
+
+.eval-live .graph-btn {
+  padding: 0.4rem 0.9rem;
+  font-size: 0.82rem;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #fff;
+  color: #444;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.eval-live .graph-btn:hover {
+  background: #f0f1f4;
+}
+
+.eval-live .graph-btn.active {
+  background: #333;
+  color: #fff;
+  border-color: #333;
+}
+
+.eval-live .graph-display {
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.07);
+  background: #fff;
+}
+
+.eval-live .graph-display img {
+  display: block;
+  max-width: 100%;
+}

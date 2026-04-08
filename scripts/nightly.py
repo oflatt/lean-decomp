@@ -6,6 +6,7 @@ bench_grind.py on each Lean file containing `grind` in the given path.
 """
 import argparse
 import http.server
+import json
 import re
 import subprocess
 import sys
@@ -87,6 +88,21 @@ def serve_results(results_path: Path, workspace: Path, port: int = 8080):
     results_json = results_path.read_text()
     name = "LeanDecomp"
 
+    # Read the Python library and graph script
+    eval_live_py = (eval_live_dir / "eval_live.py").read_text()
+    graph_script_path = workspace / "scripts" / "graphs.py"
+    graph_script = graph_script_path.read_text() if graph_script_path.exists() else ""
+
+    # Escape Python sources for embedding in JS
+    eval_live_py_js = json.dumps(eval_live_py)
+    graph_script_js = json.dumps(graph_script)
+
+    pyodide_tag = ""
+    init_graphs_args = ""
+    if graph_script:
+        pyodide_tag = '<script src="https://cdn.jsdelivr.net/pyodide/v0.27.5/full/pyodide.js"></script>'
+        init_graphs_args = f", {graph_script_js}, {eval_live_py_js}"
+
     page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -101,12 +117,13 @@ def serve_results(results_path: Path, workspace: Path, port: int = 8080):
     }}
     {css}
   </style>
+  {pyodide_tag}
 </head>
 <body>
   <div id="tables"></div>
   <script>
     {js}
-    initEvalLive("tables", {results_json}, "{name}");
+    initEvalLive("tables", {results_json}, "{name}"{init_graphs_args});
   </script>
 </body>
 </html>"""

@@ -3,8 +3,10 @@
  * @param {HTMLElement|string} container - DOM element or element ID
  * @param {Object} data - Dict of table name -> array of row objects
  * @param {string} [name] - Project name shown in the heading
+ * @param {string} [graphScript] - Python script using eval_live decorators
+ * @param {string} [evalLivePy] - Source of the eval_live.py library
  */
-function initEvalLive(container, data, name) {
+function initEvalLive(container, data, name, graphScript, evalLivePy) {
   if (typeof container === "string") {
     container = document.getElementById(container);
   }
@@ -16,6 +18,19 @@ function initEvalLive(container, data, name) {
     h1.className = "eval-live-title";
     h1.textContent = name + " \u2014 Eval Live";
     container.appendChild(h1);
+  }
+
+  // Graphs section (populated async if graphScript provided)
+  if (graphScript && evalLivePy) {
+    const graphSection = document.createElement("div");
+    graphSection.className = "graph-section";
+    const graphStatus = document.createElement("div");
+    graphStatus.className = "graph-status";
+    graphStatus.textContent = "Loading Pyodide...";
+    graphSection.appendChild(graphStatus);
+    container.appendChild(graphSection);
+
+    runGraphs(graphSection, graphStatus, data, graphScript, evalLivePy);
   }
 
   for (const [tableName, rows] of Object.entries(data)) {
@@ -126,5 +141,68 @@ function initEvalLive(container, data, name) {
     wrap.appendChild(table);
     section.appendChild(wrap);
     container.appendChild(section);
+  }
+}
+
+async function runGraphs(section, status, data, graphScript, evalLivePy) {
+  try {
+    const pyodide = await loadPyodide();
+    status.textContent = "Installing matplotlib...";
+    await pyodide.loadPackage("matplotlib");
+    status.textContent = "Running graph script...";
+
+    // Register the eval_live module
+    pyodide.FS.writeFile("/home/pyodide/eval_live.py", evalLivePy);
+
+    // Run the user script then call run_graphs(data)
+    await pyodide.runPythonAsync(graphScript);
+    pyodide.globals.set("__eval_live_data__", pyodide.toPy(data));
+    const resultProxy = await pyodide.runPythonAsync(
+      "from eval_live import run_graphs; run_graphs(__eval_live_data__)"
+    );
+    const graphs = resultProxy.toJs({ create_proxies: false });
+    resultProxy.destroy();
+
+    status.textContent = "";
+    if (!graphs || graphs.length === 0) {
+      status.textContent = "No graphs registered.";
+      return;
+    }
+
+    // Button bar
+    const bar = document.createElement("div");
+    bar.className = "graph-bar";
+    section.appendChild(bar);
+
+    // Display area
+    const display = document.createElement("div");
+    display.className = "graph-display";
+    section.appendChild(display);
+
+    for (const g of graphs) {
+      const name = g.get("name");
+      const src = g.get("src");
+
+      const btn = document.createElement("button");
+      btn.className = "graph-btn";
+      btn.textContent = name;
+      btn.addEventListener("click", () => {
+        // Toggle active state
+        for (const b of bar.querySelectorAll(".graph-btn")) b.classList.remove("active");
+        btn.classList.add("active");
+        display.innerHTML = "";
+        const img = document.createElement("img");
+        img.src = src;
+        img.alt = name;
+        display.appendChild(img);
+      });
+      bar.appendChild(btn);
+    }
+
+    // Show first graph by default
+    bar.querySelector(".graph-btn").click();
+  } catch (err) {
+    status.textContent = "Graph error: " + err.message;
+    console.error(err);
   }
 }
