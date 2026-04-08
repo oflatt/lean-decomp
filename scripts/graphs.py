@@ -1,5 +1,5 @@
 """Sample graph script for eval-live. Runs in the browser via Pyodide."""
-from eval_live import graph
+from eval_live import graph, table
 
 
 @graph("Timings by Treatment")
@@ -49,3 +49,36 @@ def error_count_by_treatment(data):
     ax.set_title("Errors by Treatment")
     plt.tight_layout()
     return fig
+
+
+@table("Mean Timing per Treatment")
+def mean_timing_per_treatment(data):
+    """Like the raw timings table but with mean/std instead of timing_list."""
+    import math
+
+    result = []
+    for row in data.get("timings", []):
+        times = row.get("timing_list", [])
+        n = len(times)
+        mean = sum(times) / n if n else 0
+        std = math.sqrt(sum((t - mean) ** 2 for t in times) / n) if n > 1 else 0
+        result.append({
+            "file": row.get("file", ""),
+            "grind_line": row.get("grind_line", ""),
+            "treatment": row.get("treatment", "unknown"),
+            "mean": round(mean, 6),
+            "std": round(std, 6),
+            "n": n,
+        })
+    return result
+
+
+@mean_timing_per_treatment.filter_source
+def _(filtered_rows, data):
+    """Filter raw timings to rows matching the visible computed rows by primary key."""
+    keys = {(r["file"], r["grind_line"], r["treatment"]) for r in filtered_rows}
+    return {
+        **data,
+        "timings": [r for r in data.get("timings", [])
+                     if (r.get("file"), r.get("grind_line"), r.get("treatment")) in keys],
+    }
