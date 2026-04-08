@@ -158,8 +158,8 @@ mutual
   /-- Handle `Lean.Grind.intro_with_eq` and `Lean.Grind.intro_with_eq'` by
       unfolding and reducing them, then recursively decompiling the result.
       `intro_with_eq p p' q he k hp` reduces to `k (Eq.mp he hp)`.
-      We perform this reduction manually to avoid `whnf` over-reducing
-      inner terms like `Or.casesOn` into `Or.rec`. -/
+      When `p` and `p'` are definitionally equal (common with `alreadyNorm`),
+      `Eq.mp he hp` is definitionally equal to `hp`, so we skip the rewrite. -/
   private partial def tryDecompIntroWithEq (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
@@ -170,30 +170,40 @@ mutual
         return none
       -- args layout: [p, p', q, he, k] (partial) or [p, p', q, he, k, hp] (full)
       if args.length == 6 then
-        -- Fully applied: intro_with_eq p p' q he k hp ↝ k (Eq.mp he hp)
+        -- Fully applied: intro_with_eq p p' q he k hp
         let p := args[0]!
         let p' := args[1]!
-        let he := args[3]!
         let k := args[4]!
         let hp := args[5]!
-        let eqMpApp := mkApp4 (mkConst ``Eq.mp [Level.zero]) p p' he hp
-        let result := Expr.app k eqMpApp
-        -- Beta-reduce if k is a lambda
-        let result := result.headBeta
+        -- When p ≡ p', Eq.mp he hp ≡ hp, so skip the rewrite
+        -- Use default transparency so isDefEq can see through alreadyNorm etc.
+        let arg ← if (← Meta.withDefault <| Meta.isDefEq p p') then
+          pure hp
+        else
+          let he := args[3]!
+          pure (mkApp4 (mkConst ``Eq.mp [Level.zero]) p p' he hp)
+        let result := (Expr.app k arg).headBeta
         let (tactics, used') ← decompileExpr result lctx localInsts used
         return some (tactics, used')
       else if args.length == 5 then
         -- Partially applied: returns p → q, construct lambda manually
         let p := args[0]!
         let p' := args[1]!
-        let he := args[3]!
         let k := args[4]!
-        let body := Expr.lam `hp p
-          (Expr.app (k.liftLooseBVars 0 1)
-            (mkApp4 (mkConst ``Eq.mp [Level.zero])
-              (p.liftLooseBVars 0 1) (p'.liftLooseBVars 0 1)
-              (he.liftLooseBVars 0 1) (.bvar 0)))
-          .default
+        -- When p ≡ p', just return fun hp => k hp
+        let isDefeq ← Meta.withDefault <| Meta.isDefEq p p'
+        let body ← if isDefeq then
+          pure (Expr.lam `hp p
+            (Expr.app (k.liftLooseBVars 0 1) (.bvar 0))
+            .default)
+        else
+          let he := args[3]!
+          pure (Expr.lam `hp p
+            (Expr.app (k.liftLooseBVars 0 1)
+              (mkApp4 (mkConst ``Eq.mp [Level.zero])
+                (p.liftLooseBVars 0 1) (p'.liftLooseBVars 0 1)
+                (he.liftLooseBVars 0 1) (.bvar 0)))
+            .default)
         let (tactics, used') ← decompileExpr body lctx localInsts used
         return some (tactics, used')
       return none

@@ -65,6 +65,14 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   -- Build a tacticSeq from the array of tactics
   let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
 
+  -- Check if the decompiled proof is too large, which indicates the decompiler
+  -- fell through to raw `exact` terms for constructs it doesn't handle yet.
+  let maxSize := 10000
+  let tacticStr := toString (← PrettyPrinter.ppTactic ⟨tacticSeq⟩)
+  if tacticStr.length > maxSize then
+    logError m!"decompile failed: generated proof too large ({tacticStr.length} chars, max {maxSize}). The decompiler likely lacks handlers for some proof term constructs."
+    return
+
   runDecompiled tacticSeq
   addSuggestion tk tacticSeq (origSpan? := ← getRef)
 
