@@ -18,7 +18,7 @@ example : 2 + 2 = 4 := by
 -- Test 2: Simple implication with intro
 /--
 info: Try this:
-  [apply]
+  [apply] 
     intro h
     exact h
 -/
