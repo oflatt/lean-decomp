@@ -63,13 +63,19 @@ function initEvalLive(container, data, name, graphScript, evalLivePy) {
     });
   }
 
+  // Computed tables go before raw tables
+  container.appendChild(state.computedContainer);
+
+  const rawHeader = document.createElement("h2");
+  rawHeader.className = "raw-tables-header";
+  rawHeader.textContent = "Raw Tables";
+  container.appendChild(rawHeader);
+
   for (const [tableName, rows] of Object.entries(data)) {
     if (!Array.isArray(rows) || rows.length === 0) continue;
     const section = buildTable(tableName, rows, state.tableStates, state.onRawFilterChange);
     container.appendChild(section);
   }
-
-  container.appendChild(state.computedContainer);
 }
 
 /**
