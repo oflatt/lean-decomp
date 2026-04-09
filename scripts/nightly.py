@@ -81,14 +81,14 @@ def find_lean_files_with_grind(path: Path) -> list[Path]:
 
 def serve_results(results_path: Path, workspace: Path, port: int = 8080):
     """Start a local HTTP server serving eval-live with the results JSON."""
-    eval_live_dir = workspace / "eval-live"
-    css = (eval_live_dir / "eval-live.css").read_text()
-    js = (eval_live_dir / "eval-live.js").read_text()
+    import eval_live
+    css = eval_live.css()
+    js = eval_live.js()
     results_json = results_path.read_text()
     name = "LeanDecomp"
 
     # Read the Python library and graph script
-    eval_live_py = (eval_live_dir / "eval_live.py").read_text()
+    eval_live_py = eval_live.pyodide_lib()
     graph_script_path = workspace / "scripts" / "graphs.py"
     graph_script = graph_script_path.read_text() if graph_script_path.exists() else ""
 
