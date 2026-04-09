@@ -281,6 +281,11 @@ class Treatment:
     query_transform: Callable[[str, int], str]  # (source, grind_line) → query source
     out_suffix: str         # file suffix for the compiled variant
     filter: Callable[[str], bool]  # which suggestions from the query to try
+    is_direct: bool = False  # if True, skip query/suggestion pipeline; use source as-is
+
+
+def _identity(source: str, _grind_line: int) -> str:
+    return source
 
 
 def _is_grind_only(suggestion: str) -> bool:
@@ -288,6 +293,8 @@ def _is_grind_only(suggestion: str) -> bool:
 
 
 TREATMENTS = [
+    Treatment("original",     _identity,
+              ".original.lean",     lambda _: True, is_direct=True),
     Treatment("grindonly",   _make_query_at_line,
               ".grind_only.lean",   _is_grind_only),
     Treatment("grindscript", _make_query_at_line,
@@ -343,8 +350,19 @@ def extract_treatments(workspace, source, lean_file, grind_lines,
     # Per-treatment, per-line working suggestions
     line_results: dict[str, dict[int, str]] = {t.name: {} for t in treatments}
 
+    # Handle direct treatments (no query/suggestion pipeline)
+    for t in treatments:
+        if not t.is_direct:
+            continue
+        result_path = Path(lean_file + t.out_suffix)
+        (workspace / result_path).write_text(source)
+        variants.append((t.name, str(result_path), None))
+        temp_files.append(result_path)
+
     for grind_line in grind_lines:
         for t in treatments:
+            if t.is_direct:
+                continue
             suffix = f".{t.name}_query_L{grind_line}.lean"
             all_suggestions, qf, raw_output = _get_line_suggestions(
                 workspace, source, grind_line, t.query_transform, suffix, lean_file)
@@ -372,6 +390,8 @@ def extract_treatments(workspace, source, lean_file, grind_lines,
 
     # Build combined variant for each treatment (replace all successful lines)
     for t in treatments:
+        if t.is_direct:
+            continue
         per_line = line_results[t.name]
         if not per_line:
             continue
@@ -451,16 +471,9 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
     grind_line = grind_lines[0] if grind_lines else 0
     temp_files = []
 
-    # Write profiler-enabled original as a temp file for benchmarking
-    orig_path = Path(lean_file + ".original.lean")
-    (workspace / orig_path).write_text(source)
-    temp_files.append(orig_path)
-
-    # Extract treatment variants
-    variants = [("original", str(orig_path), None)]
-    treatment_variants, treatment_temps, treatment_errors = extract_treatments(
+    # Extract treatment variants (includes original via identity transform)
+    variants, treatment_temps, treatment_errors = extract_treatments(
         workspace, source, lean_file, grind_lines)
-    variants.extend(treatment_variants)
     temp_files.extend(treatment_temps)
 
     # Record extraction errors in the database
@@ -484,7 +497,7 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
         print(f"  ({lean_file}:{grind_line}, {label}) {mean:.4f}s")
 
     # Print extraction errors only for treatments that have no variant at all
-    successful_treatments = {label for label, _, _ in treatment_variants}
+    successful_treatments = {label for label, _, _ in variants}
     failed_treatments = {tname for tname, _ in treatment_errors if tname not in successful_treatments}
     for tname in failed_treatments:
         print(f"  ({lean_file}:{grind_line}, {tname}) FAILED")
