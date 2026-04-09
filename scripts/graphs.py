@@ -48,33 +48,35 @@ def error_count_by_treatment(data):
 
 
 def mean_timing(data):
-    """Like the raw timings table but with mean/std instead of timing_list."""
-    import math
+    """Pivot table: one row per (file, grind_line) with treatment means as columns."""
+    from collections import defaultdict
+
+    by_key = defaultdict(dict)
+    for row in data.get("timings", []):
+        key = (row.get("file", ""), row.get("grind_line", ""))
+        treatment = row.get("treatment", "unknown")
+        times = row.get("timing_list", [])
+        mean = sum(times) / len(times) if times else 0
+        by_key[key][treatment] = round(mean, 6)
+
+    all_treatments = sorted({t for ts in by_key.values() for t in ts})
 
     result = []
-    for row in data.get("timings", []):
-        times = row.get("timing_list", [])
-        n = len(times)
-        mean = sum(times) / n if n else 0
-        std = math.sqrt(sum((t - mean) ** 2 for t in times) / n) if n > 1 else 0
-        result.append({
-            "file": row.get("file", ""),
-            "grind_line": row.get("grind_line", ""),
-            "treatment": row.get("treatment", "unknown"),
-            "mean": round(mean, 6),
-            "std": round(std, 6),
-            "n": n,
-        })
+    for (file, grind_line), treatments in by_key.items():
+        row = {"file": file, "grind_line": grind_line}
+        for t in all_treatments:
+            row[t] = treatments.get(t, "")
+        result.append(row)
     return result
 
 
 def mean_timing_filter(filtered_rows, data):
     """Filter raw timings to rows matching the visible computed rows by primary key."""
-    keys = {(r["file"], r["grind_line"], r["treatment"]) for r in filtered_rows}
+    keys = {(r["file"], r["grind_line"]) for r in filtered_rows}
     return {
         **data,
         "timings": [r for r in data.get("timings", [])
-                     if (r.get("file"), r.get("grind_line"), r.get("treatment")) in keys],
+                     if (r.get("file"), r.get("grind_line")) in keys],
     }
 
 

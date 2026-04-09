@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Nightly evaluation entry point.
 
-Clones mathlib4 (if needed), checks out a pinned commit, then runs
-bench_grind.py on each Lean file containing `grind` in the given path.
+Clones mathlib4 (if needed), checks out a pinned commit, then benchmarks
+the decompiler on each Lean file containing `grind` in the given path.
 """
 import argparse
 import http.server
@@ -14,7 +14,6 @@ import webbrowser
 from pathlib import Path
 
 from bench_db import BenchDB
-from bench_grind import add_bench_args, bench_grind
 
 MATHLIB_REPO = "https://github.com/leanprover-community/mathlib4"
 MATHLIB_COMMIT = "d4c205d5773673a2e8112f8c72bf33a0358e333d"
@@ -164,7 +163,6 @@ def main():
                         help="Skip benchmarking and just serve existing results")
     parser.add_argument("--port", type=int, default=8080,
                         help="Port for the eval-live server (default: 8080)")
-    add_bench_args(parser)
     args = parser.parse_args()
 
     workspace = Path(__file__).resolve().parents[1]
@@ -209,9 +207,8 @@ def main():
         print(f"\n{'='*60}")
         print(f"[{i}/{len(lean_files)}] {rel}")
         print(f"{'='*60}")
-        rc = bench_grind(str(rel), mathlib, args, db=db)
-        if rc != 0:
-            print(f"  bench_grind failed for {rel} (exit {rc})")
+        # TODO: implement new benchmarking logic
+        print(f"  (benchmarking not yet implemented)")
 
     db.save_json(args.output)
     print(f"\nResults saved to {args.output}")
