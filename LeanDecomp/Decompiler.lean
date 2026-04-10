@@ -27,11 +27,12 @@ private def firstSomeM [Monad m] (xs : List (m (Option α))) : m (Option α) := 
   return none
 
 /-- Check if an expression (shallowly) contains grind/linear-arithmetic internals,
-    suggesting it was built by the `grind` tactic and may be replaceable by `omega`. -/
+    suggesting it was built by the `grind` tactic and may be replaceable by `omega`.
+    Walks at most 200 nodes to keep the check cheap. -/
 private def containsGrindInternals (e : Expr) : Bool := Id.run do
   let mut stack : List Expr := [e]
   let mut count := 0
-  while !stack.isEmpty && count < 5000 do
+  while !stack.isEmpty && count < 200 do
     let cur := stack.head!
     stack := stack.tail!
     count := count + 1
@@ -45,6 +46,20 @@ private def containsGrindInternals (e : Expr) : Bool := Id.run do
     | .mdata _ e => stack := e :: stack
     | _ => pure ()
   return false
+
+/-- Check if a type is a pure arithmetic comparison over Int or Nat
+    (suitable for `omega`). Matches `LE.le`, `LT.lt`, `GE.ge`, `GT.gt`,
+    and `Eq` when the universe type is Int or Nat. -/
+private def isArithType (ty : Expr) : Bool := Id.run do
+  let (fn, args) := peelArgs ty
+  let some name := fn.constName? | return false
+  if (name == ``LE.le || name == ``LT.lt || name == ``GE.ge || name == ``GT.gt)
+      && args.length >= 4 then
+    return args[0]!.isConstOf ``Int || args[0]!.isConstOf ``Nat
+  else if name == ``Eq && args.length >= 3 then
+    return args[0]!.isConstOf ``Int || args[0]!.isConstOf ``Nat
+  else
+    return false
 
 mutual
 
@@ -272,11 +287,6 @@ mutual
       let mut currentLctx := lctx
       let mut currentUsed := used
       let mut seenTypes : Array Expr := #[]
-      -- Collect hypothesis expressions for omega
-      let mut contextFacts : List Expr := []
-      for decl in lctx do
-        if decl.isImplementationDetail then continue
-        contextFacts := (.fvar decl.fvarId) :: contextFacts
       for proof in proofs do
         if proof.isFVar then continue
         let proofTy ← Meta.inferType proof
@@ -302,21 +312,10 @@ mutual
         let haveNameIdent := mkIdent (Name.mkSimple haveName)
         -- Use normal delab for types (readable, may not perfectly re-elaborate)
         let typeStx ← PrettyPrinter.delab proofTy
-        -- Check if the type is a pure arithmetic comparison (suitable for omega)
-        let isArithGoal : Bool := Id.run do
-          let (fn, args) := peelArgs proofTy
-          let some name := fn.constName? | return false
-          if (name == ``LE.le || name == ``LT.lt || name == ``GE.ge || name == ``GT.gt)
-              && args.length >= 4 then
-            return args[0]!.isConstOf ``Int || args[0]!.isConstOf ``Nat
-          else if name == ``Eq && args.length >= 3 then
-            return args[0]!.isConstOf ``Int || args[0]!.isConstOf ``Nat
-          else
-            return false
         -- For lambda-typed proofs (implications), check if we can emit
         -- intro + have := <core_app> + omega
         let proofTactics : Array (TSyntax `tactic) ←
-          if isArithGoal then
+          if isArithType proofTy then
             pure #[← `(tactic| omega)]
           else if proof.isLambda then do
             -- The proof is `fun a => <body>`. Check if body has a core fvar app
@@ -331,16 +330,8 @@ mutual
               -- Reconstruct the full fvar application (e.g., hs x a)
               let fullApp := mkAppN coreApp extraArgs
               let coreAppStx ← PrettyPrinter.delab fullApp
-              -- Check if conclusion is arithmetic (omega can close)
               let conclusionTy ← Meta.inferType body'
-              let conclusionIsArith : Bool := Id.run do
-                let (fn, args) := peelArgs conclusionTy
-                let some name := fn.constName? | return false
-                if (name == ``LE.le || name == ``LT.lt || name == ``GE.ge || name == ``GT.gt)
-                    && args.length >= 4 then
-                  return (args[0]!.isConstOf ``Int || args[0]!.isConstOf ``Nat)
-                else return false
-              if conclusionIsArith then
+              if isArithType conclusionTy then
                 let (hName, _) := chooseIntroName (currentUsed.length + 1) `h currentUsed
                 let hIdent := mkIdent (Name.mkSimple hName)
                 pure #[← `(tactic| intro $introIdent:ident),
@@ -366,17 +357,13 @@ mutual
         haveTactics := haveTactics.push haveTac
         let haveId := FVarId.mk (← mkFreshId)
         currentLctx := currentLctx.mkLocalDecl haveId (Name.mkSimple haveName) proofTy
-        contextFacts := (.fvar haveId) :: contextFacts
-      -- If we found derived facts, emit them + omega/contradiction
+      -- If we found derived facts, emit them + closing tactic
       if haveTactics.isEmpty then return none
-      -- Try omega with the enriched context
-      let mut closingTac ← `(tactic| contradiction)
-      try
-        let goalType ← Meta.inferType expr
-        let mvar ← Meta.mkFreshExprMVar (some goalType) .syntheticOpaque
-        Lean.Elab.Tactic.Omega.omega contextFacts mvar.mvarId!
-        closingTac ← `(tactic| omega)
-      catch _ => pure ()
+      -- Use omega when all emitted facts are arithmetic, contradiction otherwise
+      let closingTac ← if seenTypes.all isArithType then
+        `(tactic| omega)
+      else
+        `(tactic| contradiction)
       return some (haveTactics ++ #[closingTac], currentUsed)
 
   /-- The final exact fallback. Try without pp.all first for smaller output,

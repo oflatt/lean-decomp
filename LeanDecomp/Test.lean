@@ -55,4 +55,44 @@ info: Try this:
 example : ∀ n : Nat, 0 + n = n := by
   decompile intro n; exact Nat.zero_add n
 
+-- Test 6: grind arithmetic contradiction → omega
+/--
+info: Try this:
+  [apply] omega
+-/
+#guard_msgs in
+example (n : Nat) (h1 : n ≤ 3) (h2 : 5 ≤ n) : False := by
+  decompile grind
+
+-- Test 7: grind byContradiction + derived have + omega
+/--
+info: Try this:
+  [apply]
+    apply Classical.byContradiction
+    intro hp
+    have fact : 10 ≤ n := by omega
+    omega
+-/
+#guard_msgs (whitespace := lax) in
+example (n : Nat) (h : n < 5) : n < 10 := by
+  decompile grind
+
+-- Test 8: P and ¬P contradiction
+/--
+info: Try this:
+  [apply] contradiction
+-/
+#guard_msgs in
+example (P : Prop) (h : P) (h' : ¬P) : False := by
+  decompile exact absurd h h'
+
+-- Test 9: False.elim → cases
+/--
+info: Try this:
+  [apply] cases h
+-/
+#guard_msgs in
+example (h : False) : 1 = 2 := by
+  decompile exact h.elim
+
 end LeanDecomp.Test

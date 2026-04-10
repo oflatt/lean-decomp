@@ -184,20 +184,6 @@ private def simplifyFalseElim (e : Expr) : MetaM (Option Expr) := do
   catch _ =>
     return none
 
-/-- Check if a constant name is a grind-internal lemma that should be unfolded. -/
-private def isGrindLemma (name : Name) : Bool :=
-  let s := name.toString
-  s.startsWith "Lean.Grind." && name != ``Lean.Grind.alreadyNorm
-    && name != ``Lean.Grind.nestedProof && name != ``Lean.Grind.Marker
-    && name != ``Lean.Grind.em && name != ``Lean.Grind.intro_with_eq
-    && name != ``Lean.Grind.intro_with_eq'
-
-/-- Placeholder for grind lemma simplification. Currently a no-op because
-    grind lemmas are opaque theorems that can't be unfolded via deltaExpand,
-    whnf, or reduce. The decompiler handles them directly in
-    `tryDecompEqMpTrueIntro` instead. -/
-private def simplifyGrindLemmas (_e : Expr) : MetaM (Option Expr) := do
-  return none
 
 /-- Strip `@id T body` → `body`. -/
 private def simplifyId (e : Expr) : Option Expr := do
@@ -329,7 +315,6 @@ private def simplifyPost (e : Expr) : MetaM TransformStep := do
   if let some r ← simplifyNoConfusion e then return .visit r
   if let some r ← simplifyEqRec e then return .visit r
   if let some r ← simplifyFalseElim e then return .visit r
-  if let some r ← simplifyGrindLemmas e then return .visit r
   return .done e
 
 /-- Recursively simplify a proof term bottom-up using `Meta.transform`.
