@@ -346,6 +346,14 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
                   innerBody := r
                   continue
             stripping := false
+          -- For indexed families, the inner body may still contain transport
+          -- chains (T.casesOn + nested Eq.ndrec) from decomposing index
+          -- equalities. If Eq.rec is still at the head after stripping, use
+          -- whnf to computationally collapse these via iota-reduction.
+          let (headFn, _) := peelArgs innerBody
+          if let some cname := headFn.constName? then
+            if cname == ``Eq.ndrec || cname == ``Eq.rec then
+              innerBody ← Meta.whnf innerBody
 
         -- Recursively decompile the inner body
         let (bodyTactics, _usedInBranch) ← decompileExpr innerBody newLctx telescopeInsts usedAfterCtorParams

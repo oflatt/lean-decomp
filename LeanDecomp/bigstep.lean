@@ -39,6 +39,17 @@ notation:55 "(" S:55 "," s:55 ")" " ==> " t:55 => BigStep S s t
 
 
 
+/--
+info: Try this:
+  [apply]
+    intro h
+    apply Classical.byContradiction
+    intro h_1
+    cases h_eq : h with
+    | if_true hcond_1 S T_1 hbody => contradiction
+    | if_false hcond_1 S T_1 hbody => contradiction
+-/
+#guard_msgs (whitespace := lax) in
 example {B T E s t} (hcond : B s) :
   (ifThenElse B T E, s) ==> t → (T, s) ==> t := by
   decompile
@@ -54,10 +65,32 @@ example {B T E s t} (hcond : B s) :
 
 attribute [grind] BigStep
 
+/--
+info: Try this:
+  [apply]
+    intro h
+    apply Classical.byContradiction
+    intro h_1
+    cases h_eq : h with
+    | if_true hcond_1 S_1 T_1 hbody => exact absurd hbody h_1
+    | if_false hcond_1 S_1 T_1 hbody => exact absurd hcond hcond_1
+-/
+#guard_msgs (whitespace := lax) in
 theorem cases_if_of_true {B S T s t} (hcond : B s) : (ifThenElse B S T, s) ==> t → (S, s) ==> t := by
   decompile
     grind
 
+/--
+info: Try this:
+  [apply]
+    intro h
+    apply Classical.byContradiction
+    intro h_1
+    cases h_eq : h with
+    | if_true hcond_1 S_1 T_1 hbody => exact absurd hcond_1 hcond
+    | if_false hcond_1 S_1 T_1 hbody => exact absurd hbody h_1
+-/
+#guard_msgs (whitespace := lax) in
 theorem cases_if_of_false {B S T s t} (hcond : ¬ B s) : (ifThenElse B S T, s) ==> t → (T, s) ==> t := by
   decompile
     grind
