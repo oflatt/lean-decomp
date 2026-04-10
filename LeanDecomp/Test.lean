@@ -67,10 +67,9 @@ example (n : Nat) (h1 : n ≤ 3) (h2 : 5 ≤ n) : False := by
 -- Test 7: grind byContradiction + derived have + omega
 /--
 info: Try this:
-  [apply]
+  [apply] 
     apply Classical.byContradiction
     intro hp
-    have fact : 10 ≤ n := by omega
     omega
 -/
 #guard_msgs (whitespace := lax) in

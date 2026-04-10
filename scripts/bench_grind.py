@@ -11,6 +11,7 @@ lean-toolchain (v4.28.0-rc1 at time of writing) and may need updates for other
 versions.
 """
 import argparse
+import glob
 import re
 import statistics
 import subprocess
@@ -447,6 +448,14 @@ def add_bench_args(parser: argparse.ArgumentParser):
     parser.add_argument("--warmup", type=int, default=1)
 
 
+def _cleanup_generated_files(workspace: Path, lean_file: str):
+    """Remove any generated .lean files left from previous runs."""
+    pattern = str(workspace / lean_file) + ".*"
+    for path in glob.glob(pattern):
+        if path.endswith(".lean"):
+            Path(path).unlink(missing_ok=True)
+
+
 def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
                 db: BenchDB | None = None):
     """Benchmark grind variants for a single Lean file.
@@ -465,59 +474,60 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
         print(f"Not found: {workspace / lean_file}", file=sys.stderr)
         return 2
 
+    # Remove stale generated files from interrupted previous runs
+    _cleanup_generated_files(workspace, lean_file)
+
     source = (workspace / lean_file).read_text()
     source = _ensure_profiler(source)
     grind_lines = _find_all_grind_lines(source)
     grind_line = grind_lines[0] if grind_lines else 0
     temp_files = []
 
-    # Extract treatment variants (includes original via identity transform)
-    variants, treatment_temps, treatment_errors = extract_treatments(
-        workspace, source, lean_file, grind_lines)
-    temp_files.extend(treatment_temps)
+    try:
+        # Extract treatment variants (includes original via identity transform)
+        variants, treatment_temps, treatment_errors = extract_treatments(
+            workspace, source, lean_file, grind_lines)
+        temp_files.extend(treatment_temps)
 
-    # Record extraction errors in the database
-    if db:
-        for tname, errmsg in treatment_errors:
-            db.add_error(lean_file, grind_line, tname, errmsg)
-
-    # Benchmark each variant
-    results = {}
-    for label, file, _ in variants:
-        r = benchmark(workspace, file, args.warmup, args.runs)
-        if r is None:
-            print(f"  ({lean_file}:{grind_line}, {label}) FAILED")
-            if db:
-                db.add_error(lean_file, grind_line, label, "benchmark failed")
-            continue
-        results[label] = r
+        # Record extraction errors in the database
         if db:
-            db.add_timing(lean_file, grind_line, label, r)
-        mean = statistics.mean(r)
-        print(f"  ({lean_file}:{grind_line}, {label}) {mean:.4f}s")
+            for tname, errmsg in treatment_errors:
+                db.add_error(lean_file, grind_line, tname, errmsg)
 
-    # Print extraction errors only for treatments that have no variant at all
-    successful_treatments = {label for label, _, _ in variants}
-    failed_treatments = {tname for tname, _ in treatment_errors if tname not in successful_treatments}
-    for tname in failed_treatments:
-        print(f"  ({lean_file}:{grind_line}, {tname}) FAILED")
+        # Benchmark each variant
+        results = {}
+        for label, file, _ in variants:
+            r = benchmark(workspace, file, args.warmup, args.runs)
+            if r is None:
+                print(f"  ({lean_file}:{grind_line}, {label}) FAILED")
+                if db:
+                    db.add_error(lean_file, grind_line, label, "benchmark failed")
+                continue
+            results[label] = r
+            if db:
+                db.add_timing(lean_file, grind_line, label, r)
+            mean = statistics.mean(r)
+            print(f"  ({lean_file}:{grind_line}, {label}) {mean:.4f}s")
 
-    if not results:
-        # Cleanup
+        # Print extraction errors only for treatments that have no variant at all
+        successful_treatments = {label for label, _, _ in variants}
+        failed_treatments = {tname for tname, _ in treatment_errors if tname not in successful_treatments}
+        for tname in failed_treatments:
+            print(f"  ({lean_file}:{grind_line}, {tname}) FAILED")
+
+        if not results:
+            return 1
+
+        # Speedup summary
+        if "original" in results:
+            orig = statistics.mean(results["original"])
+            for label, _, _ in variants[1:]:
+                if label in results:
+                    m = statistics.mean(results[label])
+                    if m > 0:
+                        print(f"  ({lean_file}:{grind_line}, {label}) speedup: {orig / m:.3f}x")
+
+        return 0
+    finally:
         for f in temp_files:
             (workspace / f).unlink(missing_ok=True)
-        return 1
-
-    # Speedup summary
-    if "original" in results:
-        orig = statistics.mean(results["original"])
-        for label, _, _ in variants[1:]:
-            if label in results:
-                m = statistics.mean(results[label])
-                if m > 0:
-                    print(f"  ({lean_file}:{grind_line}, {label}) speedup: {orig / m:.3f}x")
-
-    # Cleanup
-    for f in temp_files:
-        (workspace / f).unlink(missing_ok=True)
-    return 0

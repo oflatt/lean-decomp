@@ -287,8 +287,17 @@ mutual
       let mut currentLctx := lctx
       let mut currentUsed := used
       let mut seenTypes : Array Expr := #[]
+      -- Track implication facts whose conclusions are arithmetic.
+      -- After emitting, we apply them via `simp_all` to get the conclusion.
+      let mut implApplyTactics : Array (TSyntax `tactic) := #[]
       for proof in proofs do
         if proof.isFVar then continue
+        -- Skip Eq.mp casts wrapping context fvars — grind normalizes types
+        -- but the original hypothesis is already in context.
+        let (pfn, pargs) := peelArgs proof
+        if pfn.isConstOf ``Eq.mp && pargs.length >= 4 then
+          let core := pargs[3]!
+          if core.isFVar then continue
         let proofTy ← Meta.inferType proof
         -- Skip Prop = Prop equalities (chain internals)
         if proofTy.isApp then
@@ -314,9 +323,12 @@ mutual
         let typeStx ← PrettyPrinter.delab proofTy
         -- For lambda-typed proofs (implications), check if we can emit
         -- intro + have := <core_app> + omega
-        let proofTactics : Array (TSyntax `tactic) ←
+        -- Returns (proofTactics, optionalBinderTypeStx) — when the lambda has
+        -- an arithmetic conclusion, we also return the binder type syntax so
+        -- we can schedule a simp_all application outside withLCtx.
+        let (proofTactics, binderTypeStx?) : Array (TSyntax `tactic) × Option (TSyntax `term) ←
           if isArithType proofTy then
-            pure #[← `(tactic| omega)]
+            pure (#[← `(tactic| omega)], none)
           else if proof.isLambda then do
             -- The proof is `fun a => <body>`. Check if body has a core fvar app
             let .lam binderName binderTy body _ := proof | unreachable!
@@ -334,32 +346,56 @@ mutual
               if isArithType conclusionTy then
                 let (hName, _) := chooseIntroName (currentUsed.length + 1) `h currentUsed
                 let hIdent := mkIdent (Name.mkSimple hName)
-                pure #[← `(tactic| intro $introIdent:ident),
-                        ← `(tactic| have $hIdent := $coreAppStx),
-                        ← `(tactic| omega)]
+                -- Delab the binder type in the OUTER lctx for the apply step
+                let btStx ← withLCtx currentLctx (← getLocalInstances) do
+                  PrettyPrinter.delab binderTy
+                pure (#[← `(tactic| intro $introIdent:ident),
+                         ← `(tactic| have $hIdent := $coreAppStx),
+                         ← `(tactic| omega)], some btStx)
               else
                 let termStx ← delabToRefinableSyntax proof
-                pure #[← `(tactic| exact $termStx)]
+                pure (#[← `(tactic| exact $termStx)], none)
             else
               let termStx ← delabToRefinableSyntax proof
-              pure #[← `(tactic| exact $termStx)]
+              pure (#[← `(tactic| exact $termStx)], none)
           else if let some (coreApp, extraArgs) := extractCoreFVarApp proof then do
             -- Non-lambda proof with fvar core — emit clean exact with the core app
             let fullApp := mkAppN coreApp extraArgs
             let coreAppStx ← PrettyPrinter.delab fullApp
-            pure #[← `(tactic| exact $coreAppStx)]
+            pure (#[← `(tactic| exact $coreAppStx)], none)
           else do
             -- Fallback: use delabToRefinableSyntax
             let termStx ← delabToRefinableSyntax proof
-            pure #[← `(tactic| exact $termStx)]
+            pure (#[← `(tactic| exact $termStx)], none)
+        -- If this lambda had arithmetic conclusion, schedule application via simp_all
+        if let some btStx := binderTypeStx? then
+          let (memName, used'') := chooseIntroName (currentUsed.length + 2) `h_mem currentUsed
+          currentUsed := used''
+          let memIdent := mkIdent (Name.mkSimple memName)
+          let (applName, used''') := chooseIntroName (currentUsed.length + 1) `h_applied currentUsed
+          currentUsed := used'''
+          let applIdent := mkIdent (Name.mkSimple applName)
+          implApplyTactics := implApplyTactics
+            |>.push (← `(tactic| have $memIdent : $btStx := by simp_all (config := { zetaDelta := true })))
+            |>.push (← `(tactic| have $applIdent := $haveNameIdent $memIdent))
         let proofTacSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$proofTactics]*)
         let haveTac ← `(tactic| have $haveNameIdent : $typeStx := by $proofTacSeq)
         haveTactics := haveTactics.push haveTac
         let haveId := FVarId.mk (← mkFreshId)
         currentLctx := currentLctx.mkLocalDecl haveId (Name.mkSimple haveName) proofTy
-      -- If we found derived facts, emit them + closing tactic
-      if haveTactics.isEmpty then return none
-      -- Use omega when all emitted facts are arithmetic, contradiction otherwise
+      -- If we found derived facts, emit them + closing tactic.
+      -- When all proofs were skipped (fvars/redundant), still emit a closing
+      -- tactic since the context contains what's needed.
+      if haveTactics.isEmpty then
+        -- omega handles pure arithmetic; for mixed goals, try simp_all
+        let closingTac ← `(tactic| omega)
+        return some (#[closingTac], currentUsed)
+      -- Use omega when all emitted facts are arithmetic, contradiction otherwise.
+      -- When we have implication facts with arithmetic conclusions, apply them
+      -- via simp_all (to find antecedent witnesses) then close with simp_all.
+      if !implApplyTactics.isEmpty then
+        let closingTac ← `(tactic| simp_all (config := { zetaDelta := true }))
+        return some (haveTactics ++ implApplyTactics ++ #[closingTac], currentUsed)
       let closingTac ← if seenTypes.all isArithType then
         `(tactic| omega)
       else
