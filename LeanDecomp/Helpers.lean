@@ -58,4 +58,25 @@ def assignIntroNames (xs : Array Expr) (used0 : List String) : MetaM (List Strin
 def namesToIdents (names : List String) : Array Ident :=
   names.toArray.map (fun n => mkIdent (Name.mkSimple n))
 
+/-- Check if an expression contains grind/linear-arithmetic internals,
+    suggesting it was built by the `grind` tactic and may be replaceable by `omega`.
+    Walks at most 5000 nodes. -/
+def containsGrindInternals (e : Expr) : Bool := Id.run do
+  let mut stack : List Expr := [e]
+  let mut count := 0
+  while !stack.isEmpty && count < 5000 do
+    let cur := stack.head!
+    stack := stack.tail!
+    count := count + 1
+    match cur with
+    | .const n _ =>
+      let s := n.toString
+      if s.startsWith "Int.Linear." || s.startsWith "Lean.Grind." || s.startsWith "Lean.RArray." then
+        return true
+    | .app f a => stack := f :: a :: stack
+    | .lam _ t b _ => stack := t :: b :: stack
+    | .mdata _ e => stack := e :: stack
+    | _ => pure ()
+  return false
+
 end LeanDecomp

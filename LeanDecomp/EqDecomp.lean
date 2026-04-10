@@ -326,6 +326,10 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
       | return none
     let some sourceTy := sourceTy?
       | return none
+    -- Skip when the equality proof contains grind internals — structural
+    -- decompilation would produce huge output with non-re-elaboratable terms.
+    -- Fall through to decompExact instead.
+    if containsGrindInternals eqProofArg then return none
 
     let mut sourceProofArg? : Option Expr := none
     for a in args do

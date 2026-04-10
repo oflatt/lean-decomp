@@ -26,27 +26,6 @@ private def firstSomeM [Monad m] (xs : List (m (Option α))) : m (Option α) := 
       return some res
   return none
 
-/-- Check if an expression (shallowly) contains grind/linear-arithmetic internals,
-    suggesting it was built by the `grind` tactic and may be replaceable by `omega`.
-    Walks at most 200 nodes to keep the check cheap. -/
-private def containsGrindInternals (e : Expr) : Bool := Id.run do
-  let mut stack : List Expr := [e]
-  let mut count := 0
-  while !stack.isEmpty && count < 200 do
-    let cur := stack.head!
-    stack := stack.tail!
-    count := count + 1
-    match cur with
-    | .const n _ =>
-      let s := n.toString
-      if s.startsWith "Int.Linear." || s.startsWith "Lean.Grind." || s.startsWith "Lean.RArray." then
-        return true
-    | .app f a => stack := f :: a :: stack
-    | .lam _ t b _ => stack := t :: b :: stack
-    | .mdata _ e => stack := e :: stack
-    | _ => pure ()
-  return false
-
 mutual
 
   /-- Convert a proof term expression into tactic syntax. -/
@@ -231,6 +210,10 @@ mutual
     let inner := args[3]!
     -- Only strip when the cast itself is grind normalization junk
     if !containsGrindInternals eqProof then return none
+    -- When inner is True.intro, the meaningful content is in the equality chain,
+    -- not the inner term. Let tryDecompEqMp handle these structurally.
+    let (innerFn, _) := peelArgs inner
+    if innerFn.isConstOf ``True.intro then return none
     -- Reconstruct the inner expression with any extra args (over-application)
     let innerWithArgs := (args.drop 4).foldl (init := inner) fun acc arg => mkApp acc arg
     withLCtx lctx localInsts do
