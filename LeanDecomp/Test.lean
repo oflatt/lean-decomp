@@ -18,18 +18,18 @@ example : 2 + 2 = 4 := by
 -- Test 2: Simple implication with intro
 /--
 info: Try this:
-  [apply] 
+  [apply]
     intro h
     exact h
 -/
-#guard_msgs in
+#guard_msgs (whitespace := lax) in
 example (P : Prop) : P → P := by
   decompile intro h; exact h
 
 -- Test 3: And introduction
 /--
 info: Try this:
-  [apply] exact @And.intro a b ha hb
+  [apply] exact ⟨ha, hb⟩
 -/
 #guard_msgs in
 example (a b : Prop) (ha : a) (hb : b) : a ∧ b := by
@@ -51,7 +51,7 @@ info: Try this:
     intro n
     exact Nat.zero_add n
 -/
-#guard_msgs in
+#guard_msgs (whitespace := lax) in
 example : ∀ n : Nat, 0 + n = n := by
   decompile intro n; exact Nat.zero_add n
 

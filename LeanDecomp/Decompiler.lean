@@ -1,6 +1,7 @@
 import Lean
 import Lean.Meta.Tactic.TryThis
 import Lean.PrettyPrinter
+import Lean.Elab.Tactic.Omega.Frontend
 import LeanDecomp.Helpers
 import LeanDecomp.CasesOn
 import LeanDecomp.EqDecomp
@@ -25,6 +26,26 @@ private def firstSomeM [Monad m] (xs : List (m (Option α))) : m (Option α) := 
       return some res
   return none
 
+/-- Check if an expression (shallowly) contains grind/linear-arithmetic internals,
+    suggesting it was built by the `grind` tactic and may be replaceable by `omega`. -/
+private def containsGrindInternals (e : Expr) : Bool := Id.run do
+  let mut stack : List Expr := [e]
+  let mut count := 0
+  while !stack.isEmpty && count < 5000 do
+    let cur := stack.head!
+    stack := stack.tail!
+    count := count + 1
+    match cur with
+    | .const n _ =>
+      let s := n.toString
+      if s.startsWith "Int.Linear." || s.startsWith "Lean.Grind." || s.startsWith "Lean.RArray." then
+        return true
+    | .app f a => stack := f :: a :: stack
+    | .lam _ t b _ => stack := t :: b :: stack
+    | .mdata _ e => stack := e :: stack
+    | _ => pure ()
+  return false
+
 mutual
 
   /-- Convert a proof term expression into tactic syntax. -/
@@ -47,6 +68,8 @@ mutual
           let specialized? ← firstSomeM [
             tryDecompByContradiction body lctx localInsts used,
             tryDecompCasesOn body lctx localInsts used decompileExpr assignIntroNames,
+            tryDecompOmega body lctx localInsts used,
+            tryDecompEqMpTrueIntro body lctx localInsts used,
             LeanDecomp.tryDecompCongr body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongrArg body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqSymm body lctx localInsts used decompileExpr,
@@ -59,10 +82,7 @@ mutual
           ]
           match specialized? with
           | some res => pure res
-          | none => do
-              let termStx ← delabToRefinableSyntax body
-              let tac ← `(tactic| exact $termStx)
-              return (#[tac], used)
+          | none => decompExact body used
 
   private partial def tryDecompIntro (xs : Array Expr) (body : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Array (TSyntax `tactic) × List String) := do
@@ -196,16 +216,220 @@ mutual
       let tac ← `(tactic| decide)
       return some (#[tac], used)
 
+  /-- Try replacing grind-internal proof terms with `omega`.
+      When the expression contains grind/linear-arithmetic internals, try `omega`
+      (verified via API). This avoids decomposing huge internal terms that
+      `omega` can handle directly. -/
+  private partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+    -- Only try if the expression contains grind internals
+    if !containsGrindInternals expr then return none
+    withLCtx lctx localInsts do
+      let goalType ← Meta.inferType expr
+      -- Collect all hypothesis expressions from the local context
+      let mut facts : List Expr := []
+      for decl in lctx do
+        if decl.isImplementationDetail then continue
+        facts := (.fvar decl.fvarId) :: facts
+      -- Try omega
+      try
+        let mvar ← Meta.mkFreshExprMVar (some goalType) .syntheticOpaque
+        Lean.Elab.Tactic.Omega.omega facts mvar.mvarId!
+        let tac ← `(tactic| omega)
+        return some (#[tac], used)
+      catch _ => pure ()
+      -- Omega failed — fall through to other handlers to keep unwrapping
+      return none
+
+  /-- Handle `Eq.mp (chain : True = False) True.intro` proving `False`.
+      This is the characteristic pattern from grind proofs. We walk the equality
+      chain to collect all `eq_true` proof arguments (the actual hypotheses being
+      used), emit `have` bindings for non-trivial derived facts, and try to close
+      with `omega`. For each fact, we try omega on its type first; if that fails
+      we directly delab the proof term (no recursive decompilation). -/
+  private partial def tryDecompEqMpTrueIntro (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+    withLCtx lctx localInsts do
+      -- Match: Eq.mp (chain : True = False) True.intro
+      let (fn, args) := peelArgs expr
+      let some cname := fn.constName? | return none
+      if cname != ``Eq.mp then return none
+      if args.length != 4 then return none
+      let eqChain := args[2]!
+      let witness := args[3]!
+      let (witFn, _) := peelArgs witness
+      let some witName := witFn.constName? | return none
+      if witName != ``True.intro then return none
+      -- Check the type is False
+      let exprTy ← Meta.inferType expr
+      if !exprTy.isConstOf ``False then return none
+      -- Collect all eq_true proof arguments from the chain
+      let proofs := collectEqTrueProofs eqChain
+      if proofs.isEmpty then return none
+      -- Filter: keep proofs that are not just fvars (derived facts).
+      -- Also deduplicate and skip Prop=Prop equalities.
+      let mut haveTactics : Array (TSyntax `tactic) := #[]
+      let mut currentLctx := lctx
+      let mut currentUsed := used
+      let mut seenTypes : Array Expr := #[]
+      -- Collect hypothesis expressions for omega
+      let mut contextFacts : List Expr := []
+      for decl in lctx do
+        if decl.isImplementationDetail then continue
+        contextFacts := (.fvar decl.fvarId) :: contextFacts
+      for proof in proofs do
+        if proof.isFVar then continue
+        let proofTy ← Meta.inferType proof
+        -- Skip Prop = Prop equalities (chain internals)
+        if proofTy.isApp then
+          let (pfn, pargs) := peelArgs proofTy
+          if pfn.isConstOf ``Eq && pargs.length >= 3 then
+            if pargs[0]!.isSort then continue
+        -- Skip if we already have a fact with the same type
+        let isDuplicate ← seenTypes.anyM fun seen => Meta.isDefEq seen proofTy
+        if isDuplicate then continue
+        -- Skip if defEq to an existing hypothesis in the context
+        let mut isRedundant := false
+        for decl in lctx do
+          if decl.isImplementationDetail then continue
+          if ← Meta.isDefEq decl.type proofTy then
+            isRedundant := true
+            break
+        if isRedundant then continue
+        seenTypes := seenTypes.push proofTy
+        let (haveName, used') := chooseIntroName currentUsed.length `fact currentUsed
+        currentUsed := used'
+        let haveNameIdent := mkIdent (Name.mkSimple haveName)
+        -- Use normal delab for types (readable, may not perfectly re-elaborate)
+        let typeStx ← PrettyPrinter.delab proofTy
+        -- Check if the type is a pure arithmetic comparison (suitable for omega)
+        let isArithGoal : Bool := Id.run do
+          let (fn, args) := peelArgs proofTy
+          let some name := fn.constName? | return false
+          if (name == ``LE.le || name == ``LT.lt || name == ``GE.ge || name == ``GT.gt)
+              && args.length >= 4 then
+            return args[0]!.isConstOf ``Int || args[0]!.isConstOf ``Nat
+          else if name == ``Eq && args.length >= 3 then
+            return args[0]!.isConstOf ``Int || args[0]!.isConstOf ``Nat
+          else
+            return false
+        -- For lambda-typed proofs (implications), check if we can emit
+        -- intro + have := <core_app> + omega
+        let proofTactics : Array (TSyntax `tactic) ←
+          if isArithGoal then
+            pure #[← `(tactic| omega)]
+          else if proof.isLambda then do
+            -- The proof is `fun a => <body>`. Check if body has a core fvar app
+            let .lam binderName binderTy body _ := proof | unreachable!
+            let binderId := FVarId.mk (← mkFreshId)
+            let introIdent : TSyntax `ident := mkIdent binderName
+            -- Add the binder to local context for proper delaboration
+            let tempLctx := currentLctx.mkLocalDecl binderId binderName binderTy
+            let body' := body.instantiate1 (mkFVar binderId)
+            withLCtx tempLctx (← getLocalInstances) do
+            if let some (coreApp, extraArgs) := extractCoreFVarApp body' then
+              -- Reconstruct the full fvar application (e.g., hs x a)
+              let fullApp := mkAppN coreApp extraArgs
+              let coreAppStx ← PrettyPrinter.delab fullApp
+              -- Check if conclusion is arithmetic (omega can close)
+              let conclusionTy ← Meta.inferType body'
+              let conclusionIsArith : Bool := Id.run do
+                let (fn, args) := peelArgs conclusionTy
+                let some name := fn.constName? | return false
+                if (name == ``LE.le || name == ``LT.lt || name == ``GE.ge || name == ``GT.gt)
+                    && args.length >= 4 then
+                  return (args[0]!.isConstOf ``Int || args[0]!.isConstOf ``Nat)
+                else return false
+              if conclusionIsArith then
+                let (hName, _) := chooseIntroName (currentUsed.length + 1) `h currentUsed
+                let hIdent := mkIdent (Name.mkSimple hName)
+                pure #[← `(tactic| intro $introIdent:ident),
+                        ← `(tactic| have $hIdent := $coreAppStx),
+                        ← `(tactic| omega)]
+              else
+                let termStx ← delabToRefinableSyntax proof
+                pure #[← `(tactic| exact $termStx)]
+            else
+              let termStx ← delabToRefinableSyntax proof
+              pure #[← `(tactic| exact $termStx)]
+          else if let some (coreApp, extraArgs) := extractCoreFVarApp proof then do
+            -- Non-lambda proof with fvar core — emit clean exact with the core app
+            let fullApp := mkAppN coreApp extraArgs
+            let coreAppStx ← PrettyPrinter.delab fullApp
+            pure #[← `(tactic| exact $coreAppStx)]
+          else do
+            -- Fallback: use delabToRefinableSyntax
+            let termStx ← delabToRefinableSyntax proof
+            pure #[← `(tactic| exact $termStx)]
+        let proofTacSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$proofTactics]*)
+        let haveTac ← `(tactic| have $haveNameIdent : $typeStx := by $proofTacSeq)
+        haveTactics := haveTactics.push haveTac
+        let haveId := FVarId.mk (← mkFreshId)
+        currentLctx := currentLctx.mkLocalDecl haveId (Name.mkSimple haveName) proofTy
+        contextFacts := (.fvar haveId) :: contextFacts
+      -- If we found derived facts, emit them + omega/contradiction
+      if haveTactics.isEmpty then return none
+      -- Try omega with the enriched context
+      let mut closingTac ← `(tactic| contradiction)
+      try
+        let goalType ← Meta.inferType expr
+        let mvar ← Meta.mkFreshExprMVar (some goalType) .syntheticOpaque
+        Lean.Elab.Tactic.Omega.omega contextFacts mvar.mvarId!
+        closingTac ← `(tactic| omega)
+      catch _ => pure ()
+      return some (haveTactics ++ #[closingTac], currentUsed)
+
+  /-- The final exact fallback. Try without pp.all first for smaller output,
+      fall back to pp.all if needed. -/
+  private partial def decompExact (body : Expr) (used : List String) :
+      MetaM (Array (TSyntax `tactic) × List String) := do
+    let termStx ← delabToRefinableSyntax body
+    let tac ← `(tactic| exact $termStx)
+    return (#[tac], used)
+
   /-- Handle any expression whose type is `False` — emit `contradiction`.
-      This catches noConfusion-derived `Eq.ndrec` patterns and other complex
-      proofs of False that aren't directly `False.rec/elim/casesOn`. -/
+      Only fires when the local context contains an obvious contradiction
+      (a `False` hypothesis, or `h : P` and `h' : ¬P`). This avoids emitting
+      `contradiction` for complex proof terms where it can't close the goal. -/
   private partial def tryDecompFalseType (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let exprTy ← Meta.inferType expr
       if !exprTy.isConstOf ``False then return none
-      let contradictionTac ← `(tactic| contradiction)
-      return some (#[contradictionTac], used)
+      -- Check if the local context has an obvious contradiction
+      let mut hasFalse := false
+      let mut posHyps : Array Expr := #[]  -- hypotheses of type P
+      let mut negHyps : Array Expr := #[]  -- hypotheses of type ¬P (inner P)
+      for decl in lctx do
+        if decl.isImplementationDetail then continue
+        let ty := decl.type
+        if ty.isConstOf ``False then
+          hasFalse := true
+          break
+        let (fn, args) := peelArgs ty
+        if fn.isConstOf ``Not && args.length >= 1 then
+          negHyps := negHyps.push args[0]!
+        else if ty.isForall && !ty.isArrow then
+          -- skip universals
+          pure ()
+        else if let .forallE _ dom body _ := ty then
+          -- P → False is ¬P
+          if body.isConstOf ``False then
+            negHyps := negHyps.push dom
+          else
+            posHyps := posHyps.push ty
+        else if !ty.isSort then
+          posHyps := posHyps.push ty
+      if hasFalse then
+        let contradictionTac ← `(tactic| contradiction)
+        return some (#[contradictionTac], used)
+      -- Check for P/¬P pair
+      for neg in negHyps do
+        for pos in posHyps do
+          if (← Meta.isDefEq pos neg) then
+            let contradictionTac ← `(tactic| contradiction)
+            return some (#[contradictionTac], used)
+      return none
 
 end
 
