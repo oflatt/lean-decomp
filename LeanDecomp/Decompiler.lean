@@ -47,20 +47,6 @@ private def containsGrindInternals (e : Expr) : Bool := Id.run do
     | _ => pure ()
   return false
 
-/-- Check if a type is a pure arithmetic comparison over Int or Nat
-    (suitable for `omega`). Matches `LE.le`, `LT.lt`, `GE.ge`, `GT.gt`,
-    and `Eq` when the universe type is Int or Nat. -/
-private def isArithType (ty : Expr) : Bool := Id.run do
-  let (fn, args) := peelArgs ty
-  let some name := fn.constName? | return false
-  if (name == ``LE.le || name == ``LT.lt || name == ``GE.ge || name == ``GT.gt)
-      && args.length >= 4 then
-    return args[0]!.isConstOf ``Int || args[0]!.isConstOf ``Nat
-  else if name == ``Eq && args.length >= 3 then
-    return args[0]!.isConstOf ``Int || args[0]!.isConstOf ``Nat
-  else
-    return false
-
 mutual
 
   /-- Convert a proof term expression into tactic syntax. -/
@@ -83,8 +69,8 @@ mutual
           let specialized? ← firstSomeM [
             tryDecompByContradiction body lctx localInsts used,
             tryDecompCasesOn body lctx localInsts used decompileExpr assignIntroNames,
+            tryDecompEqMpGrindCast body lctx localInsts used,
             tryDecompOmega body lctx localInsts used,
-            tryDecompEqMpTrueIntro body lctx localInsts used,
             LeanDecomp.tryDecompCongr body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongrArg body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqSymm body lctx localInsts used decompileExpr,
@@ -231,6 +217,39 @@ mutual
       let tac ← `(tactic| decide)
       return some (#[tac], used)
 
+  /-- Strip `Eq.mp <cast> inner` when the cast contains grind internals.
+      Grind wraps proof terms in type-normalization casts that are logically
+      transparent — the inner term proves something defEq to the goal.
+      We skip the cast and recurse on the inner proof. -/
+  private partial def tryDecompEqMpGrindCast (expr : Expr) (lctx : LocalContext)
+      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+    let (fn, args) := peelArgs expr
+    let some cname := fn.constName? | return none
+    if cname != ``Eq.mp then return none
+    if args.length < 4 then return none
+    let eqProof := args[2]!
+    let inner := args[3]!
+    -- Only strip when the cast itself is grind normalization junk
+    if !containsGrindInternals eqProof then return none
+    -- Reconstruct the inner expression with any extra args (over-application)
+    let innerWithArgs := (args.drop 4).foldl (init := inner) fun acc arg => mkApp acc arg
+    withLCtx lctx localInsts do
+      let goalType ← Meta.inferType expr
+      let innerType ← Meta.inferType innerWithArgs
+      -- If types match, just recurse on inner
+      if ← Meta.isDefEq goalType innerType then
+        let (tactics, used') ← decompileExpr innerWithArgs lctx localInsts used
+        return some (tactics, used')
+      -- Types differ (grind normalization). Introduce inner as `have`, close with `omega`.
+      let (haveName, used') := chooseIntroName used.length `fact used
+      let haveNameIdent := mkIdent (Name.mkSimple haveName)
+      let typeStx ← PrettyPrinter.delab innerType
+      let (proofTactics, used'') ← decompileExpr innerWithArgs lctx localInsts used'
+      let proofTacSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$proofTactics]*)
+      let haveTac ← `(tactic| have $haveNameIdent : $typeStx := by $proofTacSeq)
+      let closingTac ← `(tactic| omega)
+      return some (#[haveTac, closingTac], used'')
+
   /-- Try replacing grind-internal proof terms with `omega`.
       When the expression contains grind/linear-arithmetic internals, try `omega`
       (verified via API). This avoids decomposing huge internal terms that
@@ -255,152 +274,6 @@ mutual
       catch _ => pure ()
       -- Omega failed — fall through to other handlers to keep unwrapping
       return none
-
-  /-- Handle `Eq.mp (chain : True = False) True.intro` proving `False`.
-      This is the characteristic pattern from grind proofs. We walk the equality
-      chain to collect all `eq_true` proof arguments (the actual hypotheses being
-      used), emit `have` bindings for non-trivial derived facts, and try to close
-      with `omega`. For each fact, we try omega on its type first; if that fails
-      we directly delab the proof term (no recursive decompilation). -/
-  private partial def tryDecompEqMpTrueIntro (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
-    withLCtx lctx localInsts do
-      -- Match: Eq.mp (chain : True = False) True.intro
-      let (fn, args) := peelArgs expr
-      let some cname := fn.constName? | return none
-      if cname != ``Eq.mp then return none
-      if args.length != 4 then return none
-      let eqChain := args[2]!
-      let witness := args[3]!
-      let (witFn, _) := peelArgs witness
-      let some witName := witFn.constName? | return none
-      if witName != ``True.intro then return none
-      -- Check the type is False
-      let exprTy ← Meta.inferType expr
-      if !exprTy.isConstOf ``False then return none
-      -- Collect all eq_true proof arguments from the chain
-      let proofs := collectEqTrueProofs eqChain
-      if proofs.isEmpty then return none
-      -- Filter: keep proofs that are not just fvars (derived facts).
-      -- Also deduplicate and skip Prop=Prop equalities.
-      let mut haveTactics : Array (TSyntax `tactic) := #[]
-      let mut currentLctx := lctx
-      let mut currentUsed := used
-      let mut seenTypes : Array Expr := #[]
-      -- Track implication facts whose conclusions are arithmetic.
-      -- After emitting, we apply them via `simp_all` to get the conclusion.
-      let mut implApplyTactics : Array (TSyntax `tactic) := #[]
-      for proof in proofs do
-        if proof.isFVar then continue
-        -- Skip Eq.mp casts wrapping context fvars — grind normalizes types
-        -- but the original hypothesis is already in context.
-        let (pfn, pargs) := peelArgs proof
-        if pfn.isConstOf ``Eq.mp && pargs.length >= 4 then
-          let core := pargs[3]!
-          if core.isFVar then continue
-        let proofTy ← Meta.inferType proof
-        -- Skip Prop = Prop equalities (chain internals)
-        if proofTy.isApp then
-          let (pfn, pargs) := peelArgs proofTy
-          if pfn.isConstOf ``Eq && pargs.length >= 3 then
-            if pargs[0]!.isSort then continue
-        -- Skip if we already have a fact with the same type
-        let isDuplicate ← seenTypes.anyM fun seen => Meta.isDefEq seen proofTy
-        if isDuplicate then continue
-        -- Skip if defEq to an existing hypothesis in the context
-        let mut isRedundant := false
-        for decl in lctx do
-          if decl.isImplementationDetail then continue
-          if ← Meta.isDefEq decl.type proofTy then
-            isRedundant := true
-            break
-        if isRedundant then continue
-        seenTypes := seenTypes.push proofTy
-        let (haveName, used') := chooseIntroName currentUsed.length `fact currentUsed
-        currentUsed := used'
-        let haveNameIdent := mkIdent (Name.mkSimple haveName)
-        -- Use normal delab for types (readable, may not perfectly re-elaborate)
-        let typeStx ← PrettyPrinter.delab proofTy
-        -- For lambda-typed proofs (implications), check if we can emit
-        -- intro + have := <core_app> + omega
-        -- Returns (proofTactics, optionalBinderTypeStx) — when the lambda has
-        -- an arithmetic conclusion, we also return the binder type syntax so
-        -- we can schedule a simp_all application outside withLCtx.
-        let (proofTactics, binderTypeStx?) : Array (TSyntax `tactic) × Option (TSyntax `term) ←
-          if isArithType proofTy then
-            pure (#[← `(tactic| omega)], none)
-          else if proof.isLambda then do
-            -- The proof is `fun a => <body>`. Check if body has a core fvar app
-            let .lam binderName binderTy body _ := proof | unreachable!
-            let binderId := FVarId.mk (← mkFreshId)
-            let introIdent : TSyntax `ident := mkIdent binderName
-            -- Add the binder to local context for proper delaboration
-            let tempLctx := currentLctx.mkLocalDecl binderId binderName binderTy
-            let body' := body.instantiate1 (mkFVar binderId)
-            withLCtx tempLctx (← getLocalInstances) do
-            if let some (coreApp, extraArgs) := extractCoreFVarApp body' then
-              -- Reconstruct the full fvar application (e.g., hs x a)
-              let fullApp := mkAppN coreApp extraArgs
-              let coreAppStx ← PrettyPrinter.delab fullApp
-              let conclusionTy ← Meta.inferType body'
-              if isArithType conclusionTy then
-                let (hName, _) := chooseIntroName (currentUsed.length + 1) `h currentUsed
-                let hIdent := mkIdent (Name.mkSimple hName)
-                -- Delab the binder type in the OUTER lctx for the apply step
-                let btStx ← withLCtx currentLctx (← getLocalInstances) do
-                  PrettyPrinter.delab binderTy
-                pure (#[← `(tactic| intro $introIdent:ident),
-                         ← `(tactic| have $hIdent := $coreAppStx),
-                         ← `(tactic| omega)], some btStx)
-              else
-                let termStx ← delabToRefinableSyntax proof
-                pure (#[← `(tactic| exact $termStx)], none)
-            else
-              let termStx ← delabToRefinableSyntax proof
-              pure (#[← `(tactic| exact $termStx)], none)
-          else if let some (coreApp, extraArgs) := extractCoreFVarApp proof then do
-            -- Non-lambda proof with fvar core — emit clean exact with the core app
-            let fullApp := mkAppN coreApp extraArgs
-            let coreAppStx ← PrettyPrinter.delab fullApp
-            pure (#[← `(tactic| exact $coreAppStx)], none)
-          else do
-            -- Fallback: use delabToRefinableSyntax
-            let termStx ← delabToRefinableSyntax proof
-            pure (#[← `(tactic| exact $termStx)], none)
-        -- If this lambda had arithmetic conclusion, schedule application via simp_all
-        if let some btStx := binderTypeStx? then
-          let (memName, used'') := chooseIntroName (currentUsed.length + 2) `h_mem currentUsed
-          currentUsed := used''
-          let memIdent := mkIdent (Name.mkSimple memName)
-          let (applName, used''') := chooseIntroName (currentUsed.length + 1) `h_applied currentUsed
-          currentUsed := used'''
-          let applIdent := mkIdent (Name.mkSimple applName)
-          implApplyTactics := implApplyTactics
-            |>.push (← `(tactic| have $memIdent : $btStx := by simp_all (config := { zetaDelta := true })))
-            |>.push (← `(tactic| have $applIdent := $haveNameIdent $memIdent))
-        let proofTacSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$proofTactics]*)
-        let haveTac ← `(tactic| have $haveNameIdent : $typeStx := by $proofTacSeq)
-        haveTactics := haveTactics.push haveTac
-        let haveId := FVarId.mk (← mkFreshId)
-        currentLctx := currentLctx.mkLocalDecl haveId (Name.mkSimple haveName) proofTy
-      -- If we found derived facts, emit them + closing tactic.
-      -- When all proofs were skipped (fvars/redundant), still emit a closing
-      -- tactic since the context contains what's needed.
-      if haveTactics.isEmpty then
-        -- omega handles pure arithmetic; for mixed goals, try simp_all
-        let closingTac ← `(tactic| omega)
-        return some (#[closingTac], currentUsed)
-      -- Use omega when all emitted facts are arithmetic, contradiction otherwise.
-      -- When we have implication facts with arithmetic conclusions, apply them
-      -- via simp_all (to find antecedent witnesses) then close with simp_all.
-      if !implApplyTactics.isEmpty then
-        let closingTac ← `(tactic| simp_all (config := { zetaDelta := true }))
-        return some (haveTactics ++ implApplyTactics ++ #[closingTac], currentUsed)
-      let closingTac ← if seenTypes.all isArithType then
-        `(tactic| omega)
-      else
-        `(tactic| contradiction)
-      return some (haveTactics ++ #[closingTac], currentUsed)
 
   /-- The final exact fallback. Try without pp.all first for smaller output,
       fall back to pp.all if needed. -/
