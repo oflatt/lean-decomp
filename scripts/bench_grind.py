@@ -305,28 +305,65 @@ TREATMENTS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Variant dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Variant:
+    """A benchmarkable variant of a Lean file for one (treatment, grind_line) pair."""
+    treatment: str
+    grind_line: int
+    path: Path
+    suggestion: str | None
+    is_direct: bool = False  # True for whole-file baseline treatments (e.g. original)
+
+
+# ---------------------------------------------------------------------------
 # Suggestion extraction pipeline
 # ---------------------------------------------------------------------------
 
-def _get_line_suggestions(workspace, source, grind_line, query_transform, suffix, lean_file):
+def _get_line_suggestions(workspace, source, grind_line, query_transform, suffix,
+                          lean_file, treatment_name):
     """Run a query for one grind line. Return (suggestions, query_path, raw_output)."""
     query_source = query_transform(source, grind_line)
     query_path = Path(lean_file + suffix)
     (workspace / query_path).write_text(query_source)
-    _, _, combined = lake_env_lean(workspace, query_path)
+    print(
+        f"  Running query: treatment={treatment_name}, line={grind_line}, file={query_path}",
+        flush=True,
+    )
+    code, elapsed, combined = lake_env_lean(workspace, query_path)
+    print(
+        f"  Query finished: treatment={treatment_name}, line={grind_line}, "
+        f"exit={code}, elapsed={elapsed:.2f}s",
+        flush=True,
+    )
     return extract_suggestions(combined), query_path, combined
 
 
-def _try_line_suggestion(workspace, source, grind_line, suggestions, lean_file, out_suffix):
+def _try_line_suggestion(workspace, source, grind_line, suggestions, lean_file,
+                         out_suffix, treatment_name):
     """Try each suggestion for a specific grind line. Return (suggestion, path, last_error)."""
     if not suggestions:
         return None, None, None
     result_path = Path(lean_file + f".L{grind_line}" + out_suffix)
     last_output = ""
-    for s in suggestions:
+    for idx, s in enumerate(suggestions, 1):
+        one_line = s.replace("\n", "\\n")
+        preview = one_line if len(one_line) <= 160 else one_line[:157] + "..."
+        print(
+            f"  Trying suggestion {idx}/{len(suggestions)}: treatment={treatment_name}, "
+            f"line={grind_line}, suggestion={preview}",
+            flush=True,
+        )
         replaced = _transform_grind_at_line(source, grind_line, s)
         (workspace / result_path).write_text(replaced)
-        code, _, output = lake_env_lean(workspace, result_path)
+        code, elapsed, output = lake_env_lean(workspace, result_path)
+        print(
+            f"  Suggestion run finished: treatment={treatment_name}, line={grind_line}, "
+            f"exit={code}, elapsed={elapsed:.2f}s",
+            flush=True,
+        )
         if code == 0:
             return s, result_path, None
         last_output = output
@@ -336,93 +373,59 @@ def _try_line_suggestion(workspace, source, grind_line, suggestions, lean_file, 
 
 def extract_treatments(workspace, source, lean_file, grind_lines,
                        treatments=TREATMENTS):
-    """Run per-line queries and build combined variant files for each treatment.
+    """For each (grind_line, treatment) pair, build a variant that replaces
+    only that single grind call.  Direct treatments (original) get one file
+    covering the whole source unchanged.  Query files are cleaned up before
+    returning.
 
-    Processes each grind line independently: runs the query transform for that
-    single line, collects suggestions, validates them, then combines all per-line
-    replacements into one variant file per treatment.
-
-    Returns (variants, temp_files, errors).
+    Returns (variants, errors) where:
+      variants: list of Variant, one per (grind_line, treatment)
+      errors: list of (tname, grind_line, errmsg)
     """
-    temp_files = []
     variants = []
     errors = []
 
-    # Per-treatment, per-line working suggestions
-    line_results: dict[str, dict[int, str]] = {t.name: {} for t in treatments}
-
-    # Handle direct treatments (no query/suggestion pipeline)
+    # Direct treatments: one variant per grind_line (same source for each).
     for t in treatments:
         if not t.is_direct:
             continue
-        result_path = Path(lean_file + t.out_suffix)
-        (workspace / result_path).write_text(source)
-        variants.append((t.name, str(result_path), None))
-        temp_files.append(result_path)
+        for grind_line in grind_lines:
+            result_path = Path(lean_file + f".L{grind_line}" + t.out_suffix)
+            (workspace / result_path).write_text(source)
+            variants.append(Variant(t.name, grind_line, result_path, None, is_direct=True))
 
+    # Non-direct: one variant per (grind_line, treatment) — only that call replaced.
     for grind_line in grind_lines:
         for t in treatments:
             if t.is_direct:
                 continue
             suffix = f".{t.name}_query_L{grind_line}.lean"
             all_suggestions, qf, raw_output = _get_line_suggestions(
-                workspace, source, grind_line, t.query_transform, suffix, lean_file)
-            temp_files.append(qf)
+                workspace, source, grind_line, t.query_transform, suffix,
+                lean_file, t.name)
+            (workspace / qf).unlink(missing_ok=True)
 
             filtered = [s for s in all_suggestions if t.filter(s)]
             if not filtered:
-                msg = raw_output.strip()[:500] or "no output" if not all_suggestions else "no matching suggestions"
-                errors.append((t.name, f"L{grind_line}: {msg}"))
+                msg = (raw_output.strip()[:500] or "no output") if not all_suggestions else "no matching suggestions"
+                errors.append((t.name, grind_line, msg))
                 continue
 
+            # _try_line_suggestion replaces only grind_line; the validated file
+            # is exactly what we want to benchmark.
             sug, sf, last_error = _try_line_suggestion(
                 workspace, source, grind_line, filtered, lean_file,
-                f".{t.name}_L{grind_line}.lean")
+                f".{t.name}_L{grind_line}.lean", t.name)
             if sug:
-                line_results[t.name][grind_line] = sug
-                if sf:
-                    temp_files.append(sf)
+                variants.append(Variant(t.name, grind_line, sf, sug))
             else:
                 suggestions_tried = "\n".join(f"  suggestion: {s}" for s in filtered)
-                error_msg = f"L{grind_line}:\n{suggestions_tried}"
+                error_msg = suggestions_tried
                 if last_error:
                     error_msg += f"\n{last_error}"
-                errors.append((t.name, error_msg))
+                errors.append((t.name, grind_line, error_msg))
 
-    # Build combined variant for each treatment (replace all successful lines)
-    for t in treatments:
-        if t.is_direct:
-            continue
-        per_line = line_results[t.name]
-        if not per_line:
-            continue
-
-        combined = source
-        # Apply replacements bottom-to-top so line numbers stay valid
-        for gl in sorted(per_line.keys(), reverse=True):
-            combined = _transform_grind_at_line(combined, gl, per_line[gl])
-
-        result_path = Path(lean_file + t.out_suffix)
-        (workspace / result_path).write_text(combined)
-
-        # Keep enough context to identify exactly which suggestion was applied.
-        applied_suggestion = None
-        if len(per_line) == 1:
-            applied_suggestion = next(iter(per_line.values()))
-        elif len(per_line) > 1:
-            applied_suggestion = "\n\n".join(
-                f"L{gl}: {per_line[gl]}" for gl in sorted(per_line)
-            )
-
-        code, _, output = lake_env_lean(workspace, result_path)
-        if code == 0:
-            variants.append((t.name, str(result_path), applied_suggestion))
-            temp_files.append(result_path)
-        else:
-            (workspace / result_path).unlink(missing_ok=True)
-            errors.append((t.name, f"combined validation failed:\n{output.strip()[:500]}"))
-
-    return variants, temp_files, errors
+    return variants, errors
 
 # ---------------------------------------------------------------------------
 # Benchmarking
@@ -480,7 +483,7 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
     """
     workspace = workspace.resolve()
     if not (workspace / lean_file).exists():
-        print(f"Not found: {workspace / lean_file}", file=sys.stderr)
+        print(f"Not found: {workspace / lean_file}", file=sys.stderr, flush=True)
         return 2
 
     # Remove stale generated files from interrupted previous runs
@@ -489,60 +492,60 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
     source = (workspace / lean_file).read_text()
     source = _ensure_profiler(source)
     grind_lines = _find_all_grind_lines(source)
-    grind_line = grind_lines[0] if grind_lines else 0
-    temp_files = []
+    variants = []
 
     try:
         # Extract treatment variants (includes original via identity transform)
-        variants, treatment_temps, treatment_errors = extract_treatments(
+        variants, treatment_errors = extract_treatments(
             workspace, source, lean_file, grind_lines)
-        temp_files.extend(treatment_temps)
 
-        # Record extraction errors in the database
+        # Record extraction errors in the database (one row per grind call line)
         if db:
-            for tname, errmsg in treatment_errors:
-                db.add_error(lean_file, grind_line, tname, errmsg)
+            for tname, gl, errmsg in treatment_errors:
+                db.add_error(lean_file, gl, tname, errmsg)
 
-        # Benchmark each variant
-        results = {}
-        for label, file, applied_suggestion in variants:
-            r = benchmark(workspace, file, args.warmup, args.runs)
+        # Benchmark each variant — one per (grind_line, treatment).
+        original_timings: dict[int, list[float]] = {}
+        any_succeeded = False
+        for v in variants:
+            print(
+                f"  Benchmarking variant: file={v.path}, line={v.grind_line}, "
+                f"treatment={v.treatment}, direct={v.is_direct}",
+                flush=True,
+            )
+            r = benchmark(workspace, v.path, args.warmup, args.runs)
             if r is None:
-                print(f"  ({lean_file}:{grind_line}, {label}) FAILED")
+                print(f"  ({lean_file}:{v.grind_line}, {v.treatment}) FAILED", flush=True)
                 if db:
-                    db.add_error(lean_file, grind_line, label, "benchmark failed")
+                    db.add_error(lean_file, v.grind_line, v.treatment, "benchmark failed")
                 continue
-            results[label] = r
-            if db:
-                db.add_timing(
-                    lean_file,
-                    grind_line,
-                    label,
-                    r,
-                    applied_suggestion=applied_suggestion,
-                )
+            any_succeeded = True
             mean = statistics.mean(r)
-            print(f"  ({lean_file}:{grind_line}, {label}) {mean:.4f}s")
+            if v.is_direct:
+                original_timings[v.grind_line] = r
+            if db:
+                db.add_timing(lean_file, v.grind_line, v.treatment, r, applied_suggestion=v.suggestion)
+            speedup_str = ""
+            orig = original_timings.get(v.grind_line)
+            if orig and not v.is_direct:
+                orig_mean = statistics.mean(orig)
+                if mean > 0:
+                    speedup_str = f"  speedup: {orig_mean / mean:.3f}x"
+            print(
+                f"  ({lean_file}:{v.grind_line}, {v.treatment}) {mean:.4f}s{speedup_str}",
+                flush=True,
+            )
 
-        # Print extraction errors only for treatments that have no variant at all
-        successful_treatments = {label for label, _, _ in variants}
-        failed_treatments = {tname for tname, _ in treatment_errors if tname not in successful_treatments}
-        for tname in failed_treatments:
-            print(f"  ({lean_file}:{grind_line}, {tname}) FAILED")
+        # Report treatments that failed for every grind line (no variant at all).
+        successful_treatments = {v.treatment for v in variants}
+        for tname, gl, _ in treatment_errors:
+            if tname not in successful_treatments:
+                print(f"  ({lean_file}:{gl}, {tname}) FAILED", flush=True)
 
-        if not results:
+        if not any_succeeded:
             return 1
-
-        # Speedup summary
-        if "original" in results:
-            orig = statistics.mean(results["original"])
-            for label, _, _ in variants[1:]:
-                if label in results:
-                    m = statistics.mean(results[label])
-                    if m > 0:
-                        print(f"  ({lean_file}:{grind_line}, {label}) speedup: {orig / m:.3f}x")
 
         return 0
     finally:
-        for f in temp_files:
-            (workspace / f).unlink(missing_ok=True)
+        for v in variants:
+            (workspace / v.path).unlink(missing_ok=True)

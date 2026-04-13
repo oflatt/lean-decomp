@@ -71,8 +71,9 @@ def mean_timing(data):
         for t in all_treatments:
             row[t] = treatments.get(t, "")
         applied = suggestions_by_key.get((file, grind_line), {})
-        row["applied_suggestions"] = "\n\n".join(
-            f"{t}: {applied[t]}" for t in sorted(applied)
+        # Each entry is the suggestion applied at this specific grind call line.
+        row["applied_suggestion"] = "\n\n---\n\n".join(
+            f"{t}:\n{applied[t]}" for t in sorted(applied)
         )
         result.append(row)
     return result
