@@ -52,12 +52,16 @@ def mean_timing(data):
     from collections import defaultdict
 
     by_key = defaultdict(dict)
+    suggestions_by_key = defaultdict(dict)
     for row in data.get("timings", []):
         key = (row.get("file", ""), row.get("grind_line", ""))
         treatment = row.get("treatment", "unknown")
         times = row.get("timing_list", [])
         mean = sum(times) / len(times) if times else 0
         by_key[key][treatment] = round(mean, 6)
+        suggestion = row.get("applied_suggestion")
+        if suggestion:
+            suggestions_by_key[key][treatment] = suggestion
 
     all_treatments = sorted({t for ts in by_key.values() for t in ts})
 
@@ -66,6 +70,10 @@ def mean_timing(data):
         row = {"file": file, "grind_line": grind_line}
         for t in all_treatments:
             row[t] = treatments.get(t, "")
+        applied = suggestions_by_key.get((file, grind_line), {})
+        row["applied_suggestions"] = "\n\n".join(
+            f"{t}: {applied[t]}" for t in sorted(applied)
+        )
         result.append(row)
     return result
 

@@ -15,6 +15,7 @@ class BenchDB:
                 grind_line INTEGER NOT NULL,
                 treatment TEXT NOT NULL,
                 timing_list TEXT NOT NULL,
+                applied_suggestion TEXT,
                 PRIMARY KEY (file, grind_line, treatment)
             )
         """)
@@ -28,10 +29,10 @@ class BenchDB:
             )
         """)
 
-    def add_timing(self, file, grind_line, treatment, timings):
+    def add_timing(self, file, grind_line, treatment, timings, applied_suggestion=None):
         self.conn.execute(
-            "INSERT OR REPLACE INTO timings VALUES (?, ?, ?, ?)",
-            (file, grind_line, treatment, json.dumps(timings)),
+            "INSERT OR REPLACE INTO timings VALUES (?, ?, ?, ?, ?)",
+            (file, grind_line, treatment, json.dumps(timings), applied_suggestion),
         )
 
     def add_error(self, file, grind_line, treatment, error):
@@ -43,7 +44,7 @@ class BenchDB:
     def to_dict(self):
         timings = [
             {"file": r[0], "grind_line": r[1], "treatment": r[2],
-             "timing_list": json.loads(r[3])}
+             "timing_list": json.loads(r[3]), "applied_suggestion": r[4]}
             for r in self.conn.execute("SELECT * FROM timings")
         ]
         errors = [

@@ -405,9 +405,18 @@ def extract_treatments(workspace, source, lean_file, grind_lines,
         result_path = Path(lean_file + t.out_suffix)
         (workspace / result_path).write_text(combined)
 
+        # Keep enough context to identify exactly which suggestion was applied.
+        applied_suggestion = None
+        if len(per_line) == 1:
+            applied_suggestion = next(iter(per_line.values()))
+        elif len(per_line) > 1:
+            applied_suggestion = "\n\n".join(
+                f"L{gl}: {per_line[gl]}" for gl in sorted(per_line)
+            )
+
         code, _, output = lake_env_lean(workspace, result_path)
         if code == 0:
-            variants.append((t.name, str(result_path), None))
+            variants.append((t.name, str(result_path), applied_suggestion))
             temp_files.append(result_path)
         else:
             (workspace / result_path).unlink(missing_ok=True)
@@ -496,7 +505,7 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
 
         # Benchmark each variant
         results = {}
-        for label, file, _ in variants:
+        for label, file, applied_suggestion in variants:
             r = benchmark(workspace, file, args.warmup, args.runs)
             if r is None:
                 print(f"  ({lean_file}:{grind_line}, {label}) FAILED")
@@ -505,7 +514,13 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
                 continue
             results[label] = r
             if db:
-                db.add_timing(lean_file, grind_line, label, r)
+                db.add_timing(
+                    lean_file,
+                    grind_line,
+                    label,
+                    r,
+                    applied_suggestion=applied_suggestion,
+                )
             mean = statistics.mean(r)
             print(f"  ({lean_file}:{grind_line}, {label}) {mean:.4f}s")
 

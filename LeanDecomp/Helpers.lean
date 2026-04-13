@@ -79,4 +79,113 @@ def containsGrindInternals (e : Expr) : Bool := Id.run do
     | _ => pure ()
   return false
 
+/-- Check if a constant name is "structural" — i.e., part of the equality/congruence
+    machinery that grind uses to chain proofs, not a meaningful library fact. -/
+private def isStructuralConst (n : Name) : Bool :=
+  let s := n.toString
+  s.startsWith "Eq." || s.startsWith "congr" || s.startsWith "implies_congr" ||
+  s.startsWith "forall_congr" || s.startsWith "eq_true" || s.startsWith "eq_false" ||
+  s.startsWith "Classical." ||
+  n == ``True.intro || n == ``False.rec || n == ``False.elim ||
+  n == ``eagerReduce || n == ``id || n == ``funext || n == ``propext ||
+  n == ``Iff.intro || n == ``Iff.mp || n == ``Iff.mpr ||
+  n == ``And.intro || n == ``And.left || n == ``And.right ||
+  n == ``Or.inl || n == ``Or.inr || n == ``Not ||
+  n == ``Bool.true || n == ``Bool.false ||
+  n == ``Eq.refl || n == ``rfl
+
+/-- Check if a constant name is grind-internal. -/
+private def isGrindConst (n : Name) : Bool :=
+  let s := n.toString
+  s.startsWith "Int.Linear." || s.startsWith "Lean.Grind." || s.startsWith "Lean.RArray."
+
+/-- Extract "interesting" subexpressions from a grind proof term.
+    These are applications of library lemmas (not structural, not grind-internal)
+    whose types are propositions. These can be added as `have` facts to help `omega`. -/
+def extractGrindFacts (e : Expr) : MetaM (Array Expr) := do
+  let mut result : Array Expr := #[]
+  let mut stack : List Expr := [e]
+  let mut seen : Std.HashSet UInt64 := {}
+  let mut count := 0
+  while !stack.isEmpty && count < 10000 do
+    let cur := stack.head!
+    stack := stack.tail!
+    count := count + 1
+    -- Deduplicate by pointer hash
+    let h := cur.hash
+    if seen.contains h then continue
+    seen := seen.insert h
+    match cur with
+    | .app .. =>
+      -- Peel to head constant
+      let fn := cur.getAppFn
+      let args := cur.getAppArgs
+      match fn with
+      | .const n _ =>
+        if isGrindConst n then
+          -- Don't collect grind applications, but DO recurse into their args
+          -- because library facts may be passed as arguments to grind lemmas
+          for a in args do stack := a :: stack
+        else if isStructuralConst n then
+          -- Recurse into args of structural constants
+          for a in args do stack := a :: stack
+        else
+          -- Library/user lemma application — check if it's a Prop
+          let ty ← try Meta.inferType cur catch _ => continue
+          let sort ← try Meta.inferType ty catch _ => continue
+          if sort.isProp then
+            -- ty is a Prop — this is an interesting fact
+            result := result.push cur
+          -- Also recurse into args in case there are nested interesting facts
+          for a in args do stack := a :: stack
+      | .fvar .. =>
+        -- fvar application — check if it's a Prop
+        let ty ← try Meta.inferType cur catch _ => continue
+        let sort ← try Meta.inferType ty catch _ => continue
+        if sort.isProp then
+          result := result.push cur
+        for a in args do stack := a :: stack
+      | _ =>
+        for a in args do stack := a :: stack
+        stack := fn :: stack
+    | .lam _ t b _ => stack := t :: b :: stack
+    | .mdata _ e => stack := e :: stack
+    | .letE _ t v b _ => stack := t :: v :: b :: stack
+    | _ => pure ()
+  return result
+
+/-- Extract the names of library lemma constants from a grind proof term.
+    Returns names that are not structural (Eq.*, congr*, etc.) and not grind-internal
+    (Int.Linear.*, Lean.Grind.*, etc.). These represent the actual mathematical facts
+    that grind used from the library. -/
+def extractGrindLemmaNames (e : Expr) : Std.HashSet Name := Id.run do
+  let mut result : Std.HashSet Name := {}
+  let mut stack : List Expr := [e]
+  let mut seen : Std.HashSet UInt64 := {}
+  let mut count := 0
+  while !stack.isEmpty && count < 10000 do
+    let cur := stack.head!
+    stack := stack.tail!
+    count := count + 1
+    let h := cur.hash
+    if seen.contains h then continue
+    seen := seen.insert h
+    match cur with
+    | .app .. =>
+      let fn := cur.getAppFn
+      let args := cur.getAppArgs
+      match fn with
+      | .const n _ =>
+        if !isGrindConst n && !isStructuralConst n then
+          result := result.insert n
+        for a in args do stack := a :: stack
+      | _ =>
+        for a in args do stack := a :: stack
+        stack := fn :: stack
+    | .lam _ t b _ => stack := t :: b :: stack
+    | .mdata _ e => stack := e :: stack
+    | .letE _ t v b _ => stack := t :: v :: b :: stack
+    | _ => pure ()
+  return result
+
 end LeanDecomp
