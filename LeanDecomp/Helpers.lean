@@ -88,8 +88,8 @@ private def isStructuralConst (n : Name) : Bool :=
   s.startsWith "Classical." ||
   n == ``True.intro || n == ``False.rec || n == ``False.elim ||
   n == ``eagerReduce || n == ``id || n == ``funext || n == ``propext ||
-  n == ``Iff.intro || n == ``Iff.mp || n == ``Iff.mpr ||
-  n == ``And.intro || n == ``And.left || n == ``And.right ||
+  n == ``Iff.intro ||
+  n == ``And.intro ||
   n == ``Or.inl || n == ``Or.inr || n == ``Not ||
   n == ``Bool.true || n == ``Bool.false ||
   n == ``Eq.refl || n == ``rfl
