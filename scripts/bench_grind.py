@@ -458,6 +458,17 @@ def add_bench_args(parser: argparse.ArgumentParser):
     """Add bench_grind arguments to a parser."""
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--grind-line",
+        dest="grind_lines",
+        action="append",
+        type=int,
+        default=None,
+        help=(
+            "Benchmark only the specified grind line number(s). "
+            "Repeat the flag to pass multiple lines."
+        ),
+    )
 
 
 def _cleanup_generated_files(workspace: Path, lean_file: str):
@@ -491,7 +502,26 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
 
     source = (workspace / lean_file).read_text()
     source = _ensure_profiler(source)
-    grind_lines = _find_all_grind_lines(source)
+    all_grind_lines = _find_all_grind_lines(source)
+    selected_lines = getattr(args, "grind_lines", None)
+    if selected_lines:
+        # Keep user-specified order while dropping duplicates.
+        grind_lines = list(dict.fromkeys(selected_lines))
+        missing = [ln for ln in grind_lines if ln not in all_grind_lines]
+        if missing:
+            print(
+                f"Requested grind line(s) not found in {lean_file}: {missing}. "
+                f"Available grind lines: {all_grind_lines}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        print(
+            f"  Filtering to requested grind lines for {lean_file}: {grind_lines}",
+            flush=True,
+        )
+    else:
+        grind_lines = all_grind_lines
     variants = []
 
     try:
