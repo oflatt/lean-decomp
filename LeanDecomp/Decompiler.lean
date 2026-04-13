@@ -223,7 +223,18 @@ mutual
       if ← Meta.isDefEq goalType innerType then
         let (tactics, used') ← decompileExpr innerWithArgs lctx localInsts used
         return some (tactics, used')
-      -- Types differ (grind normalization). Introduce inner as `have`, close with `omega`.
+      -- Types differ (grind normalization). First try omega with just context.
+      let mut ctxFacts : List Expr := []
+      for decl in lctx do
+        if decl.isImplementationDetail then continue
+        ctxFacts := (.fvar decl.fvarId) :: ctxFacts
+      try
+        let omegaMvar ← Meta.mkFreshExprMVar (some goalType) .syntheticOpaque
+        Lean.Elab.Tactic.Omega.omega ctxFacts omegaMvar.mvarId!
+        let tac ← `(tactic| omega)
+        return some (#[tac], used)
+      catch _ => pure ()
+      -- Omega alone failed. Introduce inner as `have`, close with `omega`.
       let (haveName, used') := chooseIntroName used.length `fact used
       let haveNameIdent := mkIdent (Name.mkSimple haveName)
       let typeStx ← PrettyPrinter.delab innerType

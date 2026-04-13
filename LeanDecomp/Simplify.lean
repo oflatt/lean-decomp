@@ -179,7 +179,7 @@ private def simplifyEqRec (e : Expr) : MetaM (Option Expr) := do
 private def simplifyEqMpRefl (e : Expr) : Option Expr := do
   let (fn, args) := peelArgs e
   let some cname := fn.constName? | failure
-  guard (cname == ``Eq.mp)
+  guard (cname == ``Eq.mp || cname == ``Eq.mpr)
   guard (args.length == 4)
   let eqProof := args[2]!
   let body := args[3]!
@@ -187,6 +187,164 @@ private def simplifyEqMpRefl (e : Expr) : Option Expr := do
   let some eqName := eqFn.constName? | failure
   guard (eqName == ``Eq.refl)
   return body
+
+-- ═══════════════════════════════════════════════════════
+-- Propositional cast simplification (congr-chain interpreter)
+-- ═══════════════════════════════════════════════════════
+
+/-- Handle `Eq.mp (congrArg f h) evidence` for known Prop connectives.
+    f : Prop → Prop, h : a₁ = a₂, evidence : f a₁ → result : f a₂ -/
+private def simplifyCongrArgTransport (a₁ a₂ f h evidence : Expr)
+    : MetaM (Option Expr) := do
+  -- f is a lambda: fun x => body
+  if let .lam _ _ body _ := f then
+    if !body.hasLooseBVars then return some evidence  -- constant function
+    if body == .bvar 0 then  -- identity
+      return some (mkApp4 (mkConst ``Eq.mp [Level.zero]) a₁ a₂ h evidence)
+    let (bodyFn, bodyArgs) := peelArgs body
+    -- fun x => x ∧ Q  (And on left)
+    if bodyFn.isConstOf ``And && bodyArgs.length == 2
+        && bodyArgs[0]! == .bvar 0 && !bodyArgs[1]!.hasLooseBVars then
+      let Q := bodyArgs[1]!
+      let left := mkApp3 (mkConst ``And.left) a₁ Q evidence
+      let right := mkApp3 (mkConst ``And.right) a₁ Q evidence
+      let newLeft := mkApp4 (mkConst ``Eq.mp [Level.zero]) a₁ a₂ h left
+      return some (mkApp4 (mkConst ``And.intro) a₂ Q newLeft right)
+    -- fun x => P ∧ x  (And on right)
+    if bodyFn.isConstOf ``And && bodyArgs.length == 2
+        && bodyArgs[1]! == .bvar 0 && !bodyArgs[0]!.hasLooseBVars then
+      let P := bodyArgs[0]!
+      let left := mkApp3 (mkConst ``And.left) P a₁ evidence
+      let right := mkApp3 (mkConst ``And.right) P a₁ evidence
+      let newRight := mkApp4 (mkConst ``Eq.mp [Level.zero]) a₁ a₂ h right
+      return some (mkApp4 (mkConst ``And.intro) P a₂ left newRight)
+    -- fun x => ¬x  (Not)
+    if bodyFn.isConstOf ``Not && bodyArgs.length == 1
+        && bodyArgs[0]! == .bvar 0 then
+      let mprFn := mkApp3 (mkConst ``Eq.mpr [Level.zero]) a₁ a₂ h
+      return some (mkApp4 (mkConst ``mt) a₂ a₁ mprFn evidence)
+    return none
+  -- f = Not (not a lambda, bare constant)
+  if f.isConstOf ``Not then
+    let mprFn := mkApp3 (mkConst ``Eq.mpr [Level.zero]) a₁ a₂ h
+    return some (mkApp4 (mkConst ``mt) a₂ a₁ mprFn evidence)
+  -- f = And P (partially applied)
+  let fHead := f.getAppFn
+  let fArgs := f.getAppArgs
+  if fHead.isConstOf ``And && fArgs.size == 1 then
+    let P := fArgs[0]!
+    let left := mkApp3 (mkConst ``And.left) P a₁ evidence
+    let right := mkApp3 (mkConst ``And.right) P a₁ evidence
+    let newRight := mkApp4 (mkConst ``Eq.mp [Level.zero]) a₁ a₂ h right
+    return some (mkApp4 (mkConst ``And.intro) P a₂ left newRight)
+  return none
+
+/-- Simplify propositional casts: `Eq.mp`/`Eq.mpr` with propext, Eq.trans, congr chains.
+    Converts grind's equality-based propositional transport into Iff-based operations.
+    Inspired by lean-calcify's approach of flattening congruence chains. -/
+private def simplifyPropCast (e : Expr) : MetaM (Option Expr) := do
+  let (fn, args) := peelArgs e
+  let some cname := fn.constName? | return none
+  if cname != ``Eq.mp && cname != ``Eq.mpr then return none
+  if args.length != 4 then return none
+  -- Only handle Prop-level transport: Eq.mp.{u} with u = 0 means α,β : Prop
+  unless fn.isConst do return none
+  match fn.constLevels! with
+  | [Level.zero] => pure ()
+  | _ => return none
+  let isForward := (cname == ``Eq.mp)
+  let eqProof := args[2]!
+  let evidence := args[3]!
+  let (eqFn, eqArgs) := peelArgs eqProof
+  let some eqName := eqFn.constName? | return none
+  match eqName with
+  | ``propext =>
+    if eqArgs.length < 3 then return none
+    let iff := eqArgs[2]!
+    if isForward
+    then return some (mkApp4 (mkConst ``Iff.mp) eqArgs[0]! eqArgs[1]! iff evidence)
+    else return some (mkApp4 (mkConst ``Iff.mpr) eqArgs[0]! eqArgs[1]! iff evidence)
+  | ``Lean.Grind.iff_eq =>
+    -- iff_eq p q : (p ↔ q) = (p = q)
+    -- Eq.mp (iff_eq p q) h  →  propext h  (convert Iff proof to Prop-level Eq proof)
+    if eqArgs.length < 2 then return none
+    if isForward then
+      return some (mkApp3 (mkConst ``propext) eqArgs[0]! eqArgs[1]! evidence)
+    else return none
+  | ``Eq.trans =>
+    if eqArgs.length < 6 then return none
+    -- args of @Eq.trans.{u} {α} {a b c} h₁ h₂: [α, a, b, c, h₁, h₂]
+    let a := eqArgs[1]!; let b := eqArgs[2]!; let c := eqArgs[3]!
+    let eq1 := eqArgs[4]!; let eq2 := eqArgs[5]!
+    if isForward then
+      let inner := mkApp4 (mkConst ``Eq.mp [Level.zero]) a b eq1 evidence
+      return some (mkApp4 (mkConst ``Eq.mp [Level.zero]) b c eq2 inner)
+    else
+      let inner := mkApp4 (mkConst ``Eq.mpr [Level.zero]) b c eq2 evidence
+      return some (mkApp4 (mkConst ``Eq.mpr [Level.zero]) a b eq1 inner)
+  | ``Eq.symm =>
+    if eqArgs.length < 4 then return none
+    -- @Eq.symm.{u} {α} {a b} h: [α, a, b, h]
+    let a := eqArgs[1]!; let b := eqArgs[2]!; let h := eqArgs[3]!
+    if isForward
+    then return some (mkApp4 (mkConst ``Eq.mpr [Level.zero]) a b h evidence)
+    else return some (mkApp4 (mkConst ``Eq.mp [Level.zero]) a b h evidence)
+  | ``eq_true =>
+    if eqArgs.length < 2 then return none
+    if isForward then return some (mkConst ``True.intro)
+    else return some eqArgs[1]!
+  | ``eq_false | ``eq_false' =>
+    if eqArgs.length < 2 then return none
+    if isForward then return some (mkApp eqArgs[1]! evidence)
+    else return some (mkApp2 (mkConst ``False.elim [Level.zero]) args[0]! evidence)
+  | ``congr =>
+    -- @congr.{u,v} {α β} {f₁ f₂} {a₁ a₂} h₁ h₂: [α, β, f₁, f₂, a₁, a₂, h₁, h₂]
+    if eqArgs.length < 8 then return none
+    if !isForward then return none
+    let f₂ := eqArgs[3]!; let a₁ := eqArgs[4]!
+    let h₁ := eqArgs[6]!; let h₂ := eqArgs[7]!
+    -- Decompose: Eq.mp (congr h₁ h₂) e
+    --   → Eq.mp (congrArg f₂ h₂) (Eq.mp (congrFun' h₁ a₁) e)
+    let levels := eqFn.constLevels!
+    -- @congrFun'.{u,v} {α β f g} h a — same universe params as congr
+    let step1 := mkAppN (mkConst ``congrFun' levels)
+      #[eqArgs[0]!, eqArgs[1]!, eqArgs[2]!, eqArgs[3]!, h₁, a₁]
+    -- @congrArg.{u,v} {α β a₁ a₂} f h
+    let step2 := mkAppN (mkConst ``congrArg levels)
+      #[eqArgs[0]!, eqArgs[1]!, eqArgs[4]!, eqArgs[5]!, f₂, h₂]
+    let midType := mkApp f₂ a₁
+    let inner := mkApp4 (mkConst ``Eq.mp [Level.zero]) args[0]! midType step1 evidence
+    return some (mkApp4 (mkConst ``Eq.mp [Level.zero]) midType args[1]! step2 inner)
+  | ``congrArg =>
+    -- @congrArg.{u,v} {α β} {a₁ a₂} f h: [α, β, a₁, a₂, f, h]
+    if eqArgs.length < 6 then return none
+    if !isForward then return none
+    simplifyCongrArgTransport eqArgs[2]! eqArgs[3]! eqArgs[4]! eqArgs[5]! evidence
+  | ``congrFun' | ``congrFun =>
+    -- @congrFun'.{u,v} {α β} {f g} h a: [α, β, f, g, h, a]
+    if eqArgs.length < 6 then return none
+    if !isForward then return none
+    let h := eqArgs[4]!; let a := eqArgs[5]!
+    -- If h = congrArg bigF innerEq, convert congrFun'(congrArg bigF innerEq, a)
+    --   to congrArg (fun x => bigF x a) innerEq
+    let (hFn, hArgs) := peelArgs h
+    if hFn.constName? == some ``congrArg && hArgs.length >= 6 then
+      let innerA₁ := hArgs[2]!; let innerA₂ := hArgs[3]!
+      let bigF := hArgs[4]!; let innerEq := hArgs[5]!
+      -- Handle And specifically: congrFun' (congrArg And innerEq) a → congrArg (fun x => x ∧ a) innerEq
+      if bigF.isConstOf ``And then
+        let prop := mkSort Level.zero  -- Prop
+        let newF := Expr.lam `x prop
+          (mkApp2 (mkConst ``And) (.bvar 0) (a.liftLooseBVars 0 1)) .default
+        -- @congrArg.{1,1} Prop Prop a₁ a₂ newF innerEq (Prop : Sort 1)
+        let one := Level.succ Level.zero
+        let newEqProof := mkAppN (mkConst ``congrArg [one, one])
+          #[prop, prop, innerA₁, innerA₂, newF, innerEq]
+        let srcType := mkApp2 (mkConst ``And) innerA₁ a
+        let dstType := mkApp2 (mkConst ``And) innerA₂ a
+        return some (mkApp4 (mkConst ``Eq.mp [Level.zero]) srcType dstType newEqProof evidence)
+    return none
+  | _ => return none
 
 -- ═══════════════════════════════════════════════════════
 -- Main traversal
@@ -199,13 +357,18 @@ private def simplifyPre (e : Expr) : MetaM TransformStep := do
   if e.isHeadBetaTarget then return .visit e.headBeta
   -- Strip `@id T body`
   if let some r := simplifyId e then return .visit r
-  -- Collapse Eq.mp (Eq.refl _) body → body
+  -- Collapse Eq.mp/Eq.mpr (Eq.refl _) body → body
   if let some r := simplifyEqMpRefl e then return .visit r
+  -- Simplify propositional casts (propext/congr chains → Iff operations)
+  if let some r ← simplifyPropCast e then return .visit r
   return .continue
 
 /-- Post-step: MetaM rewrites applied after children are simplified.
     Returns `.visit` to re-traverse after rewriting, `.done` to keep as-is. -/
 private def simplifyPost (e : Expr) : MetaM TransformStep := do
+  -- Re-check propositional casts: child simplification may have revealed
+  -- handleable eq proof heads (e.g. iff_eq → propext in children).
+  if let some r ← simplifyPropCast e then return .visit r
   if let some r ← simplifyGrindWrappers e then return .visit r
   if let some r ← simplifyIntroWithEq e then return .visit r
   if let some r ← simplifyNoConfusion e then return .visit r
