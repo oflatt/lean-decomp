@@ -26,6 +26,73 @@ private def firstSomeM [Monad m] (xs : List (m (Option α))) : m (Option α) := 
       return some res
   return none
 
+/-- Try to unify a fresh instance of an Iff lemma against a hypothesis type.
+    Uses `forallMetaTelescope` so matching is robust to grind normalization.
+    Returns `(appliedLemma, lhs, rhs)` on success. -/
+private def tryMatchIff (name : Name) (hypTy : Expr) (forward : Bool)
+    : MetaM (Option (Expr × Expr × Expr)) := do
+  let c ← Meta.mkConstWithFreshMVarLevels name
+  let cType ← Meta.inferType c
+  let (mvars, _, body) ← Meta.forallMetaTelescope cType
+  let body ← Meta.whnf body
+  let (hd, args) := peelArgs body
+  if !hd.isConstOf ``Iff || args.length < 2 then return none
+  let src := if forward then args[0]! else args[1]!
+  if !(← Meta.isDefEq src hypTy) then return none
+  let lhs ← instantiateMVars args[0]!
+  let rhs ← instantiateMVars args[1]!
+  if lhs.hasMVar || rhs.hasMVar then return none
+  let applied ← instantiateMVars (mkAppN c mvars)
+  return some (applied, lhs, rhs)
+
+/-- If `ty` is `¬P` or `P → False`, return `P`. -/
+private def negatedProp? (ty : Expr) : Option Expr := do
+  let (hd, args) := peelArgs ty
+  if hd.isConstOf ``Not && args.length >= 1 then return args[0]!
+  if ty.isArrow && ty.bindingBody!.isConstOf ``False then return ty.bindingDomain!
+  failure
+
+/-- Accumulated facts state for omega derivation. -/
+private structure OmegaFactState where
+  derivedFacts : Array (Expr × Expr × TSyntax `term) := #[]
+  used : List String
+  factNames : Array Name := #[]
+
+/-- Try to add a derived fact if it's clean and non-duplicate. -/
+private def OmegaFactState.addFact (s : OmegaFactState)
+    (proofExpr : Expr) (propType : Expr) (proofStx : TSyntax `term)
+    : MetaM OmegaFactState := do
+  if containsGrindInternals propType then return s
+  let isDup ← s.derivedFacts.anyM fun x =>
+    try Meta.isDefEq propType x.2.1 catch _ => pure false
+  if isDup then return s
+  let (n, used') := chooseIntroName s.used.length `fact s.used
+  return {
+    derivedFacts := s.derivedFacts.push (proofExpr, propType, proofStx)
+    used := used'
+    factNames := s.factNames.push (Name.mkSimple n)
+  }
+
+/-- Resolve an expression to its syntax name (context fvar or derived fact). -/
+private def resolveFactStx (e : Expr) (hypNameMap : Std.HashMap FVarId Name)
+    (s : OmegaFactState) : Option Ident :=
+  if e.isFVar then hypNameMap.get? e.fvarId! |>.map mkIdent
+  else (s.derivedFacts.findIdx? fun x => x.1 == e).bind fun idx =>
+    s.factNames[idx]?.map mkIdent
+
+/-- Try omega with just context hypotheses. -/
+private def tryOmegaWithContext (goalType : Expr) (lctx : LocalContext) :
+    MetaM Bool := do
+  let mut ctxFacts : List Expr := []
+  for decl in lctx do
+    if decl.isImplementationDetail then continue
+    ctxFacts := (.fvar decl.fvarId) :: ctxFacts
+  try
+    let mvar ← Meta.mkFreshExprMVar (some goalType) .syntheticOpaque
+    Lean.Elab.Tactic.Omega.omega ctxFacts mvar.mvarId!
+    return true
+  catch _ => return false
+
 mutual
 
   /-- Convert a proof term expression into tactic syntax. -/
@@ -224,17 +291,9 @@ mutual
         let (tactics, used') ← decompileExpr innerWithArgs lctx localInsts used
         return some (tactics, used')
       -- Types differ (grind normalization). First try omega with just context.
-      let mut ctxFacts : List Expr := []
-      for decl in lctx do
-        if decl.isImplementationDetail then continue
-        ctxFacts := (.fvar decl.fvarId) :: ctxFacts
-      try
-        let omegaMvar ← Meta.mkFreshExprMVar (some goalType) .syntheticOpaque
-        Lean.Elab.Tactic.Omega.omega ctxFacts omegaMvar.mvarId!
-        let tac ← `(tactic| omega)
-        return some (#[tac], used)
-      catch _ => pure ()
-      -- Omega alone failed. Introduce inner as `have`, close with `omega`.
+      if ← tryOmegaWithContext goalType lctx then
+        return some (#[← `(tactic| omega)], used)
+      -- Omega alone failed. Introduce inner as `have`, then close with `omega`.
       let (haveName, used') := chooseIntroName used.length `fact used
       let haveNameIdent := mkIdent (Name.mkSimple haveName)
       let typeStx ← PrettyPrinter.delab innerType
@@ -245,50 +304,20 @@ mutual
       return some (#[haveTac, closingTac], used'')
 
   /-- Try replacing grind-internal proof terms with `omega`.
-      When the expression contains grind/linear-arithmetic internals, try `omega`
-      (verified via API). This avoids decomposing huge internal terms that
-      `omega` can handle directly. -/
+      Extracts Iff-typed facts from the proof term, matches them against
+      context hypotheses to derive concrete facts, then tries `omega`.
+      Uses a fixed-point loop since chained Iff lemmas may require
+      multiple rounds (round 1 derives fact_1, round 2 uses it). -/
   private partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
-    -- Only try if the expression contains grind internals
     if !containsGrindInternals expr then return none
     withLCtx lctx localInsts do
       let goalType ← Meta.inferType expr
-      -- Collect all hypothesis expressions from the local context
-      let mut facts : List Expr := []
-      for decl in lctx do
-        if decl.isImplementationDetail then continue
-        facts := (.fvar decl.fvarId) :: facts
-      -- Try omega with just the local context
-      try
-        let mvar ← Meta.mkFreshExprMVar (some goalType) .syntheticOpaque
-        Lean.Elab.Tactic.Omega.omega facts mvar.mvarId!
-        let tac ← `(tactic| omega)
-        return some (#[tac], used)
-      catch _ => pure ()
-      -- Omega failed with just local context. Extract Prop-typed facts from the
-      -- grind proof term. Iff-typed ones are applied to context hypotheses to
-      -- derive concrete facts omega can use.
-      let grindFacts ← extractGrindFacts expr
-      if grindFacts.isEmpty then return none
-      -- Collect context fvar IDs for filtering
-      let ctxFVarIds : Std.HashSet FVarId := Id.run do
-        let mut s : Std.HashSet FVarId := {}
-        for decl in lctx do
-          s := s.insert decl.fvarId
-        return s
-      -- Separate Iff-typed applications (fully instantiated by extractGrindFacts)
-      let mut iffFacts : Array (Name × Expr × Expr × Expr) := #[]  -- (name, applied, lhs, rhs)
-      for fact in grindFacts do
-        if containsGrindInternals fact then continue
-        if fact.hasAnyFVar (fun fid => !ctxFVarIds.contains fid) then continue
-        let factTy ← try Meta.inferType fact catch _ => continue
-        let factTy ← Meta.whnf factTy
-        let (hd, args) := peelArgs factTy
-        if !hd.isConstOf ``Iff || args.length < 2 then continue
-        let some name := fact.getAppFn.constName? | continue
-        iffFacts := iffFacts.push (name, fact, args[0]!, args[1]!)
-      if iffFacts.isEmpty then return none
+      -- Try omega with just context hypotheses
+      if ← tryOmegaWithContext goalType lctx then
+        return some (#[← `(tactic| omega)], used)
+      let lemmaNames := extractGrindLemmaNames expr
+      if lemmaNames.isEmpty then return none
       -- Context hypotheses and name map
       let mut ctxHyps : Array (Expr × Expr) := #[]
       let mut hypNameMap : Std.HashMap FVarId Name := {}
@@ -296,82 +325,47 @@ mutual
         if decl.isImplementationDetail then continue
         ctxHyps := ctxHyps.push (.fvar decl.fvarId, decl.type)
         hypNameMap := hypNameMap.insert decl.fvarId decl.userName
-      -- Derived facts: (proofExpr, propType, proofSyntax)
-      let mut derivedFacts : Array (Expr × Expr × TSyntax `term) := #[]
-      let mut factUsed := used
-      let mut factNames : Array Name := #[]
-      -- Helper: register a derived fact (filters grind internals + dedup)
-      let addFact := fun (df : Array (Expr × Expr × TSyntax `term))
-          (fu : List String) (fns : Array Name)
-          (proofExpr : Expr) (propType : Expr) (proofStx : TSyntax `term) => do
-        if containsGrindInternals propType then return (df, fu, fns)
-        let isDup ← df.anyM (fun x =>
-          try Meta.isDefEq propType x.2.1 catch _ => pure false)
-        if isDup then return (df, fu, fns)
-        let (n, fu') := chooseIntroName fu.length `fact fu
-        return (df.push (proofExpr, propType, proofStx), fu', fns.push (Name.mkSimple n))
-      -- Helper: resolve an Expr to its syntax name
-      let resolveStx := fun (e : Expr)
-          (df : Array (Expr × Expr × TSyntax `term)) (fns : Array Name) =>
-        if e.isFVar then
-          hypNameMap.get? e.fvarId! |>.map mkIdent
-        else
-          (df.findIdx? (fun x => x.1 == e)).bind fun idx =>
-            fns[idx]?.map mkIdent
+      let mut s : OmegaFactState := { used }
       -- Iteratively derive facts from Iff lemmas + context hypotheses
       for _ in [:3] do
-        let prevSize := derivedFacts.size
-        let allHyps := ctxHyps ++ (derivedFacts.map fun x => (x.1, x.2.1))
-        for (lname, lemmaExpr, lhs, rhs) in iffFacts do
+        let prevSize := s.derivedFacts.size
+        let allHyps := ctxHyps ++ (s.derivedFacts.map fun x => (x.1, x.2.1))
+        for lname in lemmaNames do
           let lemmaStx := mkIdent lname
           for (hypExpr, hypTy) in allHyps do
-            let some hypStx := resolveStx hypExpr derivedFacts factNames | continue
-            -- Case 1: Iff.mp — lhs matches hyp type
-            if ← try Meta.isDefEq lhs hypTy catch _ => pure false then
+            let some hypStx := resolveFactStx hypExpr hypNameMap s | continue
+            -- Iff.mp — lhs matches hyp type
+            if let some (lemmaExpr, lhs, rhs) ← try tryMatchIff lname hypTy true catch _ => pure none then
               let mpExpr := mkApp4 (mkConst ``Iff.mp) lhs rhs lemmaExpr hypExpr
               let mpStx ← `($(mkIdent ``Iff.mp) $lemmaStx $hypStx)
-              let (df, fu, fns) ← addFact derivedFacts factUsed factNames mpExpr rhs mpStx
-              let parentIdx := df.size - 1
-              derivedFacts := df; factUsed := fu; factNames := fns
-              -- Split And
-              if parentIdx < factNames.size then
+              let prevFactSize := s.derivedFacts.size
+              s ← s.addFact mpExpr rhs mpStx
+              -- Split And results
+              if s.derivedFacts.size > prevFactSize then
+                let parentIdx := s.derivedFacts.size - 1
                 let (andFn, andArgs) := peelArgs rhs
                 if andFn.isConstOf ``And && andArgs.length >= 2 then
-                  let p := andArgs[0]!
-                  let q := andArgs[1]!
-                  let parentStx := mkIdent factNames[parentIdx]!
-                  let leftStx ← `(($parentStx).1)
-                  let rightStx ← `(($parentStx).2)
-                  for (subTy, subStx) in #[(p, leftStx), (q, rightStx)] do
-                    let subExpr := mkApp3 (if subTy == p then mkConst ``And.left else mkConst ``And.right) p q mpExpr
-                    let (df, fu, fns) ← addFact derivedFacts factUsed factNames subExpr subTy subStx
-                    derivedFacts := df; factUsed := fu; factNames := fns
-
-            -- Case 2: mt Iff.mpr — hyp is ¬P, where P matches lhs
-            let innerTy? := do
-              let (negHd, negArgs) := peelArgs hypTy
-              if negHd.isConstOf ``Not && negArgs.length >= 1 then return negArgs[0]!
-              if hypTy.isArrow && hypTy.bindingBody!.isConstOf ``False then
-                return hypTy.bindingDomain!
-              none
-            if let some innerTy := innerTy? then
-              if ← try Meta.isDefEq lhs innerTy catch _ => pure false then
+                  let p := andArgs[0]!; let q := andArgs[1]!
+                  let parentStx := mkIdent s.factNames[parentIdx]!
+                  s ← s.addFact (mkApp3 (mkConst ``And.left) p q mpExpr) p (← `(($parentStx).1))
+                  s ← s.addFact (mkApp3 (mkConst ``And.right) p q mpExpr) q (← `(($parentStx).2))
+            -- mt Iff.mpr — hyp is ¬P, where P matches lhs
+            if let some innerTy := negatedProp? hypTy then
+              if let some (lemmaExpr, lhs, rhs) ← try tryMatchIff lname innerTy true catch _ => pure none then
                 let mprFn := mkApp3 (mkConst ``Iff.mpr) lhs rhs lemmaExpr
                 let mtResult := mkApp4 (mkConst ``mt) rhs lhs mprFn hypExpr
                 let mtTy := mkApp (mkConst ``Not) rhs
                 let mtStx ← `($(mkIdent ``mt) ($(mkIdent ``Iff.mpr) $lemmaStx) $hypStx)
-                let (df, fu, fns) ← addFact derivedFacts factUsed factNames mtResult mtTy mtStx
-                derivedFacts := df; factUsed := fu; factNames := fns
-
+                s ← s.addFact mtResult mtTy mtStx
         -- Specialize ∀-quantified context hypotheses with derived facts
         for (hypExpr, hypTy) in ctxHyps do
           if !hypTy.isForall then continue
           let some hypName := hypNameMap.get? hypExpr.fvarId! | continue
-          let derivedPairs := derivedFacts.map fun x => (x.1, x.2.1)
+          let derivedPairs := s.derivedFacts.map fun x => (x.1, x.2.1)
           for (valExpr, valTy) in ctxHyps ++ derivedPairs do
             if valTy.isForall then continue
             if ← try Meta.isProp valTy catch _ => pure true then continue
-            let some valStx := resolveStx valExpr derivedFacts factNames | continue
+            let some valStx := resolveFactStx valExpr hypNameMap s | continue
             let specialized := mkApp hypExpr valExpr
             let specializedTy ← try Meta.inferType specialized catch _ => continue
             let mut cur := specialized
@@ -381,32 +375,25 @@ mutual
               if !curTy.isArrow then break
               let dom := curTy.bindingDomain!
               let mut applied := false
-              let derivedPairs' := derivedFacts.map fun x => (x.1, x.2.1)
+              let derivedPairs' := s.derivedFacts.map fun x => (x.1, x.2.1)
               for (argExpr, argTy) in derivedPairs' ++ ctxHyps do
                 if ← try Meta.isDefEq argTy dom catch _ => pure false then
-                  let some argStx := resolveStx argExpr derivedFacts factNames | break
+                  let some argStx := resolveFactStx argExpr hypNameMap s | break
                   cur := mkApp cur argExpr
                   curTy ← try Meta.inferType cur catch _ => break
                   curStx ← `($curStx $argStx)
-                  applied := true
-                  break
+                  applied := true; break
               if !applied then break
             if (← try Meta.isProp curTy catch _ => pure false) && !curTy.isForall then
-              let (df, fu, fns) ← addFact derivedFacts factUsed factNames cur curTy curStx
-              derivedFacts := df; factUsed := fu; factNames := fns
-        if derivedFacts.size == prevSize then break  -- fixpoint
-      if derivedFacts.isEmpty then return none
+              s ← s.addFact cur curTy curStx
+        if s.derivedFacts.size == prevSize then break  -- fixpoint
+      if s.derivedFacts.isEmpty then return none
       -- Emit have statements + omega
-      let mut used' := used
       let mut haveTacs : Array (TSyntax `tactic) := #[]
-      for (_, _, proofStx) in derivedFacts do
-        let (n, u) := chooseIntroName used'.length `fact used'
-        used' := u
-        let nameIdent := mkIdent (Name.mkSimple n)
-        let haveTac ← `(tactic| have $nameIdent := $proofStx)
-        haveTacs := haveTacs.push haveTac
-      let omegaTac ← `(tactic| omega)
-      return some (haveTacs.push omegaTac, used')
+      for i in [:s.derivedFacts.size] do
+        let (_, _, proofStx) := s.derivedFacts[i]!
+        haveTacs := haveTacs.push (← `(tactic| have $(mkIdent s.factNames[i]!) := $proofStx))
+      return some (haveTacs.push (← `(tactic| omega)), s.used)
 
   /-- The final exact fallback. Try without pp.all first for smaller output,
       fall back to pp.all if needed. -/
