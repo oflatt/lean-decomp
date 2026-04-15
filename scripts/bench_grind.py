@@ -11,7 +11,9 @@ lean-toolchain (v4.28.0-rc1 at time of writing) and may need updates for other
 versions.
 """
 import argparse
+import concurrent.futures
 import glob
+import os
 import re
 import shutil
 import statistics
@@ -28,14 +30,16 @@ from bench_db import BenchDB
 # Subprocess helpers
 # ---------------------------------------------------------------------------
 
-def run_cmd(cmd, cwd):
+def run_cmd(cmd: list[str], cwd: Path | str) -> tuple[int, float, str]:
+    """Run a command and return (exit_code, elapsed_seconds, stdout_stderr)."""
     start = time.perf_counter()
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     elapsed = time.perf_counter() - start
     return proc.returncode, elapsed, proc.stdout + proc.stderr
 
 
-def lake_env_lean(workspace, lean_file):
+def lake_env_lean(workspace: Path | str, lean_file: str | Path) -> tuple[int, float, str]:
+    """Run a Lean file via 'lake env lean'."""
     return run_cmd(["lake", "env", "lean", str(lean_file)], workspace)
 
 # ---------------------------------------------------------------------------
@@ -326,15 +330,24 @@ class DumpArtifact:
     dump_name: str
 
 
+@dataclass
+class ExtractionResult:
+    """The generated outputs for one non-direct (grind_line, treatment) task."""
+    variant: Variant | None
+    errors: list[tuple[str, int, str]]
+    dump_artifacts: list[DumpArtifact]
+    generated_paths: set[Path]
+
+
 # ---------------------------------------------------------------------------
 # Suggestion extraction pipeline
 # ---------------------------------------------------------------------------
 
-def _get_line_suggestions(workspace, source, grind_line, query_transform, suffix,
-                          lean_file, treatment_name):
+def _get_line_suggestions(workspace: Path, source: str, grind_line: int, query_transform: Callable, suffix: str,
+                          lean_file: str, treatment_name: str) -> tuple[list[str], Path, str]:
     """Run a query for one grind line. Return (suggestions, query_path, raw_output)."""
     query_source = query_transform(source, grind_line)
-    query_path = Path(lean_file + suffix)
+    query_path = Path(str(lean_file) + suffix)
     (workspace / query_path).write_text(query_source)
     print(
         f"  Running query: treatment={treatment_name}, line={grind_line}, file={query_path}",
@@ -349,12 +362,12 @@ def _get_line_suggestions(workspace, source, grind_line, query_transform, suffix
     return extract_suggestions(combined), query_path, combined
 
 
-def _try_line_suggestion(workspace, source, grind_line, suggestions, lean_file,
-                         out_suffix, treatment_name):
+def _try_line_suggestion(workspace: Path, source: str, grind_line: int, suggestions: list[str], lean_file: str,
+                         out_suffix: str, treatment_name: str) -> tuple[str | None, Path | None, str | None]:
     """Try each suggestion for a specific grind line. Return (suggestion, path, last_error)."""
     if not suggestions:
         return None, None, None
-    result_path = Path(lean_file + f".L{grind_line}" + out_suffix)
+    result_path = Path(str(lean_file) + f".L{grind_line}" + out_suffix)
     last_output = ""
     for idx, s in enumerate(suggestions, 1):
         one_line = s.replace("\n", "\\n")
@@ -376,6 +389,62 @@ def _try_line_suggestion(workspace, source, grind_line, suggestions, lean_file,
             return s, result_path, None
         last_output = output
     return None, result_path, last_output.strip()
+
+
+def _extract_non_direct_treatment(workspace, source, lean_file, grind_line,
+                                  treatment: Treatment) -> ExtractionResult:
+    """Build one non-direct treatment, including failure dump artifacts."""
+    errors = []
+    dump_artifacts = []
+    generated_paths = set()
+
+    suffix = f".{treatment.name}_query_L{grind_line}.lean"
+    all_suggestions, qf, raw_output = _get_line_suggestions(
+        workspace, source, grind_line, treatment.query_transform, suffix,
+        lean_file, treatment.name)
+    generated_paths.add(qf)
+
+    filtered = [s for s in all_suggestions if treatment.filter(s)]
+    if not filtered:
+        dump_artifacts.append(
+            DumpArtifact(qf, f"L{grind_line}.{treatment.name}.query.lean")
+        )
+        msg = (
+            raw_output.strip()[:500] or "no output"
+        ) if not all_suggestions else "no matching suggestions"
+        errors.append((treatment.name, grind_line, msg))
+        return ExtractionResult(None, errors, dump_artifacts, generated_paths)
+
+    sug, sf, last_error = _try_line_suggestion(
+        workspace, source, grind_line, filtered, lean_file,
+        f".{treatment.name}_L{grind_line}.lean", treatment.name)
+    if sf is not None:
+        generated_paths.add(sf)
+
+    if sug:
+        variant = Variant(treatment.name, grind_line, sf, sug)
+        return ExtractionResult(variant, errors, dump_artifacts, generated_paths)
+
+    dump_artifacts.append(
+        DumpArtifact(qf, f"L{grind_line}.{treatment.name}.query.lean")
+    )
+    if sf is not None:
+        dump_artifacts.append(
+            DumpArtifact(sf, f"L{grind_line}.{treatment.name}.failed.lean")
+        )
+
+    suggestions_tried = "\n".join(f"  suggestion: {s}" for s in filtered)
+    error_msg = suggestions_tried
+    if last_error:
+        error_msg += f"\n{last_error}"
+    errors.append((treatment.name, grind_line, error_msg))
+    return ExtractionResult(None, errors, dump_artifacts, generated_paths)
+
+
+def _parallel_workers(task_count: int) -> int:
+    """Choose a conservative worker count for subprocess-heavy tasks."""
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(task_count, max(cpu_count - 1, 1)))
 
 
 def extract_treatments(workspace, source, lean_file, grind_lines,
@@ -400,57 +469,47 @@ def extract_treatments(workspace, source, lean_file, grind_lines,
         if not t.is_direct:
             continue
         for grind_line in grind_lines:
-            result_path = Path(lean_file + f".L{grind_line}" + t.out_suffix)
+            result_path = Path(str(lean_file) + f".L{grind_line}" + t.out_suffix)
             (workspace / result_path).write_text(source)
             generated_paths.add(result_path)
             variants.append(Variant(t.name, grind_line, result_path, None, is_direct=True))
 
-    # Non-direct: one variant per (grind_line, treatment) with only that call replaced.
-    for grind_line in grind_lines:
-        for t in treatments:
-            if t.is_direct:
-                continue
+    # Non-direct: one independent task per (grind_line, treatment).
+    non_direct_tasks = [
+        (grind_line, t)
+        for grind_line in grind_lines
+        for t in treatments
+        if not t.is_direct
+    ]
 
-            suffix = f".{t.name}_query_L{grind_line}.lean"
-            all_suggestions, qf, raw_output = _get_line_suggestions(
-                workspace, source, grind_line, t.query_transform, suffix,
-                lean_file, t.name)
-            generated_paths.add(qf)
-
-            filtered = [s for s in all_suggestions if t.filter(s)]
-            if not filtered:
-                dump_artifacts.append(
-                    DumpArtifact(qf, f"L{grind_line}.{t.name}.query.lean")
-                )
-                msg = (
-                    raw_output.strip()[:500] or "no output"
-                ) if not all_suggestions else "no matching suggestions"
-                errors.append((t.name, grind_line, msg))
-                continue
-
-            sug, sf, last_error = _try_line_suggestion(
-                workspace, source, grind_line, filtered, lean_file,
-                f".{t.name}_L{grind_line}.lean", t.name)
-            if sf is not None:
-                generated_paths.add(sf)
-
-            if sug:
-                variants.append(Variant(t.name, grind_line, sf, sug))
-                continue
-
-            dump_artifacts.append(
-                DumpArtifact(qf, f"L{grind_line}.{t.name}.query.lean")
-            )
-            if sf is not None:
-                dump_artifacts.append(
-                    DumpArtifact(sf, f"L{grind_line}.{t.name}.failed.lean")
-                )
-
-            suggestions_tried = "\n".join(f"  suggestion: {s}" for s in filtered)
-            error_msg = suggestions_tried
-            if last_error:
-                error_msg += f"\n{last_error}"
-            errors.append((t.name, grind_line, error_msg))
+    if non_direct_tasks:
+        max_workers = _parallel_workers(len(non_direct_tasks))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _extract_non_direct_treatment,
+                    workspace,
+                    source,
+                    lean_file,
+                    grind_line,
+                    treatment,
+                ): (grind_line, treatment.name)
+                for grind_line, treatment in non_direct_tasks
+            }
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    generated_paths.update(result.generated_paths)
+                    errors.extend(result.errors)
+                    dump_artifacts.extend(result.dump_artifacts)
+                    if result.variant is not None:
+                        variants.append(result.variant)
+            except KeyboardInterrupt:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            except Exception:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
     return variants, errors, dump_artifacts, generated_paths
 
@@ -458,7 +517,8 @@ def extract_treatments(workspace, source, lean_file, grind_lines,
 # Benchmarking
 # ---------------------------------------------------------------------------
 
-def benchmark(workspace, lean_file, warmup, runs):
+def benchmark(workspace: Path, lean_file: Path | str, warmup: int, runs: int) -> list[float] | None:
+    """Benchmark a Lean file and return a list of tactic execution times (in seconds)."""
     cmd = ["lake", "env", "lean", str(lean_file)]
     for i in range(warmup):
         code, _, _ = run_cmd(cmd, workspace)
@@ -507,9 +567,9 @@ def add_bench_args(parser: argparse.ArgumentParser):
     )
 
 
-def _cleanup_generated_files(workspace: Path, lean_file: str):
+def _cleanup_generated_files(workspace: Path, lean_file: str) -> None:
     """Remove any generated .lean files left from previous runs."""
-    pattern = str(workspace / lean_file) + ".*"
+    pattern = str(workspace / Path(lean_file)) + ".*"
     for path in glob.glob(pattern):
         if path.endswith(".lean"):
             Path(path).unlink(missing_ok=True)
@@ -642,3 +702,4 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
     finally:
         for path in generated_paths:
             (workspace / path).unlink(missing_ok=True)
+        _cleanup_generated_files(workspace, lean_file)
