@@ -8,6 +8,7 @@ import argparse
 import http.server
 import json
 import re
+import shutil
 import subprocess
 import sys
 import webbrowser
@@ -173,6 +174,17 @@ def main():
         if not dump_path.is_absolute():
             dump_path = workspace / dump_path
         args.dump = str(dump_path.resolve())
+        # Remove previously dumped Lean files but keep Lake cache (.lake/,
+        # lakefile.lean, lake-manifest.json, symlinks) to avoid rebuilding deps.
+        _KEEP_IN_DUMP = {".lake", "mathlib4", "lean-toolchain", "lakefile.lean", "lake-manifest.json"}
+        if dump_path.exists():
+            for child in dump_path.iterdir():
+                if child.name not in _KEEP_IN_DUMP:
+                    print(f"Removing stale dump content: {child}")
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
 
     if args.justserve:
         results = Path(args.output)

@@ -423,6 +423,9 @@ def _extract_non_direct_treatment(workspace, source, lean_file, grind_line,
 
     if sug:
         variant = Variant(treatment.name, grind_line, sf, sug)
+        dump_artifacts.append(
+            DumpArtifact(qf, f"L{grind_line}.{treatment.name}.query.lean")
+        )
         return ExtractionResult(variant, errors, dump_artifacts, generated_paths)
 
     dump_artifacts.append(
@@ -575,6 +578,37 @@ def _cleanup_generated_files(workspace: Path, lean_file: str) -> None:
             Path(path).unlink(missing_ok=True)
 
 
+def _ensure_dump_lakefile(dump_root: Path):
+    """Create a lakefile.lean in dump_root that declares lean-decomp as a dependency.
+    
+    Also creates symlinks to mathlib4 and lean-toolchain if they don't exist.
+    """
+    lakefile = dump_root / "lakefile.lean"
+    dump_root.mkdir(parents=True, exist_ok=True)
+    
+    # Create lakefile if it doesn't exist
+    if not lakefile.exists():
+        content = """import Lake
+
+open Lake DSL
+
+package «dump» where
+
+require "mathlib" from "./mathlib4"
+require "lean-decomp" from ".."
+"""
+        lakefile.write_text(content)
+    
+    # Create symlinks to dependencies if they don't exist
+    mathlib_link = dump_root / "mathlib4"
+    if not mathlib_link.exists():
+        mathlib_link.symlink_to("../mathlib4")
+    
+    toolchain_link = dump_root / "lean-toolchain"
+    if not toolchain_link.exists():
+        toolchain_link.symlink_to("../lean-toolchain")
+
+
 def _dump_variants(workspace: Path, lean_file: str, dump_root: Path,
                    variants: list[Variant], dump_artifacts: list[DumpArtifact]):
     """Copy generated benchmark files into a stable directory for inspection."""
@@ -639,6 +673,7 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
     dump_root = getattr(args, "dump", None)
     if dump_root is not None:
         dump_root = Path(dump_root).resolve()
+        _ensure_dump_lakefile(dump_root)
 
     try:
         # Extract treatment variants (includes original via identity transform)
