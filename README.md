@@ -29,6 +29,8 @@ After decompilation, the pipeline validates the generated tactics by re-elaborat
 - **`scripts/nightly.py`** — Nightly evaluation: clones mathlib4, finds files containing `grind`, and benchmarks the decompiler on each grind call site.
 - **[eval-live](https://github.com/oflatt/eval-live)** — Live HTML dashboard library for viewing benchmark results (installed via pip).
 
+You can also preserve the generated benchmark inputs with `--dump <dir>`. The nightly script will copy each validated variant to a path like `<dir>/Mathlib/.../<FileStem>/L<line>.<treatment>.lean` so you can inspect a specific file, grind line, and treatment afterward. Failed treatments are dumped too: query failures are saved as `L<line>.<treatment>.query.lean`, and failed suggestion attempts as `L<line>.<treatment>.failed.lean`.
+
 
 ## Current Status
 

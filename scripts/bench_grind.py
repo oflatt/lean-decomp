@@ -13,6 +13,7 @@ versions.
 import argparse
 import glob
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -318,6 +319,13 @@ class Variant:
     is_direct: bool = False  # True for whole-file baseline treatments (e.g. original)
 
 
+@dataclass
+class DumpArtifact:
+    """A generated file that should be copied to the dump directory."""
+    path: Path
+    dump_name: str
+
+
 # ---------------------------------------------------------------------------
 # Suggestion extraction pipeline
 # ---------------------------------------------------------------------------
@@ -367,23 +375,25 @@ def _try_line_suggestion(workspace, source, grind_line, suggestions, lean_file,
         if code == 0:
             return s, result_path, None
         last_output = output
-    (workspace / result_path).unlink(missing_ok=True)
-    return None, None, last_output.strip()
+    return None, result_path, last_output.strip()
 
 
 def extract_treatments(workspace, source, lean_file, grind_lines,
                        treatments=TREATMENTS):
-    """For each (grind_line, treatment) pair, build a variant that replaces
-    only that single grind call.  Direct treatments (original) get one file
-    covering the whole source unchanged.  Query files are cleaned up before
-    returning.
+    """For each (grind_line, treatment) pair, build generated benchmark files.
 
-    Returns (variants, errors) where:
-      variants: list of Variant, one per (grind_line, treatment)
+    Direct treatments (original) get one file covering the whole source unchanged.
+
+    Returns (variants, errors, dump_artifacts, generated_paths) where:
+      variants: list of Variant, one per successful (grind_line, treatment)
       errors: list of (tname, grind_line, errmsg)
+      dump_artifacts: extra generated files that should be dumped on failure
+      generated_paths: all temporary generated files to clean up
     """
     variants = []
     errors = []
+    dump_artifacts = []
+    generated_paths = set()
 
     # Direct treatments: one variant per grind_line (same source for each).
     for t in treatments:
@@ -392,40 +402,57 @@ def extract_treatments(workspace, source, lean_file, grind_lines,
         for grind_line in grind_lines:
             result_path = Path(lean_file + f".L{grind_line}" + t.out_suffix)
             (workspace / result_path).write_text(source)
+            generated_paths.add(result_path)
             variants.append(Variant(t.name, grind_line, result_path, None, is_direct=True))
 
-    # Non-direct: one variant per (grind_line, treatment) — only that call replaced.
+    # Non-direct: one variant per (grind_line, treatment) with only that call replaced.
     for grind_line in grind_lines:
         for t in treatments:
             if t.is_direct:
                 continue
+
             suffix = f".{t.name}_query_L{grind_line}.lean"
             all_suggestions, qf, raw_output = _get_line_suggestions(
                 workspace, source, grind_line, t.query_transform, suffix,
                 lean_file, t.name)
-            (workspace / qf).unlink(missing_ok=True)
+            generated_paths.add(qf)
 
             filtered = [s for s in all_suggestions if t.filter(s)]
             if not filtered:
-                msg = (raw_output.strip()[:500] or "no output") if not all_suggestions else "no matching suggestions"
+                dump_artifacts.append(
+                    DumpArtifact(qf, f"L{grind_line}.{t.name}.query.lean")
+                )
+                msg = (
+                    raw_output.strip()[:500] or "no output"
+                ) if not all_suggestions else "no matching suggestions"
                 errors.append((t.name, grind_line, msg))
                 continue
 
-            # _try_line_suggestion replaces only grind_line; the validated file
-            # is exactly what we want to benchmark.
             sug, sf, last_error = _try_line_suggestion(
                 workspace, source, grind_line, filtered, lean_file,
                 f".{t.name}_L{grind_line}.lean", t.name)
+            if sf is not None:
+                generated_paths.add(sf)
+
             if sug:
                 variants.append(Variant(t.name, grind_line, sf, sug))
-            else:
-                suggestions_tried = "\n".join(f"  suggestion: {s}" for s in filtered)
-                error_msg = suggestions_tried
-                if last_error:
-                    error_msg += f"\n{last_error}"
-                errors.append((t.name, grind_line, error_msg))
+                continue
 
-    return variants, errors
+            dump_artifacts.append(
+                DumpArtifact(qf, f"L{grind_line}.{t.name}.query.lean")
+            )
+            if sf is not None:
+                dump_artifacts.append(
+                    DumpArtifact(sf, f"L{grind_line}.{t.name}.failed.lean")
+                )
+
+            suggestions_tried = "\n".join(f"  suggestion: {s}" for s in filtered)
+            error_msg = suggestions_tried
+            if last_error:
+                error_msg += f"\n{last_error}"
+            errors.append((t.name, grind_line, error_msg))
+
+    return variants, errors, dump_artifacts, generated_paths
 
 # ---------------------------------------------------------------------------
 # Benchmarking
@@ -459,6 +486,15 @@ def add_bench_args(parser: argparse.ArgumentParser):
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument(
+        "--dump",
+        dest="dump",
+        default=None,
+        help=(
+            "Directory where generated benchmark Lean files should be copied. "
+            "Files are written under subdirectories matching the source file path."
+        ),
+    )
+    parser.add_argument(
         "--grind-line",
         dest="grind_lines",
         action="append",
@@ -477,6 +513,21 @@ def _cleanup_generated_files(workspace: Path, lean_file: str):
     for path in glob.glob(pattern):
         if path.endswith(".lean"):
             Path(path).unlink(missing_ok=True)
+
+
+def _dump_variants(workspace: Path, lean_file: str, dump_root: Path,
+                   variants: list[Variant], dump_artifacts: list[DumpArtifact]):
+    """Copy generated benchmark files into a stable directory for inspection."""
+    source_path = Path(lean_file)
+    target_dir = dump_root / source_path.parent / source_path.stem
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    for variant in variants:
+        dumped_name = f"L{variant.grind_line}.{variant.treatment}.lean"
+        shutil.copy2(workspace / variant.path, target_dir / dumped_name)
+
+    for artifact in dump_artifacts:
+        shutil.copy2(workspace / artifact.path, target_dir / artifact.dump_name)
 
 
 def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
@@ -523,11 +574,23 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
     else:
         grind_lines = all_grind_lines
     variants = []
+    dump_artifacts = []
+    generated_paths: set[Path] = set()
+    dump_root = getattr(args, "dump", None)
+    if dump_root is not None:
+        dump_root = Path(dump_root).resolve()
 
     try:
         # Extract treatment variants (includes original via identity transform)
-        variants, treatment_errors = extract_treatments(
+        variants, treatment_errors, dump_artifacts, generated_paths = extract_treatments(
             workspace, source, lean_file, grind_lines)
+
+        if dump_root is not None:
+            _dump_variants(workspace, lean_file, dump_root, variants, dump_artifacts)
+            print(
+                f"  Dumped {len(variants) + len(dump_artifacts)} generated test file(s) for {lean_file} to {dump_root}",
+                flush=True,
+            )
 
         # Record extraction errors in the database (one row per grind call line)
         if db:
@@ -577,5 +640,5 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
 
         return 0
     finally:
-        for v in variants:
-            (workspace / v.path).unlink(missing_ok=True)
+        for path in generated_paths:
+            (workspace / path).unlink(missing_ok=True)

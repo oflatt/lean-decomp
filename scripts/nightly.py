@@ -168,6 +168,11 @@ def main():
     args = parser.parse_args()
 
     workspace = Path(__file__).resolve().parents[1]
+    if args.dump is not None:
+        dump_path = Path(args.dump)
+        if not dump_path.is_absolute():
+            dump_path = workspace / dump_path
+        args.dump = str(dump_path.resolve())
 
     if args.justserve:
         results = Path(args.output)
