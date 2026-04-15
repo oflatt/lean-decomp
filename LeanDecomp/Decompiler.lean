@@ -107,18 +107,6 @@ private partial def stripGrindCasts : Expr → Expr
       stripGrindCasts args[3]!
     else e
 
-/-- Also strip Eq.rec casts (type transports). -/
-private partial def stripAllGrindCasts (e : Expr) : Expr :=
-  let e := stripGrindCasts e
-  let (fn, args) := peelArgs e
-  -- Strip Eq.rec: Eq.rec takes 6 args, the actual proof is args[3]
-  if fn.constName? == some ``Eq.rec && args.length >= 6 then
-    stripAllGrindCasts args[3]!
-  -- Strip Eq.ndrec similarly
-  else if fn.constName? == some ``Eq.ndrec && args.length >= 5 then
-    stripAllGrindCasts args[3]!
-  else e
-
 /-- If `ty` reduces to `Iff lhs rhs`, return `(lhs, rhs)`. -/
 private def iffSides? (ty : Expr) : MetaM (Option (Expr × Expr)) := do
   let ty ← Meta.whnf ty
@@ -143,61 +131,9 @@ private def mkIffApplyStx (iffProof : Expr) (hypStx : TSyntax `term) (forward : 
     else
       `($(mkIdent ``Iff.mpr) $iffStx $hypStx)
 
-/-- Decompile a proof expression into a term syntax, using derived fact names,
-    context hypothesis names, and `by omega` for grind-internal arithmetic leaves.
-    Returns `none` if the expression cannot be cleanly decompiled. -/
-private partial def buildTermFromProof (e : Expr) (hypNameMap : Std.HashMap FVarId Name)
-    (s : OmegaFactState) (depth : Nat := 0) : MetaM (Option (TSyntax `term)) := do
-  if depth > 30 then return none
-  let e := stripAllGrindCasts e
-  -- Known derived fact or hypothesis → resolve to name
-  if let some ident := resolveFactStx e hypNameMap s then
-    return some ident
-  -- Clean expression (no grind internals) → just delab
-  if !containsGrindInternals e then
-    let stx ← try delabToRefinableSyntax e catch _ => return none
-    return some stx
-  let (fn, args) := peelArgs e
-  let cname := fn.constName?
-  -- And.intro: build ⟨left, right⟩
-  if cname == some ``And.intro && args.length >= 4 then
-    let left := args[2]!
-    let right := args[3]!
-    let some leftStx ← buildTermFromProof left hypNameMap s (depth + 1) | return none
-    let some rightStx ← buildTermFromProof right hypNameMap s (depth + 1) | return none
-    return some (← `(⟨$leftStx, $rightStx⟩))
-  -- And.left / And.right (3-arg, non-over-applied)
-  if (cname == some ``And.left || cname == some ``And.right) && args.length == 3 then
-    let pairProof := args[2]!
-    let some pairStx ← buildTermFromProof pairProof hypNameMap s (depth + 1) | return none
-    if cname == some ``And.left then
-      return some (← `(($pairStx).1))
-    else
-      return some (← `(($pairStx).2))
-  -- Iff.mp / Iff.mpr: use mkIffApplyStx
-  if cname == some ``Iff.mp && args.length >= 4 then
-    let iffProof := stripGrindCasts args[2]!
-    let hypProof := args[3]!
-    let some hypStx ← buildTermFromProof hypProof hypNameMap s (depth + 1) | return none
-    return some (← mkIffApplyStx iffProof hypStx true)
-  if cname == some ``Iff.mpr && args.length >= 4 then
-    let iffProof := stripGrindCasts args[2]!
-    let hypProof := args[3]!
-    let some hypStx ← buildTermFromProof hypProof hypNameMap s (depth + 1) | return none
-    return some (← mkIffApplyStx iffProof hypStx false)
-  -- General function application: try to decompose f(a)
-  if let .app f a := e then
-    let some fStx ← buildTermFromProof f hypNameMap s (depth + 1) | return none
-    let some aStx ← buildTermFromProof a hypNameMap s (depth + 1) | return none
-    return some (← `($fStx $aStx))
-  -- Grind-internal leaf with clean type: replace with (by omega : T)
-  let eTy ← try Meta.inferType e catch _ => return none
-  if containsGrindInternals eTy then return none
-  let tyStx ← try PrettyPrinter.delab eTy catch _ => return none
-  return some (← `((by omega : $tyStx)))
-
-/-- Walk a proof term and derive omega-relevant facts from explicit structure.
-    This is a direct, single-pass extraction (no lemma search, no fixed-point). -/
+/-- Walk a proof term and extract clean-typed intermediate facts for omega.
+    This is a fact extraction pass, not a decompiler — it linearizes the proof tree
+    into `have` statements that enrich omega's context. -/
 private partial def walkProofForFacts (e : Expr) (hypNameMap : Std.HashMap FVarId Name)
     (s0 : OmegaFactState) : MetaM (Option Ident × OmegaFactState) := do
   let e := stripGrindCasts e
@@ -462,10 +398,10 @@ mutual
       let tac ← `(tactic| decide)
       return some (#[tac], used)
 
-  /-- Strip `Eq.mp <cast> inner` when the cast contains grind internals.
-      Grind wraps proof terms in type-normalization casts that are logically
-      transparent — the inner term proves something defEq to the goal.
-      We skip the cast and recurse on the inner proof. -/
+  /-- Strip `Eq.mp <cast> inner` when the cast contains grind internals
+      and the inner proof's type matches the goal. Grind wraps proof terms in
+      type-normalization casts that are logically transparent — we skip the cast
+      and recurse on the inner proof via the main decompiler. -/
   private partial def tryDecompEqMpGrindCast (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
     let (fn, args) := peelArgs expr
@@ -485,22 +421,12 @@ mutual
     withLCtx lctx localInsts do
       let goalType ← Meta.inferType expr
       let innerType ← Meta.inferType innerWithArgs
-      -- If types match, just recurse on inner
+      -- Only handle when types match — strip the cast and let the main decompiler recurse.
+      -- When types differ (grind normalization changed the type), fall through to tryDecompOmega.
       if ← Meta.isDefEq goalType innerType then
         let (tactics, used') ← decompileExpr innerWithArgs lctx localInsts used
         return some (tactics, used')
-      -- Types differ (grind normalization). First try omega with just context.
-      if ← tryOmegaWithContext goalType lctx then
-        return some (#[← `(tactic| omega)], used)
-      -- Omega alone failed. Introduce inner as `have`, then close with `omega`.
-      let (haveName, used') := chooseIntroName used.length `fact used
-      let haveNameIdent := mkIdent (Name.mkSimple haveName)
-      let typeStx ← PrettyPrinter.delab innerType
-      let (proofTactics, used'') ← decompileExpr innerWithArgs lctx localInsts used'
-      let proofTacSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$proofTactics]*)
-      let haveTac ← `(tactic| have $haveNameIdent : $typeStx := by $proofTacSeq)
-      let closingTac ← `(tactic| omega)
-      return some (#[haveTac, closingTac], used'')
+      return none
 
   /-- Try replacing grind-internal proof terms with `omega`.
       Extracts facts directly from the low-level proof term structure,
@@ -593,10 +519,7 @@ mutual
                 break
             match memberClosing? with
             | some stx => pure stx
-            | none =>
-              match ← buildTermFromProof expr hypNameMap s with
-              | some termStx => `(tactic| exact $termStx)
-              | none => `(tactic| omega)
+            | none => `(tactic| omega)
       return some (haveTacs.push closingTac, s.used)
 
   /-- The final exact fallback. Try without pp.all first for smaller output,
