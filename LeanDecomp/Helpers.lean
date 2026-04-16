@@ -75,6 +75,8 @@ def containsGrindInternals (e : Expr) : Bool := Id.run do
         return true
     | .app f a => stack := f :: a :: stack
     | .lam _ t b _ => stack := t :: b :: stack
+    | .forallE _ t b _ => stack := t :: b :: stack
+    | .letE _ t v b _ => stack := t :: v :: b :: stack
     | .mdata _ e => stack := e :: stack
     | _ => pure ()
   return false

@@ -219,6 +219,13 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
   withLCtx lctx localInsts do
     let some info ← parseCasesOn expr
       | return none
+    -- If the discriminant's head is a grind-internal normalization helper
+    -- (e.g. `Lean.Grind.of_eq_eq_true`, `Lean.Grind.or_of_and_eq_false`), defer
+    -- to `tryDecompOmega` rather than emitting a `cases` with an unreadable
+    -- scrutinee. We check only the head constant — checking transitively would
+    -- falsely trigger on innocuous `Classical.em (prop-containing-grind-term)`.
+    if let some n := info.discriminant.getAppFn.constName? then
+      if n.toString.startsWith "Lean.Grind." then return none
     let ctorNames := info.indVal.ctors
 
     -- Check if the motive has equality parameters (generalized equation pattern)

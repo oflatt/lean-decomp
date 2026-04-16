@@ -19,7 +19,7 @@ example : P := by
 When elaborated, `decompile` runs the wrapped tactic, captures the resulting proof term, then runs it through a three-stage pipeline:
 
 1. **Term simplification** (`Simplify.lean`) — Rewrites the proof term before decompilation: unfolds auxiliary definitions, eliminates identity wrappers (e.g. `Lean.Grind.alreadyNorm`, `Lean.Grind.nestedProof`), simplifies `Eq.rec`/`noConfusion` patterns, and beta-reduces.
-2. **Term-to-tactic decompilation** (`Decompiler.lean`) — Pattern-matches on proof term structure and maps it to tactics (`intro` for lambdas, `cases` for `casesOn`, `apply`/`exact` for applications, `contradiction` for `False` eliminations, etc.). This stage should be a faithful structural translation — it should not change the proof strategy, only the representation.
+2. **Term-to-tactic decompilation** (`Decompiler.lean`, `Omega.lean`) — Pattern-matches on proof term structure and maps it to tactics (`intro` for lambdas, `cases` for `casesOn`, `apply`/`exact` for applications, `contradiction` for `False` eliminations, `omega` for integer arithmetic, etc.). This stage should be a faithful structural translation — it should not change the proof strategy, only the representation. Omega-related decompilation (extracting facts from proof terms and closing goals with `omega`) lives in `Omega.lean`.
 3. **Tactic simplification** (planned, not yet implemented) — Will simplify and clean up the generated tactic script at the tactic level, e.g. collapsing redundant steps, improving readability, or replacing verbose tactic sequences with simpler equivalents.
 
 After decompilation, the pipeline validates the generated tactics by re-elaborating them against the original goal, then suggests the result via Lean's "Try This" mechanism.
@@ -40,16 +40,36 @@ Goal: run `scripts/nightly.py` across all mathlib grind call sites and produce a
 
 **nightly.py runs to completion.** Results on Sum.lean (4 grind call sites):
 
-| Line | grind site | decompile status | issue |
+| Line | grind site | decompile status | notes |
 |------|-----------|-----------------|-------|
-| L36 | `sum_le_card_nsmul ... grind` | ✅ passes | — |
-| L55 | `use (c - x).toNat; grind` | ❌ proof too large (28K chars, limit 10K) | decompiler lacks handlers for some proof constructs, falls through to raw `exact` |
-| L70 | `decompile grind` (Ico lower bound) | ✅ passes | — |
-| L81 | `use (x - c).toNat; grind` | ❌ proof too large (29K chars, limit 10K) | same as L55 |
+| L36 | `sum_le_card_nsmul ... grind` | ✅ passes | Decomposes into `intro`, `apply Classical.byContradiction`, `have` chains with `Iff.mp`, closes with `omega` |
+| L55 | `use (c - x).toNat; grind` | ✅ passes | `cases Classical.em` on key inequality, each branch closed by `omega` |
+| L70 | `decompile grind` (Ico lower bound) | ✅ passes | Similar to L36: `have` chains extracting facts from `mem_sdiff`/`mem_Ico`, closes with `omega` |
+| L81 | `use (x - c).toNat; grind` | ✅ passes | Same structure as L55 with `cases Classical.em` + `omega` |
+
+All 4 grind call sites in `Sum.lean` decompile successfully. The L55/L81 proofs are concise (5 lines, ~119 chars each), while L36/L70 produce longer but still readable tactic scripts with explicit fact extraction.
+
+### Unbundled/Int.lean (5 grind call sites) — all fail
+
+| Line | theorem | decompile status | category |
+|------|---------|-----------------|----------|
+| L46 | `natAbs_abs` | ❌ omega can't close | omega vs `\|a\|` (abs) |
+| L68 | `natAbs_sub_pos_iff` | ❌ grind internals leak | `Lean.Grind.of_eq_eq_true`, `Linear.norm_le` |
+| L75 | `abs_lt_one_iff` | ❌ grind internals leak | same as L68 |
+| L78 | `abs_le_one_iff` | ❌ grind internals leak | same, 7.5K chars |
+| L90 | `abs_sub_lt_of_lt_lt` | ❌ coercion type error | `↑a` loses type → `Neg ℕ` synth failure |
+
+Three categories of failure:
+
+1. **Grind internals leaking (L68/L75/L78):** `Lean.Grind.of_eq_eq_true`, `Linear.norm_le`, `Linear.Expr.eq_of_norm_eq` etc. pass through `decompExact` because the decompiler has no handler for them. These are proof-rewriting steps grind uses to establish equalities via normalization.
+
+2. **Omega vs abs (L46):** The `cases Classical.em` skeleton is correct, but `omega` can't close goals involving `|a|` (integer abs). The proof requires knowing the definition of abs.
+
+3. **Coercion pretty-printing (L90):** The decompiled `cases Classical.em (-1 * ↑a + ↑b ≤ 0)` has the right shape, but `↑a` (coercion from `ℕ → ℤ`) loses type info when pretty-printed. Lean re-parses `-1 * ↑a` and tries to find `Neg ℕ`, which doesn't exist. Fix: explicit type ascription like `(-1 : ℤ) * ↑a` or `(↑a : ℤ)`.
 
 **Next steps:**
-- Investigate L55/L81 proof-too-large failures — grind produces massive proof terms with constructs the decompiler doesn't yet handle.
-- Expand to more mathlib files beyond Sum.lean.
+- Fix grind internals leaking — investigate whether we can unfold/simplify them away in Simplify.lean.
+- Tactic simplification pass to improve readability of generated scripts.
 
 
 ### Future big todos

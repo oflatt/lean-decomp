@@ -211,6 +211,45 @@ private partial def walkProofForFacts (e : Expr) (hypNameMap : Std.HashMap FVarI
 
   return (resolveFactStx e hypNameMap s, s)
 
+/-- Collect every `|x|` subexpression (integer absolute value) from `e`.
+    In Mathlib `|x|` elaborates to `_root_.abs.{0} α [Lattice α] [AddGroup α] x`
+    (head `abs`, four args). In core Lean it's `@Abs.abs α _ x` (head `Abs.abs`,
+    three args). We match both forms. -/
+private partial def collectIntAbsArgs (e : Expr) (acc : Array Expr) : MetaM (Array Expr) := do
+  let mut acc := acc
+  let (fn, args) := peelArgs e
+  let xArg? : Option Expr :=
+    if fn.isConstOf `abs && args.length == 4 then some args[3]!
+    else if fn.isConstOf `Abs.abs && args.length == 3 then some args[2]!
+    else none
+  if let some x := xArg? then
+    let xTy ← try Meta.inferType x catch _ => pure (mkConst `_unknown)
+    if xTy.isConstOf ``Int then
+      let alreadyIn ← acc.anyM fun a => try Meta.isDefEq a x catch _ => pure false
+      if !alreadyIn then acc := acc.push x
+  for a in args do
+    acc ← collectIntAbsArgs a acc
+  return acc
+
+/-- For each unique `|x|` (with `x : ℤ`) in the goal or context types, inject
+    `have fact := Int.abs_eq_natAbs x`. `Int.abs_eq_natAbs` is a Mathlib lemma;
+    we reference it by name so this module doesn't need to import Mathlib. -/
+private def addAbsNatAbsFacts (goalType : Expr) (ctxHyps : Array (Expr × Expr))
+    (s : OmegaFactState) : MetaM OmegaFactState := do
+  let absEqNatAbs : Name := `Int.abs_eq_natAbs
+  unless (← getEnv).contains absEqNatAbs do return s
+  let mut xs : Array Expr := #[]
+  xs ← collectIntAbsArgs goalType xs
+  for (_, hypTy) in ctxHyps do
+    xs ← collectIntAbsArgs hypTy xs
+  let mut s := s
+  for x in xs do
+    let factExpr := mkApp (mkConst absEqNatAbs) x
+    let factTy ← try Meta.inferType factExpr catch _ => continue
+    let factStx ← try delabToRefinableSyntax factExpr catch _ => continue
+    s ← s.addFact factExpr factTy factStx
+  return s
+
 /-- Try replacing grind-internal proof terms with `omega`.
     Extracts facts directly from the low-level proof term structure,
     then tries `omega` with those explicit facts. -/
@@ -219,9 +258,6 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
   if !containsGrindInternals expr then return none
   withLCtx lctx localInsts do
     let goalType ← Meta.inferType expr
-    -- Try omega with just context hypotheses
-    if ← tryOmegaWithContext goalType lctx then
-      return some (#[← `(tactic| omega)], used)
     -- Context hypotheses and name map
     let mut ctxHyps : Array (Expr × Expr) := #[]
     let mut hypNameMap : Std.HashMap FVarId Name := {}
@@ -230,6 +266,15 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
       ctxHyps := ctxHyps.push (.fvar decl.fvarId, decl.type)
       hypNameMap := hypNameMap.insert decl.fvarId decl.userName
     let mut s : OmegaFactState := { used }
+    -- Inject `Int.abs_eq_natAbs x` for each unique `|x| : ℤ` in goal and
+    -- context types. Omega can't reason through integer `|·|` on its own, so
+    -- this equality (`|x| = x.natAbs`) is the minimum needed to close abs goals.
+    s ← addAbsNatAbsFacts goalType ctxHyps s
+    -- Shortcut to a bare `omega` only when no abs facts are needed AND omega
+    -- already closes on just the context. Otherwise we must emit the `have`
+    -- statements so the re-elaborated tactic has access to them.
+    if s.derivedFacts.isEmpty && (← tryOmegaWithContext goalType lctx) then
+      return some (#[← `(tactic| omega)], used)
     let (_, s') ← walkProofForFacts expr hypNameMap s
     s := s'
     -- Single specialization pass for ∀-quantified context hypotheses.
@@ -261,7 +306,6 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
           if !applied then break
         if (← try Meta.isProp curTy catch _ => pure false) && !curTy.isForall then
           s ← s.addFact cur curTy curStx
-        if s.derivedFacts.isEmpty then return none
     -- Emit have statements and close.
     let mut haveTacs : Array (TSyntax `tactic) := #[]
     for i in [:s.derivedFacts.size] do
