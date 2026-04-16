@@ -16,8 +16,8 @@ deriving instance BEq for LeanDecomp.SimpleTest.Stmt
 /--
 info: Try this:
   [apply] cases h : s with
-    | skip => decide
-    | other => decide
+      | skip => decide
+      | other => decide
 -/
 #guard_msgs in
 example (s: Stmt) : (s == Stmt.skip) || (s == Stmt.other) := by

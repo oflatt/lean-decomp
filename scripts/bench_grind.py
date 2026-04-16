@@ -66,7 +66,7 @@ def extract_profiler_times(output: str) -> dict[str, float]:
 def extract_suggestions(output: str) -> list[str]:
     """Extract tactic suggestions from grind?/decompile output.
 
-    Handles: "Try this: X", "Try these:\\n [tag] X", and multi-line blocks.
+    Handles: "Try this: X", tagged "[apply] ..." entries, and multi-line blocks.
     """
     lines = output.splitlines()
     result = []
