@@ -49,27 +49,27 @@ Goal: run `scripts/nightly.py` across all mathlib grind call sites and produce a
 
 All 4 grind call sites in `Sum.lean` decompile successfully. The L55/L81 proofs are concise (5 lines, ~119 chars each), while L36/L70 produce longer but still readable tactic scripts with explicit fact extraction.
 
-### Unbundled/Int.lean (5 grind call sites) — all fail
+### Unbundled/Int.lean (5 grind call sites) — all pass
 
-| Line | theorem | decompile status | category |
-|------|---------|-----------------|----------|
-| L46 | `natAbs_abs` | ❌ omega can't close | omega vs `\|a\|` (abs) |
-| L68 | `natAbs_sub_pos_iff` | ❌ grind internals leak | `Lean.Grind.of_eq_eq_true`, `Linear.norm_le` |
-| L75 | `abs_lt_one_iff` | ❌ grind internals leak | same as L68 |
-| L78 | `abs_le_one_iff` | ❌ grind internals leak | same, 7.5K chars |
-| L90 | `abs_sub_lt_of_lt_lt` | ❌ coercion type error | `↑a` loses type → `Neg ℕ` synth failure |
+| Line | theorem | decompile status |
+|------|---------|-----------------|
+| L46 | `natAbs_abs` | ✅ passes |
+| L68 | `natAbs_sub_pos_iff` | ✅ passes |
+| L75 | `abs_lt_one_iff` | ✅ passes |
+| L78 | `abs_le_one_iff` | ✅ passes |
+| L90 | `abs_sub_lt_of_lt_lt` | ✅ passes |
 
-Three categories of failure:
+Fixes that landed:
 
-1. **Grind internals leaking (L68/L75/L78):** `Lean.Grind.of_eq_eq_true`, `Linear.norm_le`, `Linear.Expr.eq_of_norm_eq` etc. pass through `decompExact` because the decompiler has no handler for them. These are proof-rewriting steps grind uses to establish equalities via normalization.
+1. **Grind internals leaking (L68/L75/L78):** `tryDecompCasesOn` now returns `none` when the discriminant's head constant is in the `Lean.Grind.*` namespace, so grind-internal `casesOn` scrutinees no longer emit unreadable `cases` tactics — control falls through to `tryDecompOmega`.
 
-2. **Omega vs abs (L46):** The `cases Classical.em` skeleton is correct, but `omega` can't close goals involving `|a|` (integer abs). The proof requires knowing the definition of abs.
+2. **Omega vs abs (L46):** `tryDecompOmega` now injects `have fact := Int.abs_eq_natAbs x` for each `|x| : ℤ` found in the goal or context (`addAbsNatAbsFacts` in `Omega.lean`), giving `omega` the equality it needs to reason about integer abs.
 
-3. **Coercion pretty-printing (L90):** The decompiled `cases Classical.em (-1 * ↑a + ↑b ≤ 0)` has the right shape, but `↑a` (coercion from `ℕ → ℤ`) loses type info when pretty-printed. Lean re-parses `-1 * ↑a` and tries to find `Neg ℕ`, which doesn't exist. Fix: explicit type ascription like `(-1 : ℤ) * ↑a` or `(↑a : ℤ)`.
+3. **Coercion pretty-printing (L90):** Discriminant delab in `tryDecompCasesOn` now runs under `pp.coercions.types := true` and `pp.numericTypes := true`, so `-1 * ↑a + ↑b ≤ 0` renders as `(-1 : ℤ) * ↑a + ↑b ≤ (0 : ℤ)` with enough type anchors to re-elaborate.
 
 **Next steps:**
-- Fix grind internals leaking — investigate whether we can unfold/simplify them away in Simplify.lean.
-- Tactic simplification pass to improve readability of generated scripts.
+- Tactic-level simplifier (stage 3 in the pipeline, still unwritten). Planned scope: always call the decompiler recursively at `have h := ...` sites, emitting `have h : T := by <tactics>`, then have the simplifier collapse trivial `:= by exact X` back to `:= X`. Separates concerns — the decompiler decides representation, the simplifier handles readability.
+- Run nightly across more of `mathlib4/Mathlib/Algebra` to find the next failure class.
 
 
 ### Future big todos
