@@ -418,7 +418,9 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
 
       alts := alts.push altStx
 
-    let discriminantStx ← delabToRefinableSyntax info.discriminant
+    let discriminantStx ← withOptions (fun o =>
+        (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
+      delabToRefinableSyntax info.discriminant
     let casesTac ← if let some (eqName, _) := eqInfo then do
       let discName := getDiscriminantName info.discriminant lctx
       let eqBinderName :=
