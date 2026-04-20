@@ -288,15 +288,15 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
           (opts.setBool `pp.coercions.types true).setBool `pp.numericTypes true
         ) <| delabToRefinableSyntax absArg
       let absStx ← `(term| ($absStx0 : Int))
-      let splitTac ← `(tactic|
+        let splitTac ← `(tactic|
         cases (le_total $absStx 0) with
         | inl h =>
-            rw [abs_of_nonpos h] at hp
-            omega
+          rw [abs_of_nonpos h] at *
+          omega
         | inr h =>
-            rw [abs_of_nonneg h] at hp
-            omega
-      )
+          rw [abs_of_nonneg h] at *
+          omega
+        )
       let splitTac := TSyntax.mk (eraseMacroScopesSyntax splitTac.raw)
       return some (#[splitTac], used)
     -- Inject `Int.abs_eq_natAbs x` for each unique `|x| : ℤ` in goal and

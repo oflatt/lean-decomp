@@ -568,6 +568,22 @@ def add_bench_args(parser: argparse.ArgumentParser):
             "Repeat the flag to pass multiple lines."
         ),
     )
+    parser.add_argument(
+        "--treatment",
+        dest="treatments",
+        action="append",
+        default=None,
+        help=(
+            "Treatments to run (repeatable). Choices: "
+            "original, grindonly, grindscript, decompile."
+        ),
+    )
+    parser.add_argument(
+        "--no-benchmark",
+        dest="no_benchmark",
+        action="store_true",
+        help="Skip benchmarking and only run the treatment extraction.",
+    )
 
 
 def _cleanup_generated_files(workspace: Path, lean_file: str) -> None:
@@ -676,9 +692,25 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
         _ensure_dump_lakefile(dump_root)
 
     try:
+        treatments = TREATMENTS
+        selected = getattr(args, "treatments", None)
+        if selected:
+            wanted = {name.strip() for name in selected if name.strip()}
+            valid = {t.name for t in TREATMENTS}
+            unknown = sorted(wanted - valid)
+            if unknown:
+                print(
+                    f"Unknown treatment(s) for {lean_file}: {unknown}. "
+                    f"Valid: {sorted(valid)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return 2
+            treatments = [t for t in TREATMENTS if t.name in wanted]
+
         # Extract treatment variants (includes original via identity transform)
         variants, treatment_errors, dump_artifacts, generated_paths = extract_treatments(
-            workspace, source, lean_file, grind_lines)
+            workspace, source, lean_file, grind_lines, treatments=treatments)
 
         if dump_root is not None:
             _dump_variants(workspace, lean_file, dump_root, variants, dump_artifacts)
@@ -691,6 +723,9 @@ def bench_grind(lean_file: str, workspace: Path, args: argparse.Namespace,
         if db:
             for tname, gl, errmsg in treatment_errors:
                 db.add_error(lean_file, gl, tname, errmsg)
+
+        if getattr(args, "no_benchmark", False):
+            return 0
 
         # Benchmark each variant — one per (grind_line, treatment).
         original_timings: dict[int, list[float]] = {}
