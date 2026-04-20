@@ -92,7 +92,7 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
 
   -- Check if the decompiled proof is too large, which indicates the decompiler
   -- fell through to raw `exact` terms for constructs it doesn't handle yet.
-  let maxSize := 10000
+  let maxSize := 20000
   let tacticStr := toString (← PrettyPrinter.ppTactic ⟨tacticSeq⟩)
   -- (FileMap is available via CoreM which TacticM extends)
   let col : Nat ←

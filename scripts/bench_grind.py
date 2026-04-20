@@ -26,6 +26,8 @@ from typing import Callable
 
 from bench_db import BenchDB
 
+MATHLIB_TACTIC_BUILT = False
+
 # ---------------------------------------------------------------------------
 # Subprocess helpers
 # ---------------------------------------------------------------------------
@@ -41,6 +43,28 @@ def run_cmd(cmd: list[str], cwd: Path | str) -> tuple[int, float, str]:
 def lake_env_lean(workspace: Path | str, lean_file: str | Path) -> tuple[int, float, str]:
     """Run a Lean file via 'lake env lean'."""
     return run_cmd(["lake", "env", "lean", str(lean_file)], workspace)
+
+
+def _ensure_import(source: str, module: str) -> str:
+    if f"import {module}" in source:
+        return source
+    lines = source.split("\n")
+    insert_at = 0
+    for i, line in enumerate(lines):
+        if line.strip().startswith("import "):
+            insert_at = i + 1
+    lines.insert(insert_at, f"import {module}")
+    return "\n".join(lines)
+
+
+def _ensure_mathlib_tactic_built(workspace: Path | str) -> None:
+    global MATHLIB_TACTIC_BUILT
+    if MATHLIB_TACTIC_BUILT:
+        return
+    code, _, output = run_cmd(["lake", "build", "Mathlib.Tactic"], workspace)
+    if code != 0:
+        raise RuntimeError(f"Failed to build Mathlib.Tactic:\n{output}")
+    MATHLIB_TACTIC_BUILT = True
 
 # ---------------------------------------------------------------------------
 # Output parsing
@@ -267,6 +291,7 @@ def _make_decompile_at_line(source: str, target_line: int) -> str:
     lines[idx] = GRIND_RE.sub("decompile grind", lines[idx], count=1)
     transformed = "\n".join(lines)
     transformed = _demodulify(transformed)
+    transformed = _ensure_import(transformed, "Mathlib.Tactic")
     # Insert decompile tactic import after last import line
     lines = transformed.split("\n")
     insert_at = 0
@@ -347,6 +372,8 @@ def _get_line_suggestions(workspace: Path, source: str, grind_line: int, query_t
                           lean_file: str, treatment_name: str) -> tuple[list[str], Path, str]:
     """Run a query for one grind line. Return (suggestions, query_path, raw_output)."""
     query_source = query_transform(source, grind_line)
+    if "import Mathlib.Tactic" in query_source:
+        _ensure_mathlib_tactic_built(workspace)
     query_path = Path(str(lean_file) + suffix)
     (workspace / query_path).write_text(query_source)
     print(
@@ -378,6 +405,9 @@ def _try_line_suggestion(workspace: Path, source: str, grind_line: int, suggesti
             flush=True,
         )
         replaced = _transform_grind_at_line(source, grind_line, s)
+        if treatment_name == "decompile":
+            replaced = _ensure_import(replaced, "Mathlib.Tactic")
+            _ensure_mathlib_tactic_built(workspace)
         (workspace / result_path).write_text(replaced)
         code, elapsed, output = lake_env_lean(workspace, result_path)
         print(

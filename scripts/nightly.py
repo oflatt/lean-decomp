@@ -40,8 +40,9 @@ def ensure_mathlib(workspace: Path):
 
     # Reset any leftover modifications from previous runs
     run(["git", "checkout", "."], cwd=mathlib)
-    # Remove untracked files (e.g., dump artifacts) that can confuse module discovery
-    run(["git", "clean", "-fdx"], cwd=mathlib)
+    # Remove untracked files (e.g., dump artifacts) but keep Lake caches/builds
+    # so repeated runs do not recompile all of mathlib from scratch.
+    run(["git", "clean", "-fdx", "-e", ".lake", "-e", "build"], cwd=mathlib)
 
     print(f"Checking out {MATHLIB_COMMIT}...")
     run(["git", "checkout", MATHLIB_COMMIT], cwd=mathlib)

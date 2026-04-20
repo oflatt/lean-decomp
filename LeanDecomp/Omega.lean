@@ -231,6 +231,16 @@ private partial def collectIntAbsArgs (e : Expr) (acc : Array Expr) : MetaM (Arr
     acc ← collectIntAbsArgs a acc
   return acc
 
+private partial def containsConst (e : Expr) (name : Name) : Bool :=
+  let (fn, args) := peelArgs e
+  let hits := fn.isConstOf name
+  hits || args.any fun a => containsConst a name
+
+private def mkTacticIdent (name : Name) : TSyntax `tactic :=
+  let raw := name.toString.toRawSubstring
+  TSyntax.mk (Syntax.ident SourceInfo.none raw name [])
+
+
 /-- For each unique `|x|` (with `x : ℤ`) in the goal or context types, inject
     `have fact := Int.abs_eq_natAbs x`. `Int.abs_eq_natAbs` is a Mathlib lemma;
     we reference it by name so this module doesn't need to import Mathlib. -/
@@ -282,20 +292,30 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
     for (_, hypTy) in ctxHyps do
       absArgs ← collectIntAbsArgs hypTy absArgs
     let hasAbs := !absArgs.isEmpty
+    let useOmega :=
+      containsConst goalType ``Int || containsConst goalType ``Nat ||
+      ctxHyps.any (fun (_, hypTy) =>
+        containsConst hypTy ``Int || containsConst hypTy ``Nat
+      )
     if hasAbs then
       let absArg := absArgs[0]!
       let absStx0 ← withOptions (fun opts =>
           (opts.setBool `pp.coercions.types true).setBool `pp.numericTypes true
         ) <| delabToRefinableSyntax absArg
       let absStx ← `(term| ($absStx0 : Int))
-        let splitTac ← `(tactic|
+      let linearTac ← if useOmega then
+          `(tactic| omega)
+        else
+          pure (mkTacticIdent (Name.mkSimple "linarith"))
+      let linearTac := TSyntax.mk (eraseMacroScopesSyntax linearTac.raw)
+      let splitTac ← `(tactic|
         cases (le_total $absStx 0) with
         | inl h =>
           rw [abs_of_nonpos h] at *
-          omega
+          $linearTac
         | inr h =>
           rw [abs_of_nonneg h] at *
-          omega
+          $linearTac
         )
       let splitTac := TSyntax.mk (eraseMacroScopesSyntax splitTac.raw)
       return some (#[splitTac], used)
@@ -307,7 +327,12 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
     -- already closes on just the context. Otherwise we must emit the `have`
     -- statements so the re-elaborated tactic has access to them.
     if s.derivedFacts.isEmpty && (← tryOmegaWithContext goalType lctx) then
-      return some (#[← `(tactic| omega)], used)
+      let linearTac ← if useOmega then
+        `(tactic| omega)
+      else
+        pure (mkTacticIdent (Name.mkSimple "linarith"))
+      let linearTac := TSyntax.mk (eraseMacroScopesSyntax linearTac.raw)
+      return some (#[linearTac], used)
     let (_, s') ← walkProofForFacts expr hypNameMap s
     s := s'
     -- Single specialization pass for ∀-quantified context hypotheses.
@@ -387,12 +412,24 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
               let factIdent := mkIdent s.factNames[i]!
               let lemmaIdent := mkIdent memLemma
               let iffMpr := mkIdent ``Iff.mpr
-              memberClosing? := some (← `(tactic| exact $factIdent ($iffMpr $lemmaIdent ⟨by omega, by omega⟩)))
+              let linearTac ← if useOmega then
+                `(tactic| omega)
+              else
+                pure (mkTacticIdent (Name.mkSimple "linarith"))
+              let linearTac := TSyntax.mk (eraseMacroScopesSyntax linearTac.raw)
+              let tacs : Array (TSyntax `tactic) := #[linearTac]
+              let linearTacSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tacs]*)
+              memberClosing? := some (← `(tactic| exact $factIdent ($iffMpr $lemmaIdent ⟨by $linearTacSeq, by $linearTacSeq⟩)))
               break
           match memberClosing? with
           | some stx => pure #[stx]
           | none =>
-              pure #[← `(tactic| omega)]
+              let linearTac ← if useOmega then
+                `(tactic| omega)
+              else
+                pure (mkTacticIdent (Name.mkSimple "linarith"))
+              let linearTac := TSyntax.mk (eraseMacroScopesSyntax linearTac.raw)
+              pure #[linearTac]
     return some (haveTacs ++ closingTacs, s.used)
 
 end LeanDecomp
