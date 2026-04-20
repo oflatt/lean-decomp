@@ -205,7 +205,7 @@ def main():
     build_lean_decomp(workspace)
 
     if args.path is None:
-        target = mathlib / "Mathlib" / "Algebra" / "Order" / "Group" / "Int" / "Sum.lean"
+        target = mathlib / "Mathlib" / "Algebra" / "Order" / "Group"
     else:
         target = workspace / args.path
     if not target.exists():
