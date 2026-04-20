@@ -61,6 +61,11 @@ def ensure_mathlib(workspace: Path):
     return mathlib
 
 
+def build_lean_decomp(workspace: Path):
+    print("Building lean-decomp...")
+    run(["lake", "build"], cwd=workspace)
+
+
 def find_lean_files_with_grind(path: Path) -> list[Path]:
     """Recursively find .lean files that contain a grind tactic call."""
     if path.is_file():
@@ -197,6 +202,7 @@ def main():
         return 0
 
     mathlib = ensure_mathlib(workspace)
+    build_lean_decomp(workspace)
 
     if args.path is None:
         target = mathlib / "Mathlib" / "Algebra" / "Order" / "Group" / "Int" / "Sum.lean"

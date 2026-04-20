@@ -250,11 +250,21 @@ private def addAbsNatAbsFacts (goalType : Expr) (ctxHyps : Array (Expr × Expr))
     s ← s.addFact factExpr factTy factStx
   return s
 
+  private partial def eraseMacroScopesSyntax (stx : Syntax) : Syntax :=
+    match stx with
+    | Syntax.ident _ _ val _ =>
+      mkIdent val.eraseMacroScopes
+    | Syntax.node info kind args =>
+      Syntax.node info kind (args.map eraseMacroScopesSyntax)
+    | _ => stx
+
 /-- Try replacing grind-internal proof terms with `omega`.
     Extracts facts directly from the low-level proof term structure,
     then tries `omega` with those explicit facts. -/
 partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (used : List String)
+    (decompile : Expr → LocalContext → LocalInstances → List String → MetaM (Array (TSyntax `tactic) × List String))
+    : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
   if !containsGrindInternals expr then return none
   withLCtx lctx localInsts do
     let goalType ← Meta.inferType expr
@@ -266,6 +276,29 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
       ctxHyps := ctxHyps.push (.fvar decl.fvarId, decl.type)
       hypNameMap := hypNameMap.insert decl.fvarId decl.userName
     let mut s : OmegaFactState := { used }
+    -- Collect abs terms to decide if we should simplify before omega.
+    let mut absArgs : Array Expr := #[]
+    absArgs ← collectIntAbsArgs goalType absArgs
+    for (_, hypTy) in ctxHyps do
+      absArgs ← collectIntAbsArgs hypTy absArgs
+    let hasAbs := !absArgs.isEmpty
+    if hasAbs then
+      let absArg := absArgs[0]!
+      let absStx0 ← withOptions (fun opts =>
+          (opts.setBool `pp.coercions.types true).setBool `pp.numericTypes true
+        ) <| delabToRefinableSyntax absArg
+      let absStx ← `(term| ($absStx0 : Int))
+      let splitTac ← `(tactic|
+        cases (le_total $absStx 0) with
+        | inl h =>
+            rw [abs_of_nonpos h] at hp
+            omega
+        | inr h =>
+            rw [abs_of_nonneg h] at hp
+            omega
+      )
+      let splitTac := TSyntax.mk (eraseMacroScopesSyntax splitTac.raw)
+      return some (#[splitTac], used)
     -- Inject `Int.abs_eq_natAbs x` for each unique `|x| : ℤ` in goal and
     -- context types. Omega can't reason through integer `|·|` on its own, so
     -- this equality (`|x| = x.natAbs`) is the minimum needed to close abs goals.
@@ -309,12 +342,24 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
     -- Emit have statements and close.
     let mut haveTacs : Array (TSyntax `tactic) := #[]
     for i in [:s.derivedFacts.size] do
-      let (_, _, proofStx) := s.derivedFacts[i]!
-      haveTacs := haveTacs.push (← `(tactic| have $(mkIdent s.factNames[i]!) := $proofStx))
-    let closingTac ← match s.falseFactName? with
-      | some n =>
+      let (proofExpr, propTy, proofStx) := s.derivedFacts[i]!
+      let factIdent := mkIdent s.factNames[i]!
+      let haveTac ←
+        if containsGrindInternals proofExpr then
+          `(tactic| have $factIdent := $proofStx)
+        else
+          try
+            let tyStx ← delabToRefinableSyntax propTy
+            let (factTacs, _) ← decompile proofExpr lctx localInsts []
+            let factSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$factTacs]*)
+            `(tactic| have $factIdent : $tyStx := by $factSeq)
+          catch _ =>
+            `(tactic| have $factIdent := $proofStx)
+      haveTacs := haveTacs.push haveTac
+    let closingTacs ← match s.falseFactName? with
+      | some n => do
           let falseElim := Lean.mkCIdent ``False.elim
-          `(tactic| exact $falseElim $(mkIdent n))
+          pure #[← `(tactic| exact $falseElim $(mkIdent n))]
       | none   => do
           -- Try interval membership closing: exact factI (Iff.mpr mem_X ⟨by omega, by omega⟩)
           -- This handles the common pattern where a negation fact ¬(x ∈ Ioc a b) blocks omega.
@@ -345,8 +390,9 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
               memberClosing? := some (← `(tactic| exact $factIdent ($iffMpr $lemmaIdent ⟨by omega, by omega⟩)))
               break
           match memberClosing? with
-          | some stx => pure stx
-          | none => `(tactic| omega)
-    return some (haveTacs.push closingTac, s.used)
+          | some stx => pure #[stx]
+          | none =>
+              pure #[← `(tactic| omega)]
+    return some (haveTacs ++ closingTacs, s.used)
 
 end LeanDecomp

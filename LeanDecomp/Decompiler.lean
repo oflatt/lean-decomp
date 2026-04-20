@@ -49,7 +49,7 @@ mutual
             tryDecompByContradiction body lctx localInsts used,
             tryDecompCasesOn body lctx localInsts used decompileExpr assignIntroNames,
             tryDecompEqMpGrindCast body lctx localInsts used,
-            LeanDecomp.tryDecompOmega body lctx localInsts used,
+            LeanDecomp.tryDecompOmega body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongr body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongrArg body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqSymm body lctx localInsts used decompileExpr,

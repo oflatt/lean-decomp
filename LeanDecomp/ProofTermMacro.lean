@@ -2,6 +2,7 @@ import Lean
 import Lean.Meta.Tactic.TryThis
 import LeanDecomp.Decompiler
 import LeanDecomp.Simplify
+import LeanDecomp.TacticSimplify
 
 namespace LeanDecomp
 open Lean Elab Command Meta Tactic
@@ -79,6 +80,7 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   let localInstances ← getLocalInstances
   -- Decompile to syntax (delabToRefinableSyntax has its own pp.all fallback)
   let (tactics, _) ← decompileExpr simplifiedProof lctx localInstances []
+  let tactics ← simplifyTactics tactics
 
   -- restore the original state with the original goal
   stateBefore.restore
