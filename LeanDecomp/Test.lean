@@ -61,85 +61,43 @@ example : ∀ n : Nat, 0 + n = n := by
 /--
 info: Try this:
   [apply] refine @Eq.mp (5 ≤ n) False ?_ ?_
-    · refine
-        @Lean.Grind.Order.eq_trans_false
-          (@LE.le.{0} Nat instLENat (@OfNat.ofNat.{0} Nat (nat_lit 5) (instOfNatNat (nat_lit 5))) n)
-          (@LE.le.{0} Int Int.instLEInt (@OfNat.ofNat.{0} Int (nat_lit 5) (@instOfNat (nat_lit 5)))
-            (@NatCast.natCast.{0} Int instNatCastInt n))
-          ?_ ?_
+    · refine @Lean.Grind.Order.eq_trans_false ((5 : Nat) ≤ n) ((5 : Int) ≤ ↑n) ?_ ?_
       · refine Nat.ToInt.le_eq ?_ ?_
         · exact Nat.ToInt.natCast_ofNat 5
         · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
-      · refine
-          @Lean.Grind.Order.eq_trans_false
-            (@LE.le.{0} Int Int.instLEInt (@OfNat.ofNat.{0} Int (nat_lit 5) (@instOfNat (nat_lit 5)))
-              (@NatCast.natCast.{0} Int instNatCastInt n))
-            (@LE.le.{0} Int Int.instLEInt (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0)))
-              (@HAdd.hAdd.{0, 0, 0} Int Int Int (@instHAdd.{0} Int Int.instAdd)
-                (@NatCast.natCast.{0} Int instNatCastInt n)
-                (@IntCast.intCast.{0} Int instIntCastInt
-                  (@Neg.neg.{0} Int Int.instNegInt (@OfNat.ofNat.{0} Int (nat_lit 5) (@instOfNat (nat_lit 5)))))))
-            ?_ ?_
+      · refine @Lean.Grind.Order.eq_trans_false ((5 : Int) ≤ ↑n) ((0 : Int) ≤ ↑n + IntCast.intCast (-5 : Int)) ?_ ?_
         · refine
-            @Lean.Grind.CommRing.le_norm_expr.{0} Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
-              (@Lean.RArray.leaf.{0} Int (@NatCast.natCast.{0} Int instNatCastInt n))
-              (Lean.Grind.CommRing.Expr.num (@OfNat.ofNat.{0} Int (nat_lit 5) (@instOfNat (nat_lit 5))))
-              (Lean.Grind.CommRing.Expr.var (@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0))))
-              (Lean.Grind.CommRing.Expr.num (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0))))
-              (Lean.Grind.CommRing.Expr.add
-                (Lean.Grind.CommRing.Expr.var (@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0))))
-                (Lean.Grind.CommRing.Expr.intCast
-                  (@Neg.neg.{0} Int Int.instNegInt (@OfNat.ofNat.{0} Int (nat_lit 5) (@instOfNat (nat_lit 5))))))
-              ?_
-          · refine @Std.IsLinearPreorder.toIsPreorder.{0} Int Int.instLEInt ?_
-            · refine @Std.IsLinearOrder.toIsLinearPreorder.{0} Int Int.instLEInt ?_
+            @Lean.Grind.CommRing.le_norm_expr Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
+              (Lean.RArray.leaf ↑n) (Lean.Grind.CommRing.Expr.num 5) (Lean.Grind.CommRing.Expr.var 0)
+              (Lean.Grind.CommRing.Expr.num 0)
+              ((Lean.Grind.CommRing.Expr.var 0).add (Lean.Grind.CommRing.Expr.intCast (-5))) ?_
+          · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
+            · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
               · exact Lean.Grind.instIsLinearOrderInt
           · exact Lean.Grind.instOrderedRingInt
           · decide
         · refine
-            @Lean.Grind.Order.le_eq_false_of_le_k.{0} Int Int.instLEInt Int.instLTInt ?_ ?_
-              (@Lean.Grind.CommRing.toRing.{0} Int Lean.Grind.instCommRingInt) ?_
-              (@NatCast.natCast.{0} Int instNatCastInt n) (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0)))
-              (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3)))
-              (@Neg.neg.{0} Int Int.instNegInt (@OfNat.ofNat.{0} Int (nat_lit 5) (@instOfNat (nat_lit 5)))) ?_ ?_
+            @Lean.Grind.Order.le_eq_false_of_le_k Int Int.instLEInt Int.instLTInt ?_ ?_ Lean.Grind.instCommRingInt.toRing
+              ?_ (↑n) 0 3 (-5) ?_ ?_
           · exact Lean.Grind.instLawfulOrderLTInt
-          · refine @Std.IsLinearPreorder.toIsPreorder.{0} Int Int.instLEInt ?_
-            · refine @Std.IsLinearOrder.toIsLinearPreorder.{0} Int Int.instLEInt ?_
+          · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
+            · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
               · exact Lean.Grind.instIsLinearOrderInt
           · exact Lean.Grind.instOrderedRingInt
           · decide
-          · refine
-              @Lean.Grind.Order.eq_mp
-                (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
-                  (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3))))
-                (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
-                  (@HAdd.hAdd.{0, 0, 0} Int Int Int (@instHAdd.{0} Int Int.instAdd)
-                    (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0)))
-                    (@IntCast.intCast.{0} Int instIntCastInt
-                      (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3))))))
-                ?_ ?_
+          · refine @Lean.Grind.Order.eq_mp (↑n ≤ (3 : Int)) (↑n ≤ (0 : Int) + IntCast.intCast (3 : Int)) ?_ ?_
             · refine
-                @Lean.Grind.CommRing.le_norm_expr.{0} Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
-                  (@Lean.RArray.leaf.{0} Int (@NatCast.natCast.{0} Int instNatCastInt n))
-                  (Lean.Grind.CommRing.Expr.var (@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0))))
-                  (Lean.Grind.CommRing.Expr.num (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3))))
-                  (Lean.Grind.CommRing.Expr.var (@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0))))
-                  (Lean.Grind.CommRing.Expr.add
-                    (Lean.Grind.CommRing.Expr.num (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0))))
-                    (Lean.Grind.CommRing.Expr.intCast (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3)))))
-                  ?_
-              · refine @Std.IsLinearPreorder.toIsPreorder.{0} Int Int.instLEInt ?_
-                · refine @Std.IsLinearOrder.toIsLinearPreorder.{0} Int Int.instLEInt ?_
+                @Lean.Grind.CommRing.le_norm_expr Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
+                  (Lean.RArray.leaf ↑n) (Lean.Grind.CommRing.Expr.var 0) (Lean.Grind.CommRing.Expr.num 3)
+                  (Lean.Grind.CommRing.Expr.var 0)
+                  ((Lean.Grind.CommRing.Expr.num 0).add (Lean.Grind.CommRing.Expr.intCast 3)) ?_
+              · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
+                · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
                   · exact Lean.Grind.instIsLinearOrderInt
               · exact Lean.Grind.instOrderedRingInt
               · decide
             · refine of_eq_true ?_
-              · refine
-                  @Lean.Grind.Order.eq_trans_true'
-                    (@LE.le.{0} Nat instLENat n (@OfNat.ofNat.{0} Nat (nat_lit 3) (instOfNatNat (nat_lit 3))))
-                    (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
-                      (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3))))
-                    ?_ ?_
+              · refine @Lean.Grind.Order.eq_trans_true' (n ≤ (3 : Nat)) (↑n ≤ (3 : Int)) ?_ ?_
                 · refine Nat.ToInt.le_eq ?_ ?_
                   · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
                   · exact Nat.ToInt.natCast_ofNat 3
@@ -157,85 +115,43 @@ info: Try this:
   [apply] apply Classical.byContradiction
     intro hp
     refine @Eq.mp (10 ≤ n) False ?_ ?_
-    · refine
-        @Lean.Grind.Order.eq_trans_false
-          (@LE.le.{0} Nat instLENat (@OfNat.ofNat.{0} Nat (nat_lit 10) (instOfNatNat (nat_lit 10))) n)
-          (@LE.le.{0} Int Int.instLEInt (@OfNat.ofNat.{0} Int (nat_lit 10) (@instOfNat (nat_lit 10)))
-            (@NatCast.natCast.{0} Int instNatCastInt n))
-          ?_ ?_
+    · refine @Lean.Grind.Order.eq_trans_false ((10 : Nat) ≤ n) ((10 : Int) ≤ ↑n) ?_ ?_
       · refine Nat.ToInt.le_eq ?_ ?_
         · exact Nat.ToInt.natCast_ofNat 10
         · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
-      · refine
-          @Lean.Grind.Order.eq_trans_false
-            (@LE.le.{0} Int Int.instLEInt (@OfNat.ofNat.{0} Int (nat_lit 10) (@instOfNat (nat_lit 10)))
-              (@NatCast.natCast.{0} Int instNatCastInt n))
-            (@LE.le.{0} Int Int.instLEInt (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0)))
-              (@HAdd.hAdd.{0, 0, 0} Int Int Int (@instHAdd.{0} Int Int.instAdd)
-                (@NatCast.natCast.{0} Int instNatCastInt n)
-                (@IntCast.intCast.{0} Int instIntCastInt
-                  (@Neg.neg.{0} Int Int.instNegInt (@OfNat.ofNat.{0} Int (nat_lit 10) (@instOfNat (nat_lit 10)))))))
-            ?_ ?_
+      · refine @Lean.Grind.Order.eq_trans_false ((10 : Int) ≤ ↑n) ((0 : Int) ≤ ↑n + IntCast.intCast (-10 : Int)) ?_ ?_
         · refine
-            @Lean.Grind.CommRing.le_norm_expr.{0} Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
-              (@Lean.RArray.leaf.{0} Int (@NatCast.natCast.{0} Int instNatCastInt n))
-              (Lean.Grind.CommRing.Expr.num (@OfNat.ofNat.{0} Int (nat_lit 10) (@instOfNat (nat_lit 10))))
-              (Lean.Grind.CommRing.Expr.var (@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0))))
-              (Lean.Grind.CommRing.Expr.num (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0))))
-              (Lean.Grind.CommRing.Expr.add
-                (Lean.Grind.CommRing.Expr.var (@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0))))
-                (Lean.Grind.CommRing.Expr.intCast
-                  (@Neg.neg.{0} Int Int.instNegInt (@OfNat.ofNat.{0} Int (nat_lit 10) (@instOfNat (nat_lit 10))))))
-              ?_
-          · refine @Std.IsLinearPreorder.toIsPreorder.{0} Int Int.instLEInt ?_
-            · refine @Std.IsLinearOrder.toIsLinearPreorder.{0} Int Int.instLEInt ?_
+            @Lean.Grind.CommRing.le_norm_expr Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
+              (Lean.RArray.leaf ↑n) (Lean.Grind.CommRing.Expr.num 10) (Lean.Grind.CommRing.Expr.var 0)
+              (Lean.Grind.CommRing.Expr.num 0)
+              ((Lean.Grind.CommRing.Expr.var 0).add (Lean.Grind.CommRing.Expr.intCast (-10))) ?_
+          · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
+            · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
               · exact Lean.Grind.instIsLinearOrderInt
           · exact Lean.Grind.instOrderedRingInt
           · decide
         · refine
-            @Lean.Grind.Order.le_eq_false_of_le_k.{0} Int Int.instLEInt Int.instLTInt ?_ ?_
-              (@Lean.Grind.CommRing.toRing.{0} Int Lean.Grind.instCommRingInt) ?_
-              (@NatCast.natCast.{0} Int instNatCastInt n) (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0)))
-              (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4)))
-              (@Neg.neg.{0} Int Int.instNegInt (@OfNat.ofNat.{0} Int (nat_lit 10) (@instOfNat (nat_lit 10)))) ?_ ?_
+            @Lean.Grind.Order.le_eq_false_of_le_k Int Int.instLEInt Int.instLTInt ?_ ?_ Lean.Grind.instCommRingInt.toRing
+              ?_ (↑n) 0 4 (-10) ?_ ?_
           · exact Lean.Grind.instLawfulOrderLTInt
-          · refine @Std.IsLinearPreorder.toIsPreorder.{0} Int Int.instLEInt ?_
-            · refine @Std.IsLinearOrder.toIsLinearPreorder.{0} Int Int.instLEInt ?_
+          · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
+            · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
               · exact Lean.Grind.instIsLinearOrderInt
           · exact Lean.Grind.instOrderedRingInt
           · decide
-          · refine
-              @Lean.Grind.Order.eq_mp
-                (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
-                  (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4))))
-                (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
-                  (@HAdd.hAdd.{0, 0, 0} Int Int Int (@instHAdd.{0} Int Int.instAdd)
-                    (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0)))
-                    (@IntCast.intCast.{0} Int instIntCastInt
-                      (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4))))))
-                ?_ ?_
+          · refine @Lean.Grind.Order.eq_mp (↑n ≤ (4 : Int)) (↑n ≤ (0 : Int) + IntCast.intCast (4 : Int)) ?_ ?_
             · refine
-                @Lean.Grind.CommRing.le_norm_expr.{0} Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
-                  (@Lean.RArray.leaf.{0} Int (@NatCast.natCast.{0} Int instNatCastInt n))
-                  (Lean.Grind.CommRing.Expr.var (@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0))))
-                  (Lean.Grind.CommRing.Expr.num (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4))))
-                  (Lean.Grind.CommRing.Expr.var (@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0))))
-                  (Lean.Grind.CommRing.Expr.add
-                    (Lean.Grind.CommRing.Expr.num (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0))))
-                    (Lean.Grind.CommRing.Expr.intCast (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4)))))
-                  ?_
-              · refine @Std.IsLinearPreorder.toIsPreorder.{0} Int Int.instLEInt ?_
-                · refine @Std.IsLinearOrder.toIsLinearPreorder.{0} Int Int.instLEInt ?_
+                @Lean.Grind.CommRing.le_norm_expr Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
+                  (Lean.RArray.leaf ↑n) (Lean.Grind.CommRing.Expr.var 0) (Lean.Grind.CommRing.Expr.num 4)
+                  (Lean.Grind.CommRing.Expr.var 0)
+                  ((Lean.Grind.CommRing.Expr.num 0).add (Lean.Grind.CommRing.Expr.intCast 4)) ?_
+              · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
+                · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
                   · exact Lean.Grind.instIsLinearOrderInt
               · exact Lean.Grind.instOrderedRingInt
               · decide
             · refine of_eq_true ?_
-              · refine
-                  @Lean.Grind.Order.eq_trans_true'
-                    (@LE.le.{0} Nat instLENat n (@OfNat.ofNat.{0} Nat (nat_lit 4) (instOfNatNat (nat_lit 4))))
-                    (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
-                      (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4))))
-                    ?_ ?_
+              · refine @Lean.Grind.Order.eq_trans_true' (n ≤ (4 : Nat)) (↑n ≤ (4 : Int)) ?_ ?_
                 · refine Nat.ToInt.le_eq ?_ ?_
                   · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
                   · exact Nat.ToInt.natCast_ofNat 4
@@ -246,9 +162,7 @@ info: Try this:
                     · exact h
     · refine @Eq.mp (¬n ≤ 9) (9 + 1 ≤ n) ?_ ?_
       · exact Nat.not_le_eq n 9
-      · refine
-          @mt (@LE.le.{0} Nat instLENat n (@OfNat.ofNat.{0} Nat (nat_lit 9) (instOfNatNat (nat_lit 9))))
-            (@LT.lt.{0} Nat instLTNat n (@OfNat.ofNat.{0} Nat (nat_lit 10) (instOfNatNat (nat_lit 10)))) ?_ ?_
+      · refine @mt (n ≤ (9 : Nat)) (n < (10 : Nat)) ?_ ?_
         ·
           exact fun b =>
             Eq.symm (Eq.trans (Lean.Grind.Nat.lt_eq n 10) (Nat.Simproc.add_le_le n (of_decide_eq_true (Eq.refl true)))) ▸

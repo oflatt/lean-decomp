@@ -56,6 +56,29 @@ private def ppExprToTermSyntaxWith (e : Expr) (usePpAll : Bool) : MetaM Term :=
     ) do
       ppExprToTermSyntax e
 
+private def theoremHeadToExplicitTermSyntax (headName : Name) : MetaM Term := do
+  let env ← getEnv
+  let headStr := s!"@{headName}"
+  match Parser.runParserCategory env `term headStr with
+  | .ok stx => pure ⟨stx⟩
+  | .error err =>
+    throwError "failed to parse theorem head:\n{err}\n\n{headStr}"
+
+private def theoremAppToNotationTermSyntax (headName : Name) (args : List Expr) : MetaM Term := do
+  let headTerm ← theoremHeadToExplicitTermSyntax headName
+  let mut argTerms : Array Term := #[]
+  for arg in args do
+    let argTerm ← if ← Meta.isProof arg then
+        `(term| ?_)
+      else
+        let argType ← instantiateMVars (← Meta.inferType arg)
+        if argType.isSort then
+          ppExprToTermSyntaxWith arg false
+        else
+          delabToRefinableSyntax arg
+    argTerms := argTerms.push argTerm
+  pure <| Syntax.mkApp headTerm argTerms
+
 private def refineTacProducesGoals (term : Term) (expectedType : Expr)
   (expectedGoals : Nat) (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool := do
   let savedMsgs ← Core.getMessageLog
@@ -69,6 +92,38 @@ private def refineTacProducesGoals (term : Term) (expectedType : Expr)
             evalTactic tac
           let newMsgs ← Core.getMessageLog
           pure (!newMsgs.hasErrors && goals.length == expectedGoals)
+    catch _ =>
+      pure false
+  Core.setMessageLog savedMsgs
+  return ok
+
+private def refineTacMatchesProofArgs (term : Term) (expectedType : Expr)
+  (proofArgs : Array Expr) (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool := do
+  let savedMsgs ← Core.getMessageLog
+  Core.setMessageLog {}
+  let ok ← try
+      withoutModifyingState do
+        withLCtx lctx localInsts do
+          let goal ← Meta.mkFreshExprMVar (some expectedType) .syntheticOpaque
+          let tac ← `(tactic| refine $term)
+          let goals := (← Tactic.run goal.mvarId! do
+            evalTactic tac
+            ).toArray
+          let newMsgs ← Core.getMessageLog
+          if newMsgs.hasErrors || goals.size != proofArgs.size then
+            pure false
+          else
+            let mut ok := true
+            for i in [:proofArgs.size] do
+              let goalId := goals[i]!
+              let proofArg := proofArgs[i]!
+              let proofTy ← instantiateMVars (← Meta.inferType proofArg)
+              let sameType ← goalId.withContext do
+                let goalTy ← instantiateMVars (← goalId.getType)
+                Meta.isDefEq goalTy proofTy
+              if !sameType then
+                ok := false
+            pure ok
     catch _ =>
       pure false
   Core.setMessageLog savedMsgs
@@ -379,6 +434,18 @@ mutual
         return none
 
       let exprTy ← Meta.inferType expr
+      let delabTerm ← delabToRefinableSyntax app
+      if ← refineTacMatchesProofArgs delabTerm exprTy proofArgs lctx localInsts then
+        let refineTac ← `(tactic| refine $delabTerm)
+        let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts used decompileExpr
+        return some result
+
+      let notationTerm ← theoremAppToNotationTermSyntax headName args
+      if ← refineTacMatchesProofArgs notationTerm exprTy proofArgs lctx localInsts then
+        let refineTac ← `(tactic| refine $notationTerm)
+        let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts used decompileExpr
+        return some result
+
       let compactTerm ← ppExprToTermSyntaxWith app false
       let usePpAll := !(← refineTacProducesGoals compactTerm exprTy proofArgs.size lctx localInsts)
       let refineTerm ← if usePpAll then
