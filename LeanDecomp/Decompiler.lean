@@ -6,10 +6,9 @@ import LeanDecomp.CasesOn
 import LeanDecomp.EqDecomp
 import LeanDecomp.Specialized
 import LeanDecomp.Simplify
-import LeanDecomp.Omega
 
 namespace LeanDecomp
-open Lean Elab Meta PrettyPrinter
+open Lean Elab Meta PrettyPrinter Tactic
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
 /-- Pretty-print an elaborated expression and parse it back as term syntax.
@@ -46,18 +45,38 @@ private def ppExprToTermSyntax (e : Expr) : MetaM Term := do
   | .error err =>
     throwError "failed to parse pretty-printed term:\n{err}\n\n{termStr}"
 
-/-- Build a tacticSeq from an array of tactics -/
-private def mkTacticSeq (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax ``Lean.Parser.Tactic.tacticSeq) := do
-  `(Lean.Parser.Tactic.tacticSeq| $[$tacs]*)
+private def ppExprToTermSyntaxWith (e : Expr) (usePpAll : Bool) : MetaM Term :=
+  withOptions (fun o =>
+      let o := pp.coercions.types.set o true
+      let o := pp.numericTypes.set o true
+      if usePpAll then
+        pp.all.set o true
+      else
+        o
+    ) do
+      ppExprToTermSyntax e
+
+private def refineTacProducesGoals (term : Term) (expectedType : Expr)
+  (expectedGoals : Nat) (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool := do
+  let savedMsgs ← Core.getMessageLog
+  Core.setMessageLog {}
+  let ok ← try
+      withoutModifyingState do
+        withLCtx lctx localInsts do
+          let goal ← Meta.mkFreshExprMVar (some expectedType) .syntheticOpaque
+          let tac ← `(tactic| refine $term)
+          let goals ← Tactic.run goal.mvarId! do
+            evalTactic tac
+          let newMsgs ← Core.getMessageLog
+          pure (!newMsgs.hasErrors && goals.length == expectedGoals)
+    catch _ =>
+      pure false
+  Core.setMessageLog savedMsgs
+  return ok
 
 /-- Flatten nested arrays of tactics -/
 private def flattenTactics (tacss : List (Array (TSyntax `tactic))) : Array (TSyntax `tactic) :=
   tacss.foldl (· ++ ·) #[]
-
-/-- Build a focused tactic block for one subgoal. -/
-private def mkFocusedBlock (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax `tactic) := do
-  let seq ← mkTacticSeq tacs
-  `(tactic| · $seq:tacticSeq)
 
 private partial def containsConstName (e : Expr) (target : Name) : Bool :=
   Expr.find? (fun sub => sub.getAppFn.constName? == some target) e |>.isSome
@@ -99,7 +118,7 @@ mutual
 
   /-- Convert a proof term expression into tactic syntax. -/
   partial def decompileExpr (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Array (TSyntax `tactic) × List String) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Array (TSyntax `tactic) × List String) := do
     withLCtx lctx localInsts do
       Meta.lambdaTelescope expr fun xs body => do
         if xs.size > 0 then
@@ -118,8 +137,6 @@ mutual
             tryDecompByContradiction body lctx localInsts used,
             tryDecompCasesOn body lctx localInsts used decompileExpr assignIntroNames,
             trySpecializedDecompHandlers body lctx localInsts used decompileExpr,
-            -- We are not using the omega pass for now; prefer the raw structural
-            -- decompiler path while investigating no-omega decompilation.
             LeanDecomp.tryDecompCongr body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongrArg body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqSymm body lctx localInsts used decompileExpr,
@@ -139,7 +156,7 @@ mutual
           | none => decompExact body used
 
   private partial def tryDecompIntro (xs : Array Expr) (body : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Array (TSyntax `tactic) × List String) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Array (TSyntax `tactic) × List String) := do
     withLCtx lctx localInsts do
       let (introNames, newLctx, used') ← assignIntroNames xs used
       let newLocalInsts ← getLocalInstances
@@ -153,7 +170,7 @@ mutual
       return (introTac ++ bodyTactics, used'')
 
   private partial def tryDecompByContradiction (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let (fn, args) := peelArgs expr
       let some constName := Expr.constName? fn
@@ -188,7 +205,7 @@ mutual
       For fvar arguments, emit a let binding for readability.
       For non-fvar arguments, beta-reduce and recurse. -/
   private partial def tryDecompBetaRedex (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let .app fn arg := expr | return none
       let .lam binderName binderType body _binderInfo := fn | return none
@@ -216,7 +233,7 @@ mutual
       low-level proof terms readable and exposes theorem applications hidden at
       the end of let-heavy generated terms. -/
   private partial def tryDecompLet (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let .letE binderName _binderType value body _ := expr | return none
       let (letName, used') := chooseIntroName used.length binderName used
@@ -233,7 +250,7 @@ mutual
 
   /-- Handle `False.rec`, `False.elim`, and `False.casesOn` terms. -/
   private partial def tryDecompFalseRec (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let (fn, args) := peelArgs expr
       let some constName := Expr.constName? fn
@@ -282,7 +299,7 @@ mutual
       `decide` elaborates to `of_decide_eq_true <proof>`, so we recognize
       this pattern and replace the entire term with the `decide` tactic. -/
   private partial def tryDecompDecide (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let (fn, _) := peelArgs expr
       let some constName := fn.constName? | return none
@@ -294,7 +311,7 @@ mutual
       Grind certificates. At tactic level, `decide` is a much smaller proof of
       the resulting reducible proposition. -/
   private partial def tryDecompEagerReduce (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let (fn, _) := peelArgs expr
       let some constName := fn.constName? | return none
@@ -304,7 +321,7 @@ mutual
 
   /-- `Eq.refl` proof terms are better rendered as `rfl`. -/
   private partial def tryDecompEqRefl (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let (fn, _) := peelArgs expr
       let some constName := fn.constName? | return none
@@ -324,7 +341,7 @@ mutual
       everything into a single `exact` term. Terms with problematic evidence are
       the main motivation, but the shape is generic and not grind-specific. -/
   private partial def tryDecompTheoremAppFallback (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let (fn, args) := peelArgs expr
       let some headName := isTheoremAppHead? fn | return none
@@ -361,19 +378,16 @@ mutual
       if !problematic && proofArgs.size < 2 then
         return none
 
-      let refineTerm ← withOptions (fun o => o.setBool `pp.all true) do
-        ppExprToTermSyntax app
+      let exprTy ← Meta.inferType expr
+      let compactTerm ← ppExprToTermSyntaxWith app false
+      let usePpAll := !(← refineTacProducesGoals compactTerm exprTy proofArgs.size lctx localInsts)
+      let refineTerm ← if usePpAll then
+          ppExprToTermSyntaxWith app true
+        else
+          pure compactTerm
       let refineTac ← `(tactic| refine $refineTerm)
-
-      let mut allTacs : Array (TSyntax `tactic) := #[refineTac]
-      let mut used' := used
-      for proofArg in proofArgs do
-        let (subTacs, used'') ← decompileExpr proofArg lctx localInsts used'
-        let blockTac ← mkFocusedBlock subTacs
-        allTacs := allTacs.push blockTac
-        used' := used''
-
-      return some (allTacs, used')
+      let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts used decompileExpr
+      return some result
 
   /-- Return `true` if `e` (or any subterm) contains a `@eagerReduce _ _` application.
       Grind emits these as kernel-eager-reduction gadgets inside arithmetic
@@ -390,7 +404,7 @@ mutual
       gadgets, wrap the `exact` in `with_unfolding_all` so the elaborator runs
       with the same all-transparency setting grind used to build the term. -/
   private partial def decompExact (body : Expr) (used : List String) :
-      MetaM (Array (TSyntax `tactic) × List String) := do
+      TacticM (Array (TSyntax `tactic) × List String) := do
     let termStx ← delabToRefinableSyntax body
     if containsEagerReduce body then
       let tac ← `(tactic| with_unfolding_all exact $termStx)
@@ -404,7 +418,7 @@ mutual
       (a `False` hypothesis, or `h : P` and `h' : ¬P`). This avoids emitting
       `contradiction` for complex proof terms where it can't close the goal. -/
   private partial def tryDecompFalseType (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let exprTy ← Meta.inferType expr
       if !exprTy.isConstOf ``False then return none

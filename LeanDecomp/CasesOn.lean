@@ -4,7 +4,7 @@ import Lean.PrettyPrinter
 import LeanDecomp.Helpers
 
 namespace LeanDecomp
-open Lean Elab Meta PrettyPrinter
+open Lean Elab Meta PrettyPrinter Tactic
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
 /-- Peel off all applications from an expression to get the head and arguments.
@@ -215,14 +215,14 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String)
     (decompileExpr : DecompileCallback)
     (assignIntroNames : AssignIntroNamesCallback)
-    : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
     let some info ← parseCasesOn expr
       | return none
     -- If the discriminant's head is a grind-internal normalization helper
-    -- (e.g. `Lean.Grind.of_eq_eq_true`, `Lean.Grind.or_of_and_eq_false`), defer
-    -- to `tryDecompOmega` rather than emitting a `cases` with an unreadable
-    -- scrutinee. We check only the head constant — checking transitively would
+    -- (e.g. `Lean.Grind.of_eq_eq_true`, `Lean.Grind.or_of_and_eq_false`),
+    -- skip the structural `cases` decompiler so we do not emit an unreadable
+    -- scrutinee. We check only the head constant; checking transitively would
     -- falsely trigger on innocuous `Classical.em (prop-containing-grind-term)`.
     if let some n := info.discriminant.getAppFn.constName? then
       if n.toString.startsWith "Lean.Grind." then return none

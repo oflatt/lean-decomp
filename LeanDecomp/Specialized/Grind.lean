@@ -2,7 +2,7 @@ import Lean
 import LeanDecomp.Helpers
 
 namespace LeanDecomp.Specialized.Grind
-open Lean Elab Meta
+open Lean Elab Meta Tactic
 
 private def peelArgs (e : Expr) : Expr × List Expr :=
   let rec go (cur : Expr) (acc : List Expr) : Expr × List Expr :=
@@ -16,7 +16,7 @@ private def peelArgs (e : Expr) : Expr × List Expr :=
     it lives in the grind specialization package rather than the core decompiler. -/
 def tryDecompEqMpAutomationCast (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   let (fn, args) := peelArgs expr
   let some cname := fn.constName? | return none
   if cname != ``Eq.mp then return none
@@ -36,7 +36,7 @@ def tryDecompEqMpAutomationCast (expr : Expr) (lctx : LocalContext)
     return none
 
 def handlers : List (Expr → LocalContext → LocalInstances → List String → DecompileCallback →
-    MetaM (Option (Array (TSyntax `tactic) × List String))) := [
+    TacticM (Option (Array (TSyntax `tactic) × List String))) := [
   tryDecompEqMpAutomationCast
 ]
 

@@ -2,15 +2,39 @@ import Lean
 import Lean.PrettyPrinter
 
 namespace LeanDecomp
-open Lean Elab Meta PrettyPrinter
+open Lean Elab Meta PrettyPrinter Tactic
 
 /-- Type alias for the decompileExpr callback to avoid repetition -/
 abbrev DecompileCallback := Expr → LocalContext → LocalInstances → List String →
-    MetaM (Array (TSyntax `tactic) × List String)
+  TacticM (Array (TSyntax `tactic) × List String)
 
 /-- Type alias for the assignIntroNames callback -/
 abbrev AssignIntroNamesCallback := Array Expr → List String →
-    MetaM (List String × LocalContext × List String)
+  TacticM (List String × LocalContext × List String)
+
+/-- Build a tactic sequence from an array of tactics. -/
+def mkTacticSeq (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax ``Lean.Parser.Tactic.tacticSeq) := do
+  `(Lean.Parser.Tactic.tacticSeq| $[$tacs]*)
+
+/-- Build a focused tactic block for one recursively decompiled subgoal. -/
+def mkFocusedBlock (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax `tactic) := do
+  let seq ← mkTacticSeq tacs
+  `(tactic| · $seq:tacticSeq)
+
+/-- Emit a tactic that may create multiple goals, then recursively decompile one
+    proof term per generated goal into focused sub-blocks. This is the common
+    shape used by theorem-style decompiler passes. -/
+def emitTacticWithSubgoals (headTac : TSyntax `tactic) (subgoalProofs : Array Expr)
+    (lctx : LocalContext) (localInsts : LocalInstances) (used : List String)
+  (decompileExpr : DecompileCallback) : TacticM (Array (TSyntax `tactic) × List String) := do
+  let mut allTacs : Array (TSyntax `tactic) := #[headTac]
+  let mut used' := used
+  for proof in subgoalProofs do
+    let (subTacs, used'') ← decompileExpr proof lctx localInsts used'
+    let blockTac ← mkFocusedBlock subTacs
+    allTacs := allTacs.push blockTac
+    used' := used''
+  return (allTacs, used')
 
 def binderBaseName (idx : Nat) (name : Name) : String :=
   let raw := name.eraseMacroScopes.toString
@@ -37,7 +61,7 @@ def chooseIntroName (idx : Nat) (userName : Name) (used : List String) : (String
   let introName := mkUniqueName base used
   (introName, introName :: used)
 
-def assignIntroNames (xs : Array Expr) (used0 : List String) : MetaM (List String × LocalContext × List String) := do
+def assignIntroNames (xs : Array Expr) (used0 : List String) : TacticM (List String × LocalContext × List String) := do
   let mut used : List String := used0
   let mut idx := 0
   let mut names : List String := []
@@ -102,8 +126,9 @@ private def isGrindConst (n : Name) : Bool :=
   s.startsWith "Int.Linear." || s.startsWith "Lean.Grind." || s.startsWith "Lean.RArray."
 
 /-- Extract "interesting" subexpressions from a grind proof term.
-    These are applications of library lemmas (not structural, not grind-internal)
-    whose types are propositions. These can be added as `have` facts to help `omega`. -/
+  These are applications of library lemmas (not structural, not grind-internal)
+  whose types are propositions. Callers can turn them into named `have` facts
+  before continuing structural decompilation. -/
 def extractGrindFacts (e : Expr) : MetaM (Array Expr) := do
   let mut result : Array Expr := #[]
   let mut stack : List Expr := [e]

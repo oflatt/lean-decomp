@@ -67,9 +67,7 @@ info: Try this:
           (@LE.le.{0} Int Int.instLEInt (@OfNat.ofNat.{0} Int (nat_lit 5) (@instOfNat (nat_lit 5)))
             (@NatCast.natCast.{0} Int instNatCastInt n))
           ?_ ?_
-      · refine
-          @Nat.ToInt.le_eq (@OfNat.ofNat.{0} Nat (nat_lit 5) (instOfNatNat (nat_lit 5))) n
-            (@OfNat.ofNat.{0} Int (nat_lit 5) (@instOfNat (nat_lit 5))) (@NatCast.natCast.{0} Int instNatCastInt n) ?_ ?_
+      · refine Nat.ToInt.le_eq ?_ ?_
         · exact Nat.ToInt.natCast_ofNat 5
         · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
       · refine
@@ -117,7 +115,8 @@ info: Try this:
                 (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
                   (@HAdd.hAdd.{0, 0, 0} Int Int Int (@instHAdd.{0} Int Int.instAdd)
                     (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0)))
-                    (@IntCast.intCast.{0} Int instIntCastInt (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3))))))
+                    (@IntCast.intCast.{0} Int instIntCastInt
+                      (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3))))))
                 ?_ ?_
             · refine
                 @Lean.Grind.CommRing.le_norm_expr.{0} Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
@@ -134,25 +133,17 @@ info: Try this:
                   · exact Lean.Grind.instIsLinearOrderInt
               · exact Lean.Grind.instOrderedRingInt
               · decide
-            · refine
-                @of_eq_true
-                  (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
-                    (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3))))
-                  ?_
+            · refine of_eq_true ?_
               · refine
                   @Lean.Grind.Order.eq_trans_true'
                     (@LE.le.{0} Nat instLENat n (@OfNat.ofNat.{0} Nat (nat_lit 3) (instOfNatNat (nat_lit 3))))
                     (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
                       (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3))))
                     ?_ ?_
-                · refine
-                    @Nat.ToInt.le_eq n (@OfNat.ofNat.{0} Nat (nat_lit 3) (instOfNatNat (nat_lit 3)))
-                      (@NatCast.natCast.{0} Int instNatCastInt n)
-                      (@OfNat.ofNat.{0} Int (nat_lit 3) (@instOfNat (nat_lit 3))) ?_ ?_
+                · refine Nat.ToInt.le_eq ?_ ?_
                   · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
                   · exact Nat.ToInt.natCast_ofNat 3
-                · refine
-                    @eq_true (@LE.le.{0} Nat instLENat n (@OfNat.ofNat.{0} Nat (nat_lit 3) (instOfNatNat (nat_lit 3)))) ?_
+                · refine eq_true ?_
                   · exact h1
     · exact h2
 -/
@@ -160,7 +151,7 @@ info: Try this:
 example (n : Nat) (h1 : n ≤ 3) (h2 : 5 ≤ n) : False := by
   decompile grind
 
--- Test 7: grind byContradiction + derived have (no omega).
+-- Test 7: grind byContradiction + derived have.
 /--
 info: Try this:
   [apply] apply Classical.byContradiction
@@ -172,9 +163,7 @@ info: Try this:
           (@LE.le.{0} Int Int.instLEInt (@OfNat.ofNat.{0} Int (nat_lit 10) (@instOfNat (nat_lit 10)))
             (@NatCast.natCast.{0} Int instNatCastInt n))
           ?_ ?_
-      · refine
-          @Nat.ToInt.le_eq (@OfNat.ofNat.{0} Nat (nat_lit 10) (instOfNatNat (nat_lit 10))) n
-            (@OfNat.ofNat.{0} Int (nat_lit 10) (@instOfNat (nat_lit 10))) (@NatCast.natCast.{0} Int instNatCastInt n) ?_ ?_
+      · refine Nat.ToInt.le_eq ?_ ?_
         · exact Nat.ToInt.natCast_ofNat 10
         · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
       · refine
@@ -222,7 +211,8 @@ info: Try this:
                 (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
                   (@HAdd.hAdd.{0, 0, 0} Int Int Int (@instHAdd.{0} Int Int.instAdd)
                     (@OfNat.ofNat.{0} Int (nat_lit 0) (@instOfNat (nat_lit 0)))
-                    (@IntCast.intCast.{0} Int instIntCastInt (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4))))))
+                    (@IntCast.intCast.{0} Int instIntCastInt
+                      (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4))))))
                 ?_ ?_
             · refine
                 @Lean.Grind.CommRing.le_norm_expr.{0} Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
@@ -239,29 +229,19 @@ info: Try this:
                   · exact Lean.Grind.instIsLinearOrderInt
               · exact Lean.Grind.instOrderedRingInt
               · decide
-            · refine
-                @of_eq_true
-                  (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
-                    (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4))))
-                  ?_
+            · refine of_eq_true ?_
               · refine
                   @Lean.Grind.Order.eq_trans_true'
                     (@LE.le.{0} Nat instLENat n (@OfNat.ofNat.{0} Nat (nat_lit 4) (instOfNatNat (nat_lit 4))))
                     (@LE.le.{0} Int Int.instLEInt (@NatCast.natCast.{0} Int instNatCastInt n)
                       (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4))))
                     ?_ ?_
-                · refine
-                    @Nat.ToInt.le_eq n (@OfNat.ofNat.{0} Nat (nat_lit 4) (instOfNatNat (nat_lit 4)))
-                      (@NatCast.natCast.{0} Int instNatCastInt n)
-                      (@OfNat.ofNat.{0} Int (nat_lit 4) (@instOfNat (nat_lit 4))) ?_ ?_
+                · refine Nat.ToInt.le_eq ?_ ?_
                   · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
                   · exact Nat.ToInt.natCast_ofNat 4
-                · refine
-                    @eq_true (@LE.le.{0} Nat instLENat n (@OfNat.ofNat.{0} Nat (nat_lit 4) (instOfNatNat (nat_lit 4)))) ?_
+                · refine eq_true ?_
                   · refine @Eq.mp (n + 1 ≤ 5) (n ≤ 5 - 1) ?_ ?_
-                    · refine
-                        @Nat.Simproc.add_le_le n (@OfNat.ofNat.{0} Nat (nat_lit 1) (instOfNatNat (nat_lit 1)))
-                          (@OfNat.ofNat.{0} Nat (nat_lit 5) (instOfNatNat (nat_lit 5))) ?_
+                    · refine Nat.Simproc.add_le_le n ?_
                       · decide
                     · exact h
     · refine @Eq.mp (¬n ≤ 9) (9 + 1 ≤ n) ?_ ?_
@@ -269,8 +249,10 @@ info: Try this:
       · refine
           @mt (@LE.le.{0} Nat instLENat n (@OfNat.ofNat.{0} Nat (nat_lit 9) (instOfNatNat (nat_lit 9))))
             (@LT.lt.{0} Nat instLTNat n (@OfNat.ofNat.{0} Nat (nat_lit 10) (instOfNatNat (nat_lit 10)))) ?_ ?_
-        · exact fun b =>
-            Eq.symm (Eq.trans (Lean.Grind.Nat.lt_eq n 10) (Nat.Simproc.add_le_le n (of_decide_eq_true (Eq.refl true)))) ▸ b
+        ·
+          exact fun b =>
+            Eq.symm (Eq.trans (Lean.Grind.Nat.lt_eq n 10) (Nat.Simproc.add_le_le n (of_decide_eq_true (Eq.refl true)))) ▸
+              b
         · exact hp
 -/
 #guard_msgs (whitespace := lax) in

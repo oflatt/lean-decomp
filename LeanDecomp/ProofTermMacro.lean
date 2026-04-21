@@ -36,28 +36,34 @@ private def isAuxiliaryProofName (name : Name) : Bool :=
 private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
   Meta.deltaExpand e isAuxiliaryProofName (allowOpaque := true)
 
-/-- Run tactics, throwing a decompile error if they give an error -/
-private def runDecompiled (tactics : TSyntax `Lean.Parser.Tactic.tacticSeq) : TacticM Unit := do
+/-- Try running tactics against the current goal state, always restoring the
+    original state afterwards. Returns an error string on failure. -/
+private def checkDecompiled (tactics : TSyntax `Lean.Parser.Tactic.tacticSeq) : TacticM (Option String) := do
   let savedState ← saveState
   let savedMsgs ← Core.getMessageLog
   -- Suppress intermediate error messages during validation
   Core.setMessageLog {}
-  try
-    withCurrHeartbeats do
-      withoutRecover do
-        evalTactic tactics
-    -- Check if any errors were logged (e.g., by `cases` alternatives)
-    let newMsgs ← Core.getMessageLog
-    Core.setMessageLog savedMsgs
-    if newMsgs.hasErrors then
-      savedState.restore
-      let errMsgs := newMsgs.toList.filter (·.severity == .error)
-      let errStrs ← errMsgs.mapM (·.data.toString)
-      logError m!"decompile failed: generated tactics did not re-elaborate\n{"\n".intercalate errStrs}"
-  catch e =>
-    savedState.restore
-    Core.setMessageLog savedMsgs
-    logError m!"decompile failed: generated tactics did not re-elaborate\n{← e.toMessageData.toString}"
+  let result ← try
+      withCurrHeartbeats do
+        withoutRecover do
+          evalTactic tactics
+      let newMsgs ← Core.getMessageLog
+      if newMsgs.hasErrors then
+        let errMsgs := newMsgs.toList.filter (·.severity == .error)
+        let errStrs ← errMsgs.mapM (·.data.toString)
+        pure (some ("\n".intercalate errStrs))
+      else
+        pure none
+    catch e =>
+      pure (some (← e.toMessageData.toString))
+  savedState.restore
+  Core.setMessageLog savedMsgs
+  return result
+
+private def buildDecompiledTactics (proof : Expr) (lctx : LocalContext)
+    (localInstances : LocalInstances) : TacticM (Array (TSyntax `tactic)) := do
+  let (tactics, _) ← decompileExpr proof lctx localInstances []
+  simplifyTactics tactics
 
 
 /--
@@ -78,17 +84,17 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   let simplifiedProof ← simplifyProofTerm expandedProof
   let lctx ← getLCtx
   let localInstances ← getLocalInstances
-  -- Decompile to syntax (delabToRefinableSyntax has its own pp.all fallback)
-  let (tactics, _) ← decompileExpr simplifiedProof lctx localInstances []
-  let tactics ← simplifyTactics tactics
+  let tactics ← buildDecompiledTactics simplifiedProof lctx localInstances
+  let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
 
-  -- restore the original state with the original goal
+  -- restore the original state with the original goal before validating
   stateBefore.restore
 
-  -- run the newly generated tactics to ensure they work
-
-  -- Build a tacticSeq from the array of tactics
-  let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
+  match ← checkDecompiled tacticSeq with
+  | some err =>
+      logError m!"decompile failed: generated tactics did not re-elaborate\n{err}"
+      return
+  | none => pure ()
 
   -- Check if the decompiled proof is too large, which indicates the decompiler
   -- fell through to raw `exact` terms for constructs it doesn't handle yet.
@@ -110,8 +116,7 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   if tacticStr.length > maxSize then
     logError m!"decompile failed: generated proof too large ({tacticStr.length} chars, max {maxSize}). The decompiler likely lacks handlers for some proof term constructs."
     return
-
-  runDecompiled tacticSeq
+  evalTactic tacticSeq
   addSuggestion tk { suggestion := .string codeActionStr } (origSpan? := ← getRef)
 
 /--

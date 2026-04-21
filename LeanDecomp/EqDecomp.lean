@@ -4,17 +4,8 @@ import Lean.PrettyPrinter
 import LeanDecomp.Helpers
 
 namespace LeanDecomp
-open Lean Elab Meta PrettyPrinter
+open Lean Elab Meta PrettyPrinter Tactic
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
-
-/-- Build a tacticSeq from an array of tactics. -/
-private def mkTacticSeq (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax ``Lean.Parser.Tactic.tacticSeq) := do
-  `(Lean.Parser.Tactic.tacticSeq| $[$tacs]*)
-
-/-- Build a focused tactic block for one subgoal. -/
-private def mkFocusedBlock (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax `tactic) := do
-  let seq ← mkTacticSeq tacs
-  `(tactic| · $seq:tacticSeq)
 
 private def mkCleanIdent (name : Name) : Ident :=
   let raw := name.eraseMacroScopes.toString.toRawSubstring
@@ -154,7 +145,7 @@ where
 /-- Handle `congr` by naming function/argument equalities and recombining them. -/
 def tryDecompCongr (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
     let (fn, args) := peelApps expr
     let some constName := Expr.constName? fn
@@ -191,7 +182,7 @@ def tryDecompCongr (expr : Expr) (lctx : LocalContext)
 /-- Handle `congrArg` by naming the input equality and applying `congrArg`. -/
 def tryDecompCongrArg (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
     let (fn, args) := peelApps expr
     let some constName := Expr.constName? fn
@@ -247,7 +238,7 @@ private partial def getCalcSteps (proof : Expr) (acc : Array (TSyntax ``calcStep
 /-- Handle `Eq.symm` by naming the input equality and reusing `Eq.symm`. -/
 def tryDecompEqSymm (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
     let (fn, args) := peelApps expr
     let some constName := Expr.constName? fn
@@ -273,7 +264,7 @@ def tryDecompEqSymm (expr : Expr) (lctx : LocalContext)
 /-- Handle `Eq.trans` by normalizing (calcify-style) and emitting a `calc` block. -/
 def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
-    : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
     let (fn, args) := peelApps expr
     let some constName := Expr.constName? fn
@@ -310,7 +301,7 @@ def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
   This avoids raw delab/re-elab of arithmetic certificate terms. -/
 def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
     let (fn, args) := peelApps expr
     let some constName := Expr.constName? fn
@@ -348,14 +339,11 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
 
     let targetTy ← Meta.inferType expr
     let eqProofNorm ← simplifyEqProof eqProofArg
-    let (eqTactics, used') ← decompileExpr eqProofNorm lctx localInsts used
-    let (srcTactics, used'') ← decompileExpr sourceProofArg lctx localInsts used'
     let sourceTyStx ← delabToRefinableSyntax sourceTy
     let targetTyStx ← delabToRefinableSyntax targetTy
     let eqMpIdent := mkCleanIdent ``Eq.mp
     let refineTac ← `(tactic| refine @$eqMpIdent:ident $sourceTyStx $targetTyStx ?_ ?_)
-    let eqBlock ← mkFocusedBlock eqTactics
-    let srcBlock ← mkFocusedBlock srcTactics
-    return some (#[refineTac, eqBlock, srcBlock], used'')
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[eqProofNorm, sourceProofArg] lctx localInsts used decompileExpr
+    return some result
 
 end LeanDecomp
