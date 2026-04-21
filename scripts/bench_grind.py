@@ -82,9 +82,11 @@ def extract_profiler_times(output: str) -> dict[str, float]:
         if stripped == "cumulative profiling times:":
             in_section = True
         elif in_section:
-            m = re.match(r"(.+?)\s+([\d.]+)ms\s*$", stripped)
+            m = re.match(r"(.+?)\s+([\d.]+)(ms|s)\s*$", stripped)
             if m:
-                times[m.group(1).strip()] = float(m.group(2)) / 1000.0
+                value = float(m.group(2))
+                unit = m.group(3)
+                times[m.group(1).strip()] = value / 1000.0 if unit == "ms" else value
             elif stripped:
                 in_section = False
     return times
