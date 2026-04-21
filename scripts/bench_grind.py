@@ -61,10 +61,13 @@ def _ensure_mathlib_tactic_built(workspace: Path | str) -> None:
     global MATHLIB_TACTIC_BUILT
     if MATHLIB_TACTIC_BUILT:
         return
-    code, _, output = run_cmd(["lake", "build", "Mathlib.Tactic"], workspace)
+    print("  Building Mathlib.Tactic eagerly...", flush=True)
+    code, elapsed, output = run_cmd(["lake", "build", "Mathlib.Tactic"], workspace)
+    print(f"  Mathlib.Tactic build finished: exit={code}, elapsed={elapsed:.2f}s", flush=True)
     if code != 0:
         raise RuntimeError(f"Failed to build Mathlib.Tactic:\n{output}")
     MATHLIB_TACTIC_BUILT = True
+
 
 # ---------------------------------------------------------------------------
 # Output parsing

@@ -7,6 +7,15 @@ namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
+/-- Build a tacticSeq from an array of tactics. -/
+private def mkTacticSeq (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax ``Lean.Parser.Tactic.tacticSeq) := do
+  `(Lean.Parser.Tactic.tacticSeq| $[$tacs]*)
+
+/-- Build a focused tactic block for one subgoal. -/
+private def mkFocusedBlock (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax `tactic) := do
+  let seq ← mkTacticSeq tacs
+  `(tactic| · $seq:tacticSeq)
+
 /-- Local argument peeler to avoid cross-module utility coupling. -/
 private def peelApps (e : Expr) : Expr × List Expr :=
   let rec go (e : Expr) (acc : List Expr) : Expr × List Expr :=
@@ -292,8 +301,9 @@ def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
       let tac ← `(tactic| exact $proofStx)
       return some (#[tac], used)
 
-/-- Handle `Eq.mp` casts to `False` by naming the equality proof and applying
-    it to the source proof (e.g. `True.intro`). -/
+/-- Handle `Eq.mp` casts structurally by refining with holes for the transport
+  equality and transported proof, then recursively decompiling both sides.
+  This avoids raw delab/re-elab of arithmetic certificate terms. -/
 def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
     : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
@@ -304,11 +314,6 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
     if constName != ``Eq.mp then
       return none
 
-    let falseTy := mkConst ``False
-    let exprTy ← Meta.inferType expr
-    if !(← Meta.isDefEq exprTy falseTy) then
-      return none
-
     let mut eqProofArg? : Option Expr := none
     let mut sourceTy? : Option Expr := none
     for a in args do
@@ -316,20 +321,14 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
       let (tyFn, tyArgs) := peelApps aTy
       if tyFn.isConstOf ``Eq && tyArgs.length >= 3 then
         let lhs := tyArgs[1]!
-        let rhs := tyArgs[2]!
-        if (← Meta.isDefEq rhs falseTy) then
-          eqProofArg? := some a
-          sourceTy? := some lhs
-          break
+        eqProofArg? := some a
+        sourceTy? := some lhs
+        break
 
     let some eqProofArg := eqProofArg?
       | return none
     let some sourceTy := sourceTy?
       | return none
-    -- Skip when the equality proof contains grind internals — structural
-    -- decompilation would produce huge output with non-re-elaboratable terms.
-    -- Fall through to decompExact instead.
-    if containsGrindInternals eqProofArg then return none
 
     let mut sourceProofArg? : Option Expr := none
     for a in args do
@@ -343,17 +342,15 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
     let some sourceProofArg := sourceProofArg?
       | return none
 
+    let targetTy ← Meta.inferType expr
     let eqProofNorm ← simplifyEqProof eqProofArg
     let (eqTactics, used') ← decompileExpr eqProofNorm lctx localInsts used
-
-    let (eqName, used'') := chooseIntroName used'.length `hEq used'
-    let eqIdent := mkIdent (Name.mkSimple eqName)
-    let eqTyStx ← delabToRefinableSyntax (← Meta.inferType eqProofArg)
-    let eqTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$eqTactics]*)
-    let letEqTac ← `(tactic| let $eqIdent : $eqTyStx := by $eqTacticSeq)
-
-    let sourceProofStx ← delabToRefinableSyntax sourceProofArg
-    let exactTac ← `(tactic| exact $(mkIdent ``Eq.mp) $eqIdent $sourceProofStx)
-    return some (#[letEqTac, exactTac], used'')
+    let (srcTactics, used'') ← decompileExpr sourceProofArg lctx localInsts used'
+    let sourceTyStx ← delabToRefinableSyntax sourceTy
+    let targetTyStx ← delabToRefinableSyntax targetTy
+    let refineTac ← `(tactic| refine @Eq.mp $sourceTyStx $targetTyStx ?_ ?_)
+    let eqBlock ← mkFocusedBlock eqTactics
+    let srcBlock ← mkFocusedBlock srcTactics
+    return some (#[refineTac, eqBlock, srcBlock], used'')
 
 end LeanDecomp

@@ -27,7 +27,7 @@ private structure OmegaFactState where
 private def OmegaFactState.addFact (s : OmegaFactState)
     (proofExpr : Expr) (propType : Expr) (proofStx : TSyntax `term)
     : MetaM OmegaFactState := do
-  if containsGrindInternals propType then return s
+  if containsAutomationInternals propType then return s
   let isDup ← s.derivedFacts.anyM fun x =>
     try Meta.isDefEq propType x.2.1 catch _ => pure false
   if isDup then return s
@@ -38,7 +38,7 @@ private def OmegaFactState.addFact (s : OmegaFactState)
   -- have-statement re-elaborates correctly (the syntactic shorthand may not type-check as False).
   -- Skip if the proof expression itself contains grind internals (would produce unreadable syntax).
   let effectiveStx ← if isFalse then
-    if containsGrindInternals proofExpr then return s
+    if containsAutomationInternals proofExpr then return s
     else try delabToRefinableSyntax proofExpr catch _ => pure proofStx
   else
     pure proofStx
@@ -86,7 +86,7 @@ private def tryOmegaWithContext (goalType : Expr) (lctx : LocalContext) :
 private partial def stripGrindCasts : Expr → Expr
   | e =>
     let (fn, args) := peelArgs e
-    if fn.constName? == some ``Eq.mp && args.length >= 4 && containsGrindInternals args[2]! then
+    if fn.constName? == some ``Eq.mp && args.length >= 4 && containsAutomationInternals args[2]! then
       stripGrindCasts args[3]!
     else e
 
@@ -275,7 +275,7 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String)
     (decompile : Expr → LocalContext → LocalInstances → List String → MetaM (Array (TSyntax `tactic) × List String))
     : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
-  if !containsGrindInternals expr then return none
+  if !containsAutomationInternals expr then return none
   withLCtx lctx localInsts do
     let goalType ← Meta.inferType expr
     -- Context hypotheses and name map
@@ -370,7 +370,7 @@ partial def tryDecompOmega (expr : Expr) (lctx : LocalContext)
       let (proofExpr, propTy, proofStx) := s.derivedFacts[i]!
       let factIdent := mkIdent s.factNames[i]!
       let haveTac ←
-        if containsGrindInternals proofExpr then
+        if containsAutomationInternals proofExpr then
           `(tactic| have $factIdent := $proofStx)
         else
           try
