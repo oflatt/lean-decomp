@@ -7,6 +7,25 @@ namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter Tactic
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
+private partial def containsEagerReduce (e : Expr) : Bool :=
+  Expr.find? (fun sub =>
+    match sub.getAppFn.constName? with
+    | some n => n == ``eagerReduce
+    | none => false) e |>.isSome
+
+private partial def containsConstName (e : Expr) (target : Name) : Bool :=
+  Expr.find? (fun sub => sub.getAppFn.constName? == some target) e |>.isSome
+
+/-- Some proposition-equality proof terms delaborate into anonymous structure
+    literals like `{ mp := ..., mpr := ... }`, which are fragile in calc steps
+    because the expected structure type is often not inferable there. Route
+    these through recursive tactic generation instead of raw term reuse. -/
+private def shouldRecursivelyDecompileCalcProof (proof : Expr) : Bool :=
+  containsEagerReduce proof ||
+    containsAutomationInternals proof ||
+    containsConstName proof ``propext ||
+    containsConstName proof ``Iff.intro
+
 private def mkCleanIdent (name : Name) : Ident :=
   let raw := name.eraseMacroScopes.toString.toRawSubstring
   TSyntax.mk (Syntax.ident SourceInfo.none raw name.eraseMacroScopes [])
@@ -161,23 +180,9 @@ def tryDecompCongr (expr : Expr) (lctx : LocalContext)
       | return none
     let some _ ← inferEqType? hEqArg
       | return none
-
-    let (eqFnTactics, used1) ← decompileExpr hEqFn lctx localInsts used
-    let (eqFnName, used2) := chooseIntroName used1.length `hEqFn used1
-    let eqFnIdent := mkIdent (Name.mkSimple eqFnName)
-    let eqFnTyStx ← delabToRefinableSyntax (← Meta.inferType hEqFn)
-    let eqFnSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$eqFnTactics]*)
-    let letEqFnTac ← `(tactic| let $eqFnIdent : $eqFnTyStx := by $eqFnSeq)
-
-    let (eqArgTactics, used3) ← decompileExpr hEqArg lctx localInsts used2
-    let (eqArgName, used4) := chooseIntroName used3.length `hEqArg used3
-    let eqArgIdent := mkIdent (Name.mkSimple eqArgName)
-    let eqArgTyStx ← delabToRefinableSyntax (← Meta.inferType hEqArg)
-    let eqArgSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$eqArgTactics]*)
-    let letEqArgTac ← `(tactic| let $eqArgIdent : $eqArgTyStx := by $eqArgSeq)
-
-    let exactTac ← `(tactic| exact $(mkIdent ``congr) $eqFnIdent $eqArgIdent)
-    return some (#[letEqFnTac, letEqArgTac, exactTac], used4)
+    let refineTac ← `(tactic| refine $(mkIdent ``congr) ?_ ?_)
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[hEqFn, hEqArg] lctx localInsts used decompileExpr
+    return some result
 
 /-- Handle `congrArg` by naming the input equality and applying `congrArg`. -/
 def tryDecompCongrArg (expr : Expr) (lctx : LocalContext)
@@ -197,43 +202,53 @@ def tryDecompCongrArg (expr : Expr) (lctx : LocalContext)
     let some _ ← inferEqType? hEq
       | return none
 
-    let (eqTactics, used1) ← decompileExpr hEq lctx localInsts used
-    let (eqName, used2) := chooseIntroName used1.length `hEq used1
-    let eqIdent := mkIdent (Name.mkSimple eqName)
-    let eqTyStx ← delabToRefinableSyntax (← Meta.inferType hEq)
-    let eqSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$eqTactics]*)
-    let letEqTac ← `(tactic| let $eqIdent : $eqTyStx := by $eqSeq)
-
     let fStx ← delabToRefinableSyntax f
-    let exactTac ← `(tactic| exact $(mkIdent ``congrArg) $fStx $eqIdent)
-    return some (#[letEqTac, exactTac], used2)
+    let refineTac ← `(tactic| refine $(mkIdent ``congrArg) $fStx ?_)
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[hEq] lctx localInsts used decompileExpr
+    return some result
 
-/-- Render a single calc step proof as a term (calcify-style). -/
-private partial def getCalcProof (proof : Expr) : MetaM Term :=
+/-- Render a single calc step proof as a term (calcify-style).
+
+    For automation-heavy proof terms, prefer a term-level `by` block driven by
+    recursive decompilation instead of re-elaborating the full raw term.
+    This avoids brittle `eagerReduce` certificates and anonymous `Iff`
+    structure literals that do not survive a plain delab/re-elab roundtrip. -/
+private partial def getCalcProof (proof : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+    : TacticM (Term × List String) := do
   match_expr proof with
   | Eq.symm _ _ _ h => do
-    let h ← getCalcProof h
-    `($(h).$(mkIdent `symm))
-  | _ => delabToRefinableSyntax proof
+    let (h, used') ← getCalcProof h lctx localInsts used decompileExpr
+    return ((← `(term| ($(h)).$(mkIdent `symm))), used')
+  | _ => do
+    if shouldRecursivelyDecompileCalcProof proof then
+      let (proofTactics, used') ← decompileExpr proof lctx localInsts used
+      let term ← `(term| by $proofTactics:tactic*)
+      return (term, used')
+    let termStx ← delabToRefinableSyntax proof
+    return (termStx, used)
 
 /-- Walk a normalized `Eq.trans` chain collecting `calcStep` syntax nodes.
     Skips `Eq.refl` steps since they are no-ops. -/
 private partial def getCalcSteps (proof : Expr) (acc : Array (TSyntax ``calcStep))
-    : MetaM (Array (TSyntax ``calcStep)) :=
+    (lctx : LocalContext) (localInsts : LocalInstances) (used : List String)
+    (decompileExpr : DecompileCallback) : TacticM (Array (TSyntax ``calcStep) × List String) :=
   match_expr proof with
   | Eq.trans _ _ rhs _ p1 p2 => do
     match_expr p1 with
-    | Eq.refl _ _ => getCalcSteps p2 acc  -- skip refl steps
+    | Eq.refl _ _ => getCalcSteps p2 acc lctx localInsts used decompileExpr  -- skip refl steps
     | _ =>
-      let step ← `(calcStep| _ = $(← delabToRefinableSyntax rhs) := $(← getCalcProof p1))
-      getCalcSteps p2 (acc.push step)
-  | Eq.refl _ _ => return acc  -- skip trailing refl
+      let (proofStx, used') ← getCalcProof p1 lctx localInsts used decompileExpr
+      let step ← `(calcStep| _ = $(← delabToRefinableSyntax rhs) := $proofStx)
+      getCalcSteps p2 (acc.push step) lctx localInsts used' decompileExpr
+  | Eq.refl _ _ => return (acc, used)  -- skip trailing refl
   | _ => do
     let type ← whnf (← Meta.inferType proof)
     let some (_, _, rhs) := type.eq?
       | throwError "Expected proof of equality, got {type}"
-    let step ← `(calcStep| _ = $(← delabToRefinableSyntax rhs) := $(← getCalcProof proof))
-    return acc.push step
+    let (proofStx, used') ← getCalcProof proof lctx localInsts used decompileExpr
+    let step ← `(calcStep| _ = $(← delabToRefinableSyntax rhs) := $proofStx)
+    return (acc.push step, used')
 
 /-- Handle `Eq.symm` by naming the input equality and reusing `Eq.symm`. -/
 def tryDecompEqSymm (expr : Expr) (lctx : LocalContext)
@@ -250,20 +265,13 @@ def tryDecompEqSymm (expr : Expr) (lctx : LocalContext)
       | return none
     let some (_α, _lhs, _rhs) ← inferEqType? inEq
       | return none
-
-    let (eqTactics, used') ← decompileExpr inEq lctx localInsts used
-    let (eqName, used'') := chooseIntroName used'.length `hEq used'
-    let eqIdent := mkIdent (Name.mkSimple eqName)
-    let eqTyStx ← delabToRefinableSyntax (← Meta.inferType inEq)
-    let eqTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$eqTactics]*)
-    let letEqTac ← `(tactic| let $eqIdent : $eqTyStx := by $eqTacticSeq)
-
-    let exactTac ← `(tactic| exact $(mkIdent ``Eq.symm) $eqIdent)
-    return some (#[letEqTac, exactTac], used'')
+    let refineTac ← `(tactic| refine $(mkIdent ``Eq.symm) ?_)
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[inEq] lctx localInsts used decompileExpr
+    return some result
 
 /-- Handle `Eq.trans` by normalizing (calcify-style) and emitting a `calc` block. -/
 def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
+  (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
     let (fn, args) := peelApps expr
@@ -285,11 +293,11 @@ def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
       let tac ← `(tactic| rfl)
       return some (#[tac], used)
     | Eq.trans _ _ _ _ _ _ => do
-      let stepStx ← getCalcSteps exprNorm #[]
+      let (stepStx, used') ← getCalcSteps exprNorm #[] lctx localInsts used decompileExpr
       let calcTac ← `(tactic| calc
             $(← delabToRefinableSyntax lhs):term
             $stepStx*)
-      return some (#[calcTac], used)
+      return some (#[calcTac], used')
     | _ => do
       -- Single-step result after normalization; just delaborate it
       let proofStx ← delabToRefinableSyntax exprNorm

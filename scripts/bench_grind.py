@@ -26,8 +26,6 @@ from typing import Callable
 
 from bench_db import BenchDB
 
-MATHLIB_TACTIC_BUILT = False
-
 # ---------------------------------------------------------------------------
 # Subprocess helpers
 # ---------------------------------------------------------------------------
@@ -55,18 +53,6 @@ def _ensure_import(source: str, module: str) -> str:
             insert_at = i + 1
     lines.insert(insert_at, f"import {module}")
     return "\n".join(lines)
-
-
-def _ensure_mathlib_tactic_built(workspace: Path | str) -> None:
-    global MATHLIB_TACTIC_BUILT
-    if MATHLIB_TACTIC_BUILT:
-        return
-    print("  Building Mathlib.Tactic eagerly...", flush=True)
-    code, elapsed, output = run_cmd(["lake", "build", "Mathlib.Tactic"], workspace)
-    print(f"  Mathlib.Tactic build finished: exit={code}, elapsed={elapsed:.2f}s", flush=True)
-    if code != 0:
-        raise RuntimeError(f"Failed to build Mathlib.Tactic:\n{output}")
-    MATHLIB_TACTIC_BUILT = True
 
 
 # ---------------------------------------------------------------------------
@@ -289,14 +275,31 @@ def _demodulify(source: str) -> str:
     return "\n".join(out)
 
 
+def _strip_module_boundary_checks(source: str) -> str:
+    """Remove `assert_not_exists` checks from generated query files.
+
+    These assertions enforce import boundaries in mathlib source files, but the
+    generated decompile queries intentionally inject `LeanDecomp.ProofTermMacro`,
+    so preserving the checks causes unrelated query-generation failures.
+    """
+    return "\n".join(
+        line for line in source.split("\n")
+        if not line.strip().startswith("assert_not_exists ")
+    )
+
+
 def _make_decompile_at_line(source: str, target_line: int) -> str:
-    """Replace the grind at target_line with 'decompile grind', demodulify, add import."""
+    """Replace the grind at target_line with 'decompile grind' and add decompile support.
+
+    The source file already compiled with whatever imports it needed for
+    `grind`, so the generated query only adds the decompile tactic import.
+    """
     lines = source.split("\n")
     idx = target_line - 1
     lines[idx] = GRIND_RE.sub("decompile grind", lines[idx], count=1)
     transformed = "\n".join(lines)
     transformed = _demodulify(transformed)
-    transformed = _ensure_import(transformed, "Mathlib.Tactic")
+    transformed = _strip_module_boundary_checks(transformed)
     # Insert decompile tactic import after last import line
     lines = transformed.split("\n")
     insert_at = 0
@@ -377,8 +380,6 @@ def _get_line_suggestions(workspace: Path, source: str, grind_line: int, query_t
                           lean_file: str, treatment_name: str) -> tuple[list[str], Path, str]:
     """Run a query for one grind line. Return (suggestions, query_path, raw_output)."""
     query_source = query_transform(source, grind_line)
-    if "import Mathlib.Tactic" in query_source:
-        _ensure_mathlib_tactic_built(workspace)
     query_path = Path(str(lean_file) + suffix)
     (workspace / query_path).write_text(query_source)
     print(
@@ -410,9 +411,6 @@ def _try_line_suggestion(workspace: Path, source: str, grind_line: int, suggesti
             flush=True,
         )
         replaced = _transform_grind_at_line(source, grind_line, s)
-        if treatment_name == "decompile":
-            replaced = _ensure_import(replaced, "Mathlib.Tactic")
-            _ensure_mathlib_tactic_built(workspace)
         (workspace / result_path).write_text(replaced)
         code, elapsed, output = lake_env_lean(workspace, result_path)
         print(

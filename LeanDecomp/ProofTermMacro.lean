@@ -39,6 +39,7 @@ private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
 /-- Try running tactics against the current goal state, always restoring the
     original state afterwards. Returns an error string on failure. -/
 private def checkDecompiled (tactics : TSyntax `Lean.Parser.Tactic.tacticSeq) : TacticM (Option String) := do
+  let tacticStr := toString (← PrettyPrinter.ppTactic ⟨tactics⟩)
   let savedState ← saveState
   let savedMsgs ← Core.getMessageLog
   -- Suppress intermediate error messages during validation
@@ -51,11 +52,11 @@ private def checkDecompiled (tactics : TSyntax `Lean.Parser.Tactic.tacticSeq) : 
       if newMsgs.hasErrors then
         let errMsgs := newMsgs.toList.filter (·.severity == .error)
         let errStrs ← errMsgs.mapM (·.data.toString)
-        pure (some ("\n".intercalate errStrs))
+        pure (some s!"generated tactics:\n{tacticStr}\n\n{"\n".intercalate errStrs}" )
       else
         pure none
     catch e =>
-      pure (some (← e.toMessageData.toString))
+      pure (some s!"generated tactics:\n{tacticStr}\n\n{← e.toMessageData.toString}")
   savedState.restore
   Core.setMessageLog savedMsgs
   return result

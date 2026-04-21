@@ -146,7 +146,8 @@ private partial def containsCastLike (e : Expr) : Bool :=
 
 private def hasProblematicEvidence (e : Expr) : Bool :=
   containsAutomationInternals e || containsConstName e ``eagerReduce ||
-    containsConstName e ``of_decide_eq_true || containsCastLike e
+    containsConstName e ``of_decide_eq_true || containsConstName e ``propext ||
+    containsConstName e ``Iff.intro || containsCastLike e
 
 /-- Return `true` when the head of the application looks like a theorem-level
     proof constructor rather than data construction. This is intentionally broad:
@@ -472,7 +473,12 @@ mutual
       with the same all-transparency setting grind used to build the term. -/
   private partial def decompExact (body : Expr) (used : List String) :
       TacticM (Array (TSyntax `tactic) × List String) := do
-    let termStx ← delabToRefinableSyntax body
+    let usePrettyPrintedTerm :=
+      containsEagerReduce body || containsConstName body ``propext || containsConstName body ``Iff.intro
+    let termStx ← if usePrettyPrintedTerm then
+        ppExprToTermSyntaxWith body true
+      else
+        delabToRefinableSyntax body
     if containsEagerReduce body then
       let tac ← `(tactic| with_unfolding_all exact $termStx)
       return (#[tac], used)
