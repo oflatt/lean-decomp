@@ -16,6 +16,10 @@ private def mkFocusedBlock (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax `ta
   let seq ← mkTacticSeq tacs
   `(tactic| · $seq:tacticSeq)
 
+private def mkCleanIdent (name : Name) : Ident :=
+  let raw := name.eraseMacroScopes.toString.toRawSubstring
+  TSyntax.mk (Syntax.ident SourceInfo.none raw name.eraseMacroScopes [])
+
 /-- Local argument peeler to avoid cross-module utility coupling. -/
 private def peelApps (e : Expr) : Expr × List Expr :=
   let rec go (e : Expr) (acc : List Expr) : Expr × List Expr :=
@@ -348,7 +352,8 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
     let (srcTactics, used'') ← decompileExpr sourceProofArg lctx localInsts used'
     let sourceTyStx ← delabToRefinableSyntax sourceTy
     let targetTyStx ← delabToRefinableSyntax targetTy
-    let refineTac ← `(tactic| refine @Eq.mp $sourceTyStx $targetTyStx ?_ ?_)
+    let eqMpIdent := mkCleanIdent ``Eq.mp
+    let refineTac ← `(tactic| refine @$eqMpIdent:ident $sourceTyStx $targetTyStx ?_ ?_)
     let eqBlock ← mkFocusedBlock eqTactics
     let srcBlock ← mkFocusedBlock srcTactics
     return some (#[refineTac, eqBlock, srcBlock], used'')

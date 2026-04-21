@@ -4,6 +4,7 @@ import Lean.PrettyPrinter
 import LeanDecomp.Helpers
 import LeanDecomp.CasesOn
 import LeanDecomp.EqDecomp
+import LeanDecomp.Specialized
 import LeanDecomp.Simplify
 import LeanDecomp.Omega
 
@@ -116,7 +117,7 @@ mutual
           let specialized? ← firstSomeM [
             tryDecompByContradiction body lctx localInsts used,
             tryDecompCasesOn body lctx localInsts used decompileExpr assignIntroNames,
-            tryDecompEqMpGrindCast body lctx localInsts used,
+            trySpecializedDecompHandlers body lctx localInsts used decompileExpr,
             -- We are not using the omega pass for now; prefer the raw structural
             -- decompiler path while investigating no-omega decompilation.
             LeanDecomp.tryDecompCongr body lctx localInsts used decompileExpr,
@@ -373,37 +374,6 @@ mutual
         used' := used''
 
       return some (allTacs, used')
-
-  /-- Strip `Eq.mp <cast> inner` when the cast contains grind internals
-      and the inner proof's type matches the goal. Grind wraps proof terms in
-      type-normalization casts that are logically transparent — we skip the cast
-      and recurse on the inner proof via the main decompiler. -/
-  private partial def tryDecompEqMpGrindCast (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : MetaM (Option (Array (TSyntax `tactic) × List String)) := do
-    let (fn, args) := peelArgs expr
-    let some cname := fn.constName? | return none
-    if cname != ``Eq.mp then return none
-    if args.length < 4 then return none
-    let eqProof := args[2]!
-    let inner := args[3]!
-    -- Only strip when the cast itself is grind normalization junk
-    if !containsAutomationInternals eqProof then return none
-    -- When inner is True.intro, the meaningful content is in the equality chain,
-    -- not the inner term. Let tryDecompEqMp handle these structurally.
-    let (innerFn, _) := peelArgs inner
-    if innerFn.isConstOf ``True.intro then return none
-    -- Reconstruct the inner expression with any extra args (over-application)
-    let innerWithArgs := (args.drop 4).foldl (init := inner) fun acc arg => mkApp acc arg
-    withLCtx lctx localInsts do
-      let goalType ← Meta.inferType expr
-      let innerType ← Meta.inferType innerWithArgs
-      -- Only handle when types match — strip the cast and let the main decompiler recurse.
-      -- When types differ (grind normalization changed the type), leave the term to the
-      -- remaining structural handlers or the final exact fallback.
-      if ← Meta.isDefEq goalType innerType then
-        let (tactics, used') ← decompileExpr innerWithArgs lctx localInsts used
-        return some (tactics, used')
-      return none
 
   /-- Return `true` if `e` (or any subterm) contains a `@eagerReduce _ _` application.
       Grind emits these as kernel-eager-reduction gadgets inside arithmetic

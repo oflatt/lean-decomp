@@ -60,7 +60,7 @@ example : ∀ n : Nat, 0 + n = n := by
 -- `eagerReduce (Eq.refl true)` certificate gadgets with holes closed by `rfl`.
 /--
 info: Try this:
-  [apply] refine @Eq.mp✝ (5 ≤ n) False ?_ ?_
+  [apply] refine @Eq.mp (5 ≤ n) False ?_ ?_
     · refine
         @Lean.Grind.Order.eq_trans_false
           (@LE.le.{0} Nat instLENat (@OfNat.ofNat.{0} Nat (nat_lit 5) (instOfNatNat (nat_lit 5))) n)
@@ -165,7 +165,7 @@ example (n : Nat) (h1 : n ≤ 3) (h2 : 5 ≤ n) : False := by
 info: Try this:
   [apply] apply Classical.byContradiction
     intro hp
-    refine @Eq.mp✝ (10 ≤ n) False ?_ ?_
+    refine @Eq.mp (10 ≤ n) False ?_ ?_
     · refine
         @Lean.Grind.Order.eq_trans_false
           (@LE.le.{0} Nat instLENat (@OfNat.ofNat.{0} Nat (nat_lit 10) (instOfNatNat (nat_lit 10))) n)
@@ -258,13 +258,13 @@ info: Try this:
                   · exact Nat.ToInt.natCast_ofNat 4
                 · refine
                     @eq_true (@LE.le.{0} Nat instLENat n (@OfNat.ofNat.{0} Nat (nat_lit 4) (instOfNatNat (nat_lit 4)))) ?_
-                  · refine @Eq.mp✝ (n + 1 ≤ 5) (n ≤ 5 - 1) ?_ ?_
+                  · refine @Eq.mp (n + 1 ≤ 5) (n ≤ 5 - 1) ?_ ?_
                     · refine
                         @Nat.Simproc.add_le_le n (@OfNat.ofNat.{0} Nat (nat_lit 1) (instOfNatNat (nat_lit 1)))
                           (@OfNat.ofNat.{0} Nat (nat_lit 5) (instOfNatNat (nat_lit 5))) ?_
                       · decide
                     · exact h
-    · refine @Eq.mp✝ (¬n ≤ 9) (9 + 1 ≤ n) ?_ ?_
+    · refine @Eq.mp (¬n ≤ 9) (9 + 1 ≤ n) ?_ ?_
       · exact Nat.not_le_eq n 9
       · refine
           @mt (@LE.le.{0} Nat instLENat n (@OfNat.ofNat.{0} Nat (nat_lit 9) (instOfNatNat (nat_lit 9))))
