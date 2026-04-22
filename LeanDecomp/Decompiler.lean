@@ -382,13 +382,7 @@ mutual
       let (fn, _) := peelArgs expr
       let some constName := fn.constName? | return none
       if constName != ``Eq.refl then return none
-      let exprTy ← Meta.inferType expr
-      let tac ← if containsCastLike exprTy then
-          let termStx ← withOptions (fun o => o.setBool `pp.all true) do
-            ppExprToTermSyntax expr
-          `(tactic| exact $termStx)
-        else
-          `(tactic| rfl)
+      let tac ← `(tactic| rfl)
       return some (#[tac], used)
 
   /-- Late fallback for theorem applications: refine with holes for proof

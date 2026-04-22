@@ -64,7 +64,7 @@ info: Try this:
     · refine @Lean.Grind.Order.eq_trans_false ((5 : Nat) ≤ n) ((5 : Int) ≤ ↑n) ?_ ?_
       · refine Nat.ToInt.le_eq ?_ ?_
         · exact Nat.ToInt.natCast_ofNat 5
-        · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
+        · rfl
       · refine @Lean.Grind.Order.eq_trans_false ((5 : Int) ≤ ↑n) ((0 : Int) ≤ ↑n + IntCast.intCast (-5 : Int)) ?_ ?_
         · refine
             @Lean.Grind.CommRing.le_norm_expr Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
@@ -99,7 +99,7 @@ info: Try this:
             · refine of_eq_true ?_
               · refine @Lean.Grind.Order.eq_trans_true' (n ≤ (3 : Nat)) (↑n ≤ (3 : Int)) ?_ ?_
                 · refine Nat.ToInt.le_eq ?_ ?_
-                  · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
+                  · rfl
                   · exact Nat.ToInt.natCast_ofNat 3
                 · refine eq_true ?_
                   · exact h1
@@ -118,7 +118,7 @@ info: Try this:
     · refine @Lean.Grind.Order.eq_trans_false ((10 : Nat) ≤ n) ((10 : Int) ≤ ↑n) ?_ ?_
       · refine Nat.ToInt.le_eq ?_ ?_
         · exact Nat.ToInt.natCast_ofNat 10
-        · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
+        · rfl
       · refine @Lean.Grind.Order.eq_trans_false ((10 : Int) ≤ ↑n) ((0 : Int) ≤ ↑n + IntCast.intCast (-10 : Int)) ?_ ?_
         · refine
             @Lean.Grind.CommRing.le_norm_expr Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
@@ -153,7 +153,7 @@ info: Try this:
             · refine of_eq_true ?_
               · refine @Lean.Grind.Order.eq_trans_true' (n ≤ (4 : Nat)) (↑n ≤ (4 : Int)) ?_ ?_
                 · refine Nat.ToInt.le_eq ?_ ?_
-                  · exact @Eq.refl.{1} Int (@NatCast.natCast.{0} Int instNatCastInt n)
+                  · rfl
                   · exact Nat.ToInt.natCast_ofNat 4
                 · refine eq_true ?_
                   · refine @Eq.mp (n + 1 ≤ 5) (n ≤ 5 - 1) ?_ ?_
