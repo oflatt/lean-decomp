@@ -172,6 +172,15 @@ private def tryValidatedTerminalTactic (expr : Expr) (lctx : LocalContext)
     return some (#[tac], used)
   return none
 
+private def tryDecompExactLocalHyp (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String)
+    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let some fvarId := expr.fvarId? | return none
+    let decl ← fvarId.getDecl
+    let tac ← `(tactic| exact $(mkIdent decl.userName):ident)
+    return some (#[tac], used)
+
 private def tryDecompArithmeticTerminalPasses (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String)
     : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
@@ -228,6 +237,7 @@ mutual
           while body.isApp && body.getAppFn.isLambda do
             body := body.headBeta
           let specialized? ← firstSomeM [
+            tryDecompExactLocalHyp body lctx localInsts used,
             tryDecompByContradiction body lctx localInsts used,
             tryDecompCasesOn body lctx localInsts used decompileExpr assignIntroNames,
             trySpecializedDecompHandlers body lctx localInsts used decompileExpr,

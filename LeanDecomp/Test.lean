@@ -61,7 +61,7 @@ example : ∀ n : Nat, 0 + n = n := by
 info: Try this:
   [apply] refine @Eq.mp (5 ≤ n) False ?_ ?_
     · lia
-    · lia
+    · exact h2
 -/
 #guard_msgs (whitespace := lax) in
 example (n : Nat) (h1 : n ≤ 3) (h2 : 5 ≤ n) : False := by
@@ -99,5 +99,23 @@ info: Try this:
 #guard_msgs in
 example (h : False) : 1 = 2 := by
   decompile exact h.elim
+
+-- Test 10: arithmetic hypotheses prefer exact over arithmetic terminal passes.
+/--
+info: Try this:
+  [apply] exact h
+-/
+#guard_msgs in
+example (n : Nat) (h : 5 ≤ n) : 5 ≤ n := by
+  decompile exact h
+
+-- Test 11: bare False hypotheses prefer exact before contradiction/cases.
+/--
+info: Try this:
+  [apply] exact h
+-/
+#guard_msgs in
+example (h : False) : False := by
+  decompile exact h
 
 end LeanDecomp.Test

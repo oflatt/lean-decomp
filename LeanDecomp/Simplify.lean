@@ -438,6 +438,32 @@ private def simplifyEqMpRefl (e : Expr) : Option Expr := do
   guard (eqName == ``Eq.refl)
   return body
 
+/-- Collapse `Eq.mp (Eq.trans (Eq.symm (eq_true h)) heq) True.intro` to
+    `Eq.mp heq h`. Grind often packages a local hypothesis `h : P` as
+    `True = P` via `Eq.symm (eq_true h)` and then transports `True.intro`
+    through it before applying a second cast. Replacing the prefix with `h`
+    exposes the direct hypothesis to the decompiler. -/
+private def simplifyEqMpTrueIntroEqTrue (e : Expr) : MetaM (Option Expr) := do
+  let (fn, args) := peelArgs e
+  let some cname := fn.constName? | return none
+  if cname != ``Eq.mp || args.length != 4 then return none
+  let witness := args[3]!
+  let (witnessFn, _) := peelArgs witness
+  if witnessFn.constName? != some ``True.intro then return none
+  let eqProof := args[2]!
+  let (eqFn, eqArgs) := peelArgs eqProof
+  if eqFn.constName? != some ``Eq.trans || eqArgs.length < 6 then return none
+  let eq1 := eqArgs[4]!
+  let eq2 := eqArgs[5]!
+  let (eq1Fn, eq1Args) := peelArgs eq1
+  if eq1Fn.constName? != some ``Eq.symm || eq1Args.length < 4 then return none
+  let inner := eq1Args[3]!
+  let (innerFn, innerArgs) := peelArgs inner
+  if innerFn.constName? != some ``eq_true || innerArgs.length < 2 then return none
+  let h := innerArgs[1]!
+  let p ← instantiateMVars (← Meta.inferType h)
+  return some (mkApp4 (mkConst ``Eq.mp [Level.zero]) p args[1]! eq2 h)
+
 -- ═══════════════════════════════════════════════════════
 -- Propositional cast simplification (congr-chain interpreter)
 -- ═══════════════════════════════════════════════════════
@@ -617,6 +643,7 @@ private def simplifyPre (e : Expr) : MetaM TransformStep := do
 /-- Post-step: MetaM rewrites applied after children are simplified.
     Returns `.visit` to re-traverse after rewriting, `.done` to keep as-is. -/
 private def simplifyPost (e : Expr) : MetaM TransformStep := do
+  if let some r ← simplifyEqMpTrueIntroEqTrue e then return .visit r
   -- Convert grind theorem-based combinators to standard eq_true/eq_false/propext forms.
   if let some r ← simplifyGrindCombinators e then return .visit r
   -- Re-check propositional casts: child simplification may have revealed
