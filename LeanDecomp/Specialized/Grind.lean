@@ -31,7 +31,7 @@ def tryDecompEqMpAutomationCast (expr : Expr) (lctx : LocalContext)
     let goalType ← Meta.inferType expr
     let innerType ← Meta.inferType innerWithArgs
     if ← Meta.isDefEq goalType innerType then
-      let (tactics, used') ← decompileExpr innerWithArgs lctx localInsts used
+      let (tactics, used') ← LeanDecomp.decompileOrExact innerWithArgs lctx localInsts used decompileExpr
       return some (tactics, used')
     return none
 

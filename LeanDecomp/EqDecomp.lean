@@ -222,7 +222,7 @@ private partial def getCalcProof (proof : Expr) (lctx : LocalContext)
     return ((← `(term| ($(h)).$(mkIdent `symm))), used')
   | _ => do
     if shouldRecursivelyDecompileCalcProof proof then
-      let (proofTactics, used') ← decompileExpr proof lctx localInsts used
+      let (proofTactics, used') ← LeanDecomp.decompileOrExact proof lctx localInsts used decompileExpr
       let term ← `(term| by $proofTactics:tactic*)
       return (term, used')
     let termStx ← delabToRefinableSyntax proof

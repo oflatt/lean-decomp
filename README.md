@@ -22,6 +22,12 @@ When elaborated, `decompile` runs the wrapped tactic, captures the resulting pro
 
 After decompilation, the pipeline validates the generated tactics by re-elaborating them against the original goal, then suggests the result via Lean's "Try This" mechanism.
 
+### Correctness Invariant
+
+The primary invariant is: **the decompiler should always produce a proof that re-elaborates successfully**.
+
+Readability is secondary to correctness. When the structural decompiler cannot safely reconstruct a recursive subproof, it should fall back to an `exact` proof term for that subproof rather than emit a prettier script that does not validate.
+
 ### Benchmarking
 
 - **`scripts/nightly.py`** — Nightly evaluation: clones mathlib4, finds files containing `grind`, and benchmarks the decompiler on each grind call site.
@@ -78,6 +84,7 @@ Current state:
 - The `eagerReduce` / certificate re-elaboration blocker for the `Nat` arithmetic examples in `LeanDecomp/Test.lean` is fixed.
 - Tests 6 and 7 in `LeanDecomp/Test.lean` now pass and are locked in with `#guard_msgs`.
 - Low-level handlers now cover `let` bindings, `eagerReduce -> decide`, `Eq.refl -> rfl`, structural `Eq.mp`, and a late theorem-application fallback that turns proof arguments into recursive subgoals instead of collapsing everything into one `exact`.
+- Recursive subproofs are validated in isolation; if a recursively generated tactic block does not close its subgoal, the decompiler falls back to `exact` for that subproof to preserve the re-elaboration invariant.
 - Hygiene artifacts such as `@Eq.mp✝` have been cleaned up in generated output.
 - Specialized handling now has an extension point: `LeanDecomp/Specialized.lean` runs package-specific handlers, and grind-specific helpers live in `LeanDecomp/Specialized/Grind.lean`.
 

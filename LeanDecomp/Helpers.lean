@@ -1,8 +1,10 @@
 import Lean
+import Lean.Meta.Tactic.TryThis
 import Lean.PrettyPrinter
 
 namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter Tactic
+open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
 /-- Type alias for the decompileExpr callback to avoid repetition -/
 abbrev DecompileCallback := Expr → LocalContext → LocalInstances → List String →
@@ -21,6 +23,138 @@ def mkFocusedBlock (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax `tactic) :=
   let seq ← mkTacticSeq tacs
   `(tactic| · $seq:tacticSeq)
 
+/-- Replace parser-generated `?m.N` placeholders with anonymous holes. -/
+private def anonymizeSyntheticMVars (s : String) : String := Id.run do
+  let chars := s.toList.toArray
+  let mut out := ""
+  let mut i := 0
+  while i < chars.size do
+    if chars[i]! == '?' && i + 2 < chars.size && chars[i + 1]! == 'm' && chars[i + 2]! == '.' then
+      let mut j := i + 3
+      let mut sawDigit := false
+      while j < chars.size && chars[j]!.isDigit do
+        sawDigit := true
+        j := j + 1
+      if sawDigit then
+        out := out ++ "?_"
+        i := j
+      else
+        out := out.push chars[i]!
+        i := i + 1
+    else
+      out := out.push chars[i]!
+      i := i + 1
+  out
+
+private def ppExprToTermSyntax (e : Expr) : MetaM Term := do
+  let env ← getEnv
+  let fmt ← Meta.ppExpr e
+  let termStr := anonymizeSyntheticMVars fmt.pretty
+  match Parser.runParserCategory env `term termStr with
+  | .ok stx => pure ⟨stx⟩
+  | .error err =>
+    throwError "failed to parse pretty-printed term:\n{err}\n\n{termStr}"
+
+private def ppExprToTermSyntaxWith (e : Expr) (usePpAll : Bool) : MetaM Term :=
+  withOptions (fun o =>
+      let o := pp.coercions.types.set o true
+      let o := pp.numericTypes.set o true
+      if usePpAll then
+        pp.all.set o true
+      else
+        o
+    ) do
+      ppExprToTermSyntax e
+
+private partial def containsConstName (e : Expr) (target : Name) : Bool :=
+  Expr.find? (fun sub => sub.getAppFn.constName? == some target) e |>.isSome
+
+private partial def containsEagerReduce (e : Expr) : Bool :=
+  Expr.find? (fun sub =>
+    match sub.getAppFn.constName? with
+    | some n => n == ``eagerReduce
+    | none => false) e |>.isSome
+
+private partial def exprNodeCount (e : Expr) : Nat :=
+  match e with
+  | .bvar _ | .fvar _ | .mvar _ | .sort _ | .const _ _ | .lit _ => 1
+  | .app f a => exprNodeCount f + exprNodeCount a + 1
+  | .lam _ ty body _ => exprNodeCount ty + exprNodeCount body + 1
+  | .forallE _ ty body _ => exprNodeCount ty + exprNodeCount body + 1
+  | .letE _ ty val body _ => exprNodeCount ty + exprNodeCount val + exprNodeCount body + 1
+  | .mdata _ body => exprNodeCount body + 1
+  | .proj _ _ body => exprNodeCount body + 1
+
+private def throwIfFallbackProofTooLarge (proof : Expr) : MetaM Unit := do
+  let maxNodes := 5000
+  let nodeCount := exprNodeCount proof
+  if nodeCount > maxNodes then
+    throwError
+      "exact fallback proof too large ({nodeCount} nodes, max {maxNodes}); refusing to emit a giant exact term"
+
+/-- Build a robust exact fallback for a subproof. Prefer direct delaboration when
+    possible, but fall back to fully pretty-printed syntax for low-level proofs. -/
+private def mkExactFallbackTactics (proof : Expr) : MetaM (Array (TSyntax `tactic)) := do
+  throwIfFallbackProofTooLarge proof
+  let usePrettyPrintedTerm :=
+    containsEagerReduce proof || containsConstName proof ``propext || containsConstName proof ``Iff.intro
+  let termStx ← if usePrettyPrintedTerm then
+      ppExprToTermSyntaxWith proof true
+    else
+      try
+        delabToRefinableSyntax proof
+      catch _ =>
+        ppExprToTermSyntaxWith proof true
+  if containsEagerReduce proof then
+    let tac ← `(tactic| with_unfolding_all exact $termStx)
+    return #[tac]
+  else
+    let tac ← `(tactic| exact $termStx)
+    return #[tac]
+
+/-- Recursively decompile a proof term, but preserve correctness by falling back
+    to an exact proof term when the generated tactics do not re-elaborate or do
+    not fully close a fresh goal of the same type. -/
+private def subproofTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedType : Expr)
+    (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool := do
+  let savedMsgs ← Core.getMessageLog
+  Core.setMessageLog {}
+  let ok ← try
+      withoutModifyingState do
+        withLCtx lctx localInsts do
+          let goal ← Meta.mkFreshExprMVar (some expectedType) .syntheticOpaque
+          let seq ← mkTacticSeq tacs
+          let goals ← Tactic.run goal.mvarId! do
+            evalTactic seq
+          let newMsgs ← Core.getMessageLog
+          pure (!newMsgs.hasErrors && goals.isEmpty)
+    catch _ =>
+      pure false
+  Core.setMessageLog savedMsgs
+  return ok
+
+/-- Validate a candidate tactic block against the full proof goal and fall back
+    to an exact proof term if validation fails. -/
+def validateOrExact (proof : Expr) (lctx : LocalContext) (localInsts : LocalInstances)
+    (used : List String) (build : TacticM (Array (TSyntax `tactic) × List String))
+    : TacticM (Array (TSyntax `tactic) × List String) := do
+  let proofTy ← instantiateMVars (← Meta.inferType proof)
+  let fallbackTacs ← mkExactFallbackTactics proof
+  try
+    let (candidateTacs, used') ← build
+    if ← subproofTacticsCloseGoal candidateTacs proofTy lctx localInsts then
+      return (candidateTacs, used')
+    else
+      return (fallbackTacs, used')
+  catch _ =>
+    return (fallbackTacs, used)
+
+def decompileOrExact (proof : Expr) (lctx : LocalContext) (localInsts : LocalInstances)
+    (used : List String) (decompileExpr : DecompileCallback)
+    : TacticM (Array (TSyntax `tactic) × List String) := do
+  validateOrExact proof lctx localInsts used do
+    decompileExpr proof lctx localInsts used
+
 /-- Emit a tactic that may create multiple goals, then recursively decompile one
     proof term per generated goal into focused sub-blocks. This is the common
     shape used by theorem-style decompiler passes. -/
@@ -30,8 +164,8 @@ def emitTacticWithSubgoals (headTac : TSyntax `tactic) (subgoalProofs : Array Ex
   let mut allTacs : Array (TSyntax `tactic) := #[headTac]
   let mut used' := used
   for proof in subgoalProofs do
-    let (subTacs, used'') ← decompileExpr proof lctx localInsts used'
-    let blockTac ← mkFocusedBlock subTacs
+    let (chosenTacs, used'') ← decompileOrExact proof lctx localInsts used' decompileExpr
+    let blockTac ← mkFocusedBlock chosenTacs
     allTacs := allTacs.push blockTac
     used' := used''
   return (allTacs, used')

@@ -363,7 +363,8 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
               innerBody ← Meta.whnf innerBody
 
         -- Recursively decompile the inner body
-        let (bodyTactics, _usedInBranch) ← decompileExpr innerBody newLctx telescopeInsts usedAfterCtorParams
+        let (bodyTactics, _usedInBranch) ←
+          LeanDecomp.decompileOrExact innerBody newLctx telescopeInsts usedAfterCtorParams decompileExpr
         return (bodyTactics, ctorParamNames, used)
 
       used := used'

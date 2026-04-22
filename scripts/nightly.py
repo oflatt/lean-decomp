@@ -66,7 +66,10 @@ def ensure_mathlib(workspace: Path):
 
 def build_lean_decomp(workspace: Path):
     print("Building lean-decomp...")
-    run(["lake", "build"], cwd=workspace)
+    # Nightly benchmarking only needs the LeanDecomp library available as a
+    # dependency for mathlib queries, not the local #guard_msgs regression
+    # suites wired into other default targets.
+    run(["lake", "build", "LeanDecomp"], cwd=workspace)
 
 
 def find_lean_files_with_grind(path: Path) -> list[Path]:

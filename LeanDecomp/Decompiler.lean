@@ -247,13 +247,15 @@ mutual
           let renamedBinderLctx := lctxWithBinder.setUserName fvarId (Name.mkSimple binderName)
           let binderLocalInsts ← getLocalInstances
           let applied := Expr.app handler binder
-          let (bodyTactics, used'') ← decompileExpr applied renamedBinderLctx binderLocalInsts used'
           let binderIdent := mkIdent (Name.mkSimple binderName)
           -- Use mkIdent with no info to avoid hygiene marks (✝) in pretty-printed output
           let byContradictionIdent : Ident := ⟨mkIdent ``Classical.byContradiction |>.raw.setInfo .none⟩
           let applyTac ← `(tactic| apply $byContradictionIdent:ident)
           let introTac ← `(tactic| intro $binderIdent:ident)
-          return some (#[applyTac, introTac] ++ bodyTactics, used'')
+          let result ← LeanDecomp.validateOrExact expr lctx localInsts used do
+            let (bodyTactics, used'') ← decompileExpr applied renamedBinderLctx binderLocalInsts used'
+            return (#[applyTac, introTac] ++ bodyTactics, used'')
+          return some result
         else
           return none
 
