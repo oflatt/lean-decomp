@@ -133,6 +133,13 @@ private def subproofTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedT
   Core.setMessageLog savedMsgs
   return ok
 
+  /-- Check whether a candidate tactic block closes a fresh goal of the given type.
+    This is useful for speculative terminal tactics where failure should simply
+    let the decompiler continue trying other handlers. -/
+  def candidateTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedType : Expr)
+    (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool :=
+    subproofTacticsCloseGoal tacs expectedType lctx localInsts
+
 /-- Validate a candidate tactic block against the full proof goal and fall back
     to an exact proof term if validation fails. -/
 def validateOrExact (proof : Expr) (lctx : LocalContext) (localInsts : LocalInstances)

@@ -47,9 +47,8 @@ example (P Q : Prop) (h : P → Q) (a : P) : Q := by
 -- Test 5: Universal statement
 /--
 info: Try this:
-  [apply]
-    intro n
-    exact Nat.zero_add n
+  [apply] intro n
+    lia
 -/
 #guard_msgs (whitespace := lax) in
 example : ∀ n : Nat, 0 + n = n := by
@@ -61,49 +60,8 @@ example : ∀ n : Nat, 0 + n = n := by
 /--
 info: Try this:
   [apply] refine @Eq.mp (5 ≤ n) False ?_ ?_
-    · refine @Lean.Grind.Order.eq_trans_false ((5 : Nat) ≤ n) ((5 : Int) ≤ ↑n) ?_ ?_
-      · refine Nat.ToInt.le_eq ?_ ?_
-        · exact Nat.ToInt.natCast_ofNat 5
-        · rfl
-      · refine @Lean.Grind.Order.eq_trans_false ((5 : Int) ≤ ↑n) ((0 : Int) ≤ ↑n + IntCast.intCast (-5 : Int)) ?_ ?_
-        · refine
-            @Lean.Grind.CommRing.le_norm_expr Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
-              (Lean.RArray.leaf ↑n) (Lean.Grind.CommRing.Expr.num 5) (Lean.Grind.CommRing.Expr.var 0)
-              (Lean.Grind.CommRing.Expr.num 0)
-              ((Lean.Grind.CommRing.Expr.var 0).add (Lean.Grind.CommRing.Expr.intCast (-5))) ?_
-          · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
-            · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
-              · exact Lean.Grind.instIsLinearOrderInt
-          · exact Lean.Grind.instOrderedRingInt
-          · decide
-        · refine
-            @Lean.Grind.Order.le_eq_false_of_le_k Int Int.instLEInt Int.instLTInt ?_ ?_ Lean.Grind.instCommRingInt.toRing
-              ?_ (↑n) 0 3 (-5) ?_ ?_
-          · exact Lean.Grind.instLawfulOrderLTInt
-          · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
-            · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
-              · exact Lean.Grind.instIsLinearOrderInt
-          · exact Lean.Grind.instOrderedRingInt
-          · decide
-          · refine @Lean.Grind.Order.eq_mp (↑n ≤ (3 : Int)) (↑n ≤ (0 : Int) + IntCast.intCast (3 : Int)) ?_ ?_
-            · refine
-                @Lean.Grind.CommRing.le_norm_expr Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
-                  (Lean.RArray.leaf ↑n) (Lean.Grind.CommRing.Expr.var 0) (Lean.Grind.CommRing.Expr.num 3)
-                  (Lean.Grind.CommRing.Expr.var 0)
-                  ((Lean.Grind.CommRing.Expr.num 0).add (Lean.Grind.CommRing.Expr.intCast 3)) ?_
-              · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
-                · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
-                  · exact Lean.Grind.instIsLinearOrderInt
-              · exact Lean.Grind.instOrderedRingInt
-              · decide
-            · refine of_eq_true ?_
-              · refine @Lean.Grind.Order.eq_trans_true' (n ≤ (3 : Nat)) (↑n ≤ (3 : Int)) ?_ ?_
-                · refine Nat.ToInt.le_eq ?_ ?_
-                  · rfl
-                  · exact Nat.ToInt.natCast_ofNat 3
-                · refine eq_true ?_
-                  · exact h1
-    · exact h2
+    · lia
+    · lia
 -/
 #guard_msgs (whitespace := lax) in
 example (n : Nat) (h1 : n ≤ 3) (h2 : 5 ≤ n) : False := by
@@ -115,59 +73,10 @@ info: Try this:
   [apply] apply Classical.byContradiction
     intro hp
     refine @Eq.mp (10 ≤ n) False ?_ ?_
-    · refine @Lean.Grind.Order.eq_trans_false ((10 : Nat) ≤ n) ((10 : Int) ≤ ↑n) ?_ ?_
-      · refine Nat.ToInt.le_eq ?_ ?_
-        · exact Nat.ToInt.natCast_ofNat 10
-        · rfl
-      · refine @Lean.Grind.Order.eq_trans_false ((10 : Int) ≤ ↑n) ((0 : Int) ≤ ↑n + IntCast.intCast (-10 : Int)) ?_ ?_
-        · refine
-            @Lean.Grind.CommRing.le_norm_expr Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
-              (Lean.RArray.leaf ↑n) (Lean.Grind.CommRing.Expr.num 10) (Lean.Grind.CommRing.Expr.var 0)
-              (Lean.Grind.CommRing.Expr.num 0)
-              ((Lean.Grind.CommRing.Expr.var 0).add (Lean.Grind.CommRing.Expr.intCast (-10))) ?_
-          · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
-            · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
-              · exact Lean.Grind.instIsLinearOrderInt
-          · exact Lean.Grind.instOrderedRingInt
-          · decide
-        · refine
-            @Lean.Grind.Order.le_eq_false_of_le_k Int Int.instLEInt Int.instLTInt ?_ ?_ Lean.Grind.instCommRingInt.toRing
-              ?_ (↑n) 0 4 (-10) ?_ ?_
-          · exact Lean.Grind.instLawfulOrderLTInt
-          · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
-            · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
-              · exact Lean.Grind.instIsLinearOrderInt
-          · exact Lean.Grind.instOrderedRingInt
-          · decide
-          · refine @Lean.Grind.Order.eq_mp (↑n ≤ (4 : Int)) (↑n ≤ (0 : Int) + IntCast.intCast (4 : Int)) ?_ ?_
-            · refine
-                @Lean.Grind.CommRing.le_norm_expr Int Lean.Grind.instCommRingInt Int.instLEInt Int.instLTInt ?_ ?_
-                  (Lean.RArray.leaf ↑n) (Lean.Grind.CommRing.Expr.var 0) (Lean.Grind.CommRing.Expr.num 4)
-                  (Lean.Grind.CommRing.Expr.var 0)
-                  ((Lean.Grind.CommRing.Expr.num 0).add (Lean.Grind.CommRing.Expr.intCast 4)) ?_
-              · refine @Std.IsLinearPreorder.toIsPreorder Int Int.instLEInt ?_
-                · refine @Std.IsLinearOrder.toIsLinearPreorder Int Int.instLEInt ?_
-                  · exact Lean.Grind.instIsLinearOrderInt
-              · exact Lean.Grind.instOrderedRingInt
-              · decide
-            · refine of_eq_true ?_
-              · refine @Lean.Grind.Order.eq_trans_true' (n ≤ (4 : Nat)) (↑n ≤ (4 : Int)) ?_ ?_
-                · refine Nat.ToInt.le_eq ?_ ?_
-                  · rfl
-                  · exact Nat.ToInt.natCast_ofNat 4
-                · refine eq_true ?_
-                  · refine @Eq.mp (n + 1 ≤ 5) (n ≤ 5 - 1) ?_ ?_
-                    · refine Nat.Simproc.add_le_le n ?_
-                      · decide
-                    · exact h
+    · lia
     · refine @Eq.mp (¬n ≤ 9) (9 + 1 ≤ n) ?_ ?_
-      · exact Nat.not_le_eq n 9
-      · refine @mt (n ≤ (9 : Nat)) (n < (10 : Nat)) ?_ ?_
-        ·
-          exact fun b =>
-            Eq.symm (Eq.trans (Lean.Grind.Nat.lt_eq n 10) (Nat.Simproc.add_le_le n (of_decide_eq_true (Eq.refl true)))) ▸
-              b
-        · exact hp
+      · lia
+      · lia
 -/
 #guard_msgs (whitespace := lax) in
 example (n : Nat) (h : n < 5) : n < 10 := by

@@ -362,9 +362,14 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
             if cname == ``Eq.ndrec || cname == ``Eq.rec then
               innerBody ← Meta.whnf innerBody
 
-        -- Recursively decompile the inner body
+        -- Generalized equation branches carry transport artifacts that do not
+        -- replay faithfully on a synthetic fresh goal rebuilt from `innerBody`.
+        -- Decompile them directly and let the outer replay check the real branch.
         let (bodyTactics, _usedInBranch) ←
-          LeanDecomp.decompileOrExact innerBody newLctx telescopeInsts usedAfterCtorParams decompileExpr
+          if hasEqMotive then
+            decompileExpr innerBody newLctx telescopeInsts usedAfterCtorParams
+          else
+            LeanDecomp.decompileOrExact innerBody newLctx telescopeInsts usedAfterCtorParams decompileExpr
         return (bodyTactics, ctorParamNames, used)
 
       used := used'

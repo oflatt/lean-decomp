@@ -149,6 +149,44 @@ private def hasProblematicEvidence (e : Expr) : Bool :=
     containsConstName e ``of_decide_eq_true || containsConstName e ``propext ||
     containsConstName e ``Iff.intro || containsCastLike e
 
+private partial def containsArithRelevantConst (e : Expr) : Bool :=
+  Expr.find? (fun sub =>
+    match sub.getAppFn.constName? with
+    | some n =>
+        n == ``Int || n == ``Nat || n == ``LE.le || n == ``LT.lt ||
+          n == ``GE.ge || n == ``GT.gt || n == ``Dvd.dvd ||
+          n == ``HAdd.hAdd || n == ``HSub.hSub || n == ``HMul.hMul ||
+          n == ``OfNat.ofNat || n == ``Nat.succ || n == ``Nat.sub || n == ``Int.sub ||
+          n == ``Int.add || n == ``Int.mul || n == ``Nat.add || n == ``Nat.mul
+    | none => false) e |>.isSome
+
+private def isArithmeticLikeGoal (expr : Expr) : MetaM Bool := do
+  let ty ← instantiateMVars (← Meta.inferType expr)
+  pure (containsArithRelevantConst ty || containsArithRelevantConst expr)
+
+private def tryValidatedTerminalTactic (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (tac : TSyntax `tactic)
+    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  let expectedType ← instantiateMVars (← Meta.inferType expr)
+  if ← LeanDecomp.candidateTacticsCloseGoal #[tac] expectedType lctx localInsts then
+    return some (#[tac], used)
+  return none
+
+private def tryDecompArithmeticTerminalPasses (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String)
+    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    if !(← isArithmeticLikeGoal expr) then
+      return none
+    let liaTac ← `(tactic| lia)
+    if let some result ← tryValidatedTerminalTactic expr lctx localInsts used liaTac then
+      return some result
+    let orderTac ← `(tactic| grind_order)
+    if let some result ← tryValidatedTerminalTactic expr lctx localInsts used orderTac then
+      return some result
+    let linarithTac ← `(tactic| grind_linarith)
+    tryValidatedTerminalTactic expr lctx localInsts used linarithTac
+
 /-- Return `true` when the head of the application looks like a theorem-level
     proof constructor rather than data construction. This is intentionally broad:
     the handler is placed late in the pipeline, so more specific patterns still
@@ -205,6 +243,7 @@ mutual
             tryDecompEagerReduce body lctx localInsts used,
             tryDecompEqRefl body lctx localInsts used,
             tryDecompDecide body lctx localInsts used,
+            tryDecompArithmeticTerminalPasses body lctx localInsts used,
             tryDecompTheoremAppFallback body lctx localInsts used
           ]
           match specialized? with
