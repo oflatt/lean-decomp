@@ -217,77 +217,77 @@ private def firstSomeM [Monad m] (xs : List (m (Option α))) : m (Option α) := 
       return some res
   return none
 
+private partial def tryDecompProblematicProofApp (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let (fn, args) := peelArgs expr
+    let some _ := fn.fvarId? | return none
+    if args.isEmpty then
+      return none
+
+    let mut app := fn
+    let mut remainingType ← Meta.inferType fn
+    let mut proofArgs : Array Expr := #[]
+    let mut sawProblematicProofArg := false
+    let mut hasNonProofArg := false
+
+    for arg in args do
+      remainingType ← Meta.whnf remainingType
+      let .forallE _ binderType body _ := remainingType
+        | return none
+      if ← Meta.isProp binderType then
+        let hole ← Meta.mkFreshExprSyntheticOpaqueMVar binderType
+        app := mkApp app hole
+        proofArgs := proofArgs.push arg
+        if hasProblematicEvidence arg then
+          sawProblematicProofArg := true
+      else
+        app := mkApp app arg
+        hasNonProofArg := true
+      remainingType := body.instantiate1 arg
+
+    if proofArgs.isEmpty || !sawProblematicProofArg then
+      return none
+
+    let headTerm ← delabToRefinableSyntax fn
+    let headTac ← if hasNonProofArg then
+        let refineTerm ← delabToRefinableSyntax app
+        `(tactic| refine $refineTerm)
+      else
+        `(tactic| apply $headTerm)
+    let result ← LeanDecomp.emitTacticWithSubgoals headTac proofArgs lctx localInsts used decompileExpr
+    return some result
+
+private partial def tryDecompIffIntro (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let (fn, args) := peelArgs expr
+    let some constName := Expr.constName? fn | return none
+    if constName != ``Iff.intro || args.length < 4 then
+      return none
+    let fwd := args[2]!
+    let bwd := args[3]!
+    let constructorTac ← `(tactic| constructor)
+    let result ← LeanDecomp.emitTacticWithSubgoals constructorTac #[fwd, bwd] lctx localInsts used decompileExpr
+    return some result
+
+private partial def tryDecompPropext (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let (fn, args) := peelArgs expr
+    let some constName := Expr.constName? fn | return none
+    if constName != ``propext then
+      return none
+    let some iffProof := args.getLast? | return none
+    let propextIdent : Ident := ⟨mkIdent ``propext |>.raw.setInfo .none⟩
+    let applyTac ← `(tactic| apply $propextIdent:ident)
+    let result ← LeanDecomp.emitTacticWithSubgoals applyTac #[iffProof] lctx localInsts used decompileExpr
+    return some result
+
 mutual
-
-  private partial def tryDecompProblematicProofApp (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String)
-      : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
-    withLCtx lctx localInsts do
-      let (fn, args) := peelArgs expr
-      let some _ := fn.fvarId? | return none
-      if args.isEmpty then
-        return none
-
-      let mut app := fn
-      let mut remainingType ← Meta.inferType fn
-      let mut proofArgs : Array Expr := #[]
-      let mut sawProblematicProofArg := false
-      let mut hasNonProofArg := false
-
-      for arg in args do
-        remainingType ← Meta.whnf remainingType
-        let .forallE _ binderType body _ := remainingType
-          | return none
-        if ← Meta.isProp binderType then
-          let hole ← Meta.mkFreshExprSyntheticOpaqueMVar binderType
-          app := mkApp app hole
-          proofArgs := proofArgs.push arg
-          if hasProblematicEvidence arg then
-            sawProblematicProofArg := true
-        else
-          app := mkApp app arg
-          hasNonProofArg := true
-        remainingType := body.instantiate1 arg
-
-      if proofArgs.isEmpty || !sawProblematicProofArg then
-        return none
-
-      let headTerm ← delabToRefinableSyntax fn
-      let headTac ← if hasNonProofArg then
-          let refineTerm ← delabToRefinableSyntax app
-          `(tactic| refine $refineTerm)
-        else
-          `(tactic| apply $headTerm)
-      let result ← LeanDecomp.emitTacticWithSubgoals headTac proofArgs lctx localInsts used decompileExpr
-      return some result
-
-  private partial def tryDecompIffIntro (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String)
-      : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
-    withLCtx lctx localInsts do
-      let (fn, args) := peelArgs expr
-      let some constName := Expr.constName? fn | return none
-      if constName != ``Iff.intro || args.length < 4 then
-        return none
-      let fwd := args[2]!
-      let bwd := args[3]!
-      let constructorTac ← `(tactic| constructor)
-      let result ← LeanDecomp.emitTacticWithSubgoals constructorTac #[fwd, bwd] lctx localInsts used decompileExpr
-      return some result
-
-  private partial def tryDecompPropext (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String)
-      : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
-    withLCtx lctx localInsts do
-      let (fn, args) := peelArgs expr
-      let some constName := Expr.constName? fn | return none
-      if constName != ``propext then
-        return none
-      let some iffProof := args.getLast? | return none
-      let propextIdent : Ident := ⟨mkIdent ``propext |>.raw.setInfo .none⟩
-      let applyTac ← `(tactic| apply $propextIdent:ident)
-      let result ← LeanDecomp.emitTacticWithSubgoals applyTac #[iffProof] lctx localInsts used decompileExpr
-      return some result
 
   /-- Convert a proof term expression into tactic syntax. -/
   partial def decompileExpr (expr : Expr) (lctx : LocalContext)
@@ -308,12 +308,12 @@ mutual
             body := body.headBeta
           let specialized? ← firstSomeM [
             tryDecompExactLocalHyp body lctx localInsts used,
-            tryDecompProblematicProofApp body lctx localInsts used,
+            tryDecompProblematicProofApp body lctx localInsts used decompileExpr,
             tryDecompByContradiction body lctx localInsts used,
             tryDecompCasesOn body lctx localInsts used decompileExpr assignIntroNames,
             trySpecializedDecompHandlers body lctx localInsts used decompileExpr,
-            tryDecompPropext body lctx localInsts used,
-            tryDecompIffIntro body lctx localInsts used,
+            tryDecompPropext body lctx localInsts used decompileExpr,
+            tryDecompIffIntro body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongr body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongrArg body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqSymm body lctx localInsts used decompileExpr,
