@@ -304,6 +304,72 @@ def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
       let tac ← `(tactic| exact $proofStx)
       return some (#[tac], used)
 
+/-- Handle proposition-valued `Eq.rec`/`Eq.ndrec` transports by converting them
+    back into an explicit `Eq.mp` step. `convert` often leaves these wrappers
+    around a large theorem application; exposing the transport and base proof as
+    separate subgoals gives the decompiler a chance to recurse structurally. -/
+def tryDecompEqRecPropTransport (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let (fn, args) := peelApps expr
+    let some constName := Expr.constName? fn | return none
+    if constName != ``Eq.rec && constName != ``Eq.ndrec then
+      return none
+    if args.length < 6 then
+      return none
+
+    let motive := args[2]!
+    let base := args[3]!
+    let hEq := args[5]!
+    let baseWithArgs := (args.drop 6).foldl (init := base) fun acc arg => mkApp acc arg
+
+    let sourceTy ← instantiateMVars (← Meta.inferType baseWithArgs)
+    let targetTy ← instantiateMVars (← Meta.inferType expr)
+    if !(← Meta.isProp sourceTy) || !(← Meta.isProp targetTy) then
+      return none
+
+    let hEqNorm ← simplifyEqProof hEq
+
+    -- Expanded definition of `Eq.mp` / proposition transport:
+    --   Eq.rec base target (fun x h => x) hEq
+    -- Collapse it back to an explicit cast so the existing Eq.mp handler can recurse.
+    let motiveShape ← Meta.lambdaTelescope motive fun xs body => do
+      pure (xs.size, xs.size == 2 && body == xs[0]!)
+    if motiveShape.2 then
+      let some (_, lhs, rhs) ← inferEqType? hEqNorm
+        | return none
+      let transportEq ←
+        if (← Meta.isDefEq lhs sourceTy) && (← Meta.isDefEq rhs targetTy) then
+          pure hEqNorm
+        else if (← Meta.isDefEq lhs targetTy) && (← Meta.isDefEq rhs sourceTy) then
+          mkEqSymm' hEqNorm
+        else
+          return none
+      let sourceTyStx ← delabToRefinableSyntax sourceTy
+      let targetTyStx ← delabToRefinableSyntax targetTy
+      let eqMpIdent := mkCleanIdent ``Eq.mp
+      let refineTac ← `(tactic| refine @$eqMpIdent:ident $sourceTyStx $targetTyStx ?_ ?_)
+      let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[transportEq, baseWithArgs] lctx localInsts used decompileExpr
+      return some result
+
+    -- Only handle the ordinary nondependent transport case where the motive is
+    -- a single-argument proposition-valued function. Truly dependent motives
+    -- require a different reconstruction than `congrArg motive hEq`.
+    let motiveInfo ← Meta.lambdaTelescope motive fun xs body => do
+      let body ← instantiateMVars body
+      pure (xs.size, body.hasLooseBVars)
+    if motiveInfo.1 != 1 || motiveInfo.2 then
+      return none
+
+    let transportEq ← mkCongrArg' motive hEqNorm
+    let sourceTyStx ← delabToRefinableSyntax sourceTy
+    let targetTyStx ← delabToRefinableSyntax targetTy
+    let eqMpIdent := mkCleanIdent ``Eq.mp
+    let refineTac ← `(tactic| refine @$eqMpIdent:ident $sourceTyStx $targetTyStx ?_ ?_)
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[transportEq, baseWithArgs] lctx localInsts used decompileExpr
+    return some result
+
 /-- Handle `Eq.mp` casts structurally by refining with holes for the transport
   equality and transported proof, then recursively decompiling both sides.
   This avoids raw delab/re-elab of arithmetic certificate terms. -/

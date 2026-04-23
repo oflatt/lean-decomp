@@ -64,11 +64,14 @@ private def theoremHeadToExplicitTermSyntax (headName : Name) : MetaM Term := do
   | .error err =>
     throwError "failed to parse theorem head:\n{err}\n\n{headStr}"
 
-private def theoremAppToNotationTermSyntax (headName : Name) (args : List Expr) : MetaM Term := do
+private def theoremAppToNotationTermSyntax (headName : Name) (args : List Expr)
+    (holeMask : Array Bool := #[]) : MetaM Term := do
   let headTerm ← theoremHeadToExplicitTermSyntax headName
   let mut argTerms : Array Term := #[]
-  for arg in args do
-    let argTerm ← if ← Meta.isProof arg then
+  for h : i in [:args.length] do
+    let arg := args[i]
+    let useHole := holeMask.getD i false
+    let argTerm ← if useHole || (← Meta.isProof arg) then
         `(term| ?_)
       else
         let argType ← instantiateMVars (← Meta.inferType arg)
@@ -160,9 +163,23 @@ private partial def containsArithRelevantConst (e : Expr) : Bool :=
           n == ``Int.add || n == ``Int.mul || n == ``Nat.add || n == ``Nat.mul
     | none => false) e |>.isSome
 
+private partial def containsArithmeticAutomationConst (e : Expr) : Bool :=
+  Expr.find? (fun sub =>
+    match sub.getAppFn.constName? with
+    | some n =>
+        let s := toString n
+        s.startsWith "Int.Linear." ||
+          s.startsWith "Nat.Linear." ||
+          s.startsWith "Lean.Grind.Order." ||
+          s.startsWith "Lean.Grind.CommRing."
+    | none => false) e |>.isSome
+
 private def isArithmeticLikeGoal (expr : Expr) : MetaM Bool := do
   let ty ← instantiateMVars (← Meta.inferType expr)
-  pure (containsArithRelevantConst ty || containsArithRelevantConst expr)
+  pure <|
+    containsArithRelevantConst ty ||
+      containsArithRelevantConst expr ||
+      containsArithmeticAutomationConst expr
 
 private def tryValidatedTerminalTactic (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (tac : TSyntax `tactic)
@@ -189,7 +206,7 @@ private def tryDecompArithmeticTerminalPasses (expr : Expr) (lctx : LocalContext
       return none
     let liaTac ← `(tactic| lia)
     if let some result ← tryValidatedTerminalTactic expr lctx localInsts used liaTac then
-      return some result
+        return some result
     let orderTac ← `(tactic| grind_order)
     if let some result ← tryValidatedTerminalTactic expr lctx localInsts used orderTac then
       return some result
@@ -209,6 +226,16 @@ private def isConstructorName (env : Environment) (name : Name) : Bool :=
   match env.find? name with
   | some (.ctorInfo _) => true
   | _ => false
+
+/-- Treat explicit proof functions like `∀ x, P x → Q x` as proof-like so theorem
+    applications can recurse into them instead of embedding large lambda terms raw. -/
+private def isProofLikeBinderType (binderType : Expr) : MetaM Bool := do
+  let binderType ← instantiateMVars binderType
+  let binderType ← Meta.whnf binderType
+  if ← Meta.isProp binderType then
+    return true
+  Meta.forallTelescopeReducing binderType fun _ body =>
+    Meta.isProp body
 
 /-- Try a list of computations in order, returning the first `some` result. -/
 private def firstSomeM [Monad m] (xs : List (m (Option α))) : m (Option α) := do
@@ -273,6 +300,37 @@ private partial def tryDecompIffIntro (expr : Expr) (lctx : LocalContext)
     let result ← LeanDecomp.emitTacticWithSubgoals constructorTac #[fwd, bwd] lctx localInsts used decompileExpr
     return some result
 
+private partial def tryDecompIffMpMpr (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let (fn, args) := peelArgs expr
+    let some constName := Expr.constName? fn | return none
+    if constName != ``Iff.mp && constName != ``Iff.mpr then
+      return none
+    if args.length < 4 then
+      return none
+    let iffProof := args[2]!
+    let premiseProof := args[3]!
+    let headIdent : Ident := ⟨mkIdent constName |>.raw.setInfo .none⟩
+    let refineTac ← `(tactic| refine $headIdent:ident ?_ ?_)
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[iffProof, premiseProof] lctx localInsts used decompileExpr
+    return some result
+
+private partial def tryDecompAndProj (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let (fn, args) := peelArgs expr
+    let some constName := Expr.constName? fn | return none
+    if constName != ``And.left && constName != ``And.right then
+      return none
+    let some andProof := args.getLast? | return none
+    let headIdent : Ident := ⟨mkIdent constName |>.raw.setInfo .none⟩
+    let applyTac ← `(tactic| apply $headIdent:ident)
+    let result ← LeanDecomp.emitTacticWithSubgoals applyTac #[andProof] lctx localInsts used decompileExpr
+    return some result
+
 private partial def tryDecompPropext (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
     : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
@@ -314,10 +372,13 @@ mutual
             trySpecializedDecompHandlers body lctx localInsts used decompileExpr,
             tryDecompPropext body lctx localInsts used decompileExpr,
             tryDecompIffIntro body lctx localInsts used decompileExpr,
+            tryDecompIffMpMpr body lctx localInsts used decompileExpr,
+            tryDecompAndProj body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongr body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongrArg body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqSymm body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqTrans body lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompEqRecPropTransport body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqMp body lctx localInsts used decompileExpr,
             tryDecompFalseRec body lctx localInsts used,
             tryDecompFalseType body lctx localInsts used,
@@ -374,6 +435,22 @@ mutual
           let byContradictionIdent : Ident := ⟨mkIdent ``Classical.byContradiction |>.raw.setInfo .none⟩
           let applyTac ← `(tactic| apply $byContradictionIdent:ident)
           let introTac ← `(tactic| intro $binderIdent:ident)
+          -- Prefer structural decompilation of the contradiction body before
+          -- trying arithmetic terminals like `lia`. This keeps contradiction-
+          -- shaped proofs stable and avoids collapsing non-arithmetic branches
+          -- into `lia` when the recursive handlers already know how to emit a
+          -- more faithful script.
+          try
+            let (bodyTactics, used'') ← decompileExpr applied renamedBinderLctx binderLocalInsts used'
+            let candidate := #[applyTac, introTac] ++ bodyTactics
+            let exprTy ← instantiateMVars (← Meta.inferType expr)
+            if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
+              return some (candidate, used'')
+          catch _ =>
+            pure ()
+          if let some (branchTactics, used'') ←
+              tryDecompArithmeticTerminalPasses applied renamedBinderLctx binderLocalInsts used' then
+            return some (#[applyTac, introTac] ++ branchTactics, used'')
           let result ← LeanDecomp.validateOrExact expr lctx localInsts used do
             let (bodyTactics, used'') ← decompileExpr applied renamedBinderLctx binderLocalInsts used'
             return (#[applyTac, introTac] ++ bodyTactics, used'')
@@ -518,15 +595,17 @@ mutual
       (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
     withLCtx lctx localInsts do
       let (fn, args) := peelArgs expr
-      let some headName := isTheoremAppHead? fn | return none
-      if isConstructorName (← getEnv) headName then
-        return none
       if args.isEmpty then
         return none
+      let headName? := isTheoremAppHead? fn
+      if let some headName := headName? then
+        if isConstructorName (← getEnv) headName then
+          return none
 
       let mut app := fn
       let mut remainingType ← Meta.inferType fn
       let mut proofArgs : Array Expr := #[]
+      let mut proofLikeMask : Array Bool := #[]
       let mut sawProofArg := false
       let problematic := hasProblematicEvidence expr
 
@@ -534,13 +613,15 @@ mutual
         remainingType ← Meta.whnf remainingType
         let .forallE _ binderType body _ := remainingType
           | return none
-        if ← Meta.isProp binderType then
+        if ← isProofLikeBinderType binderType then
           let hole ← Meta.mkFreshExprSyntheticOpaqueMVar binderType
           app := mkApp app hole
           proofArgs := proofArgs.push arg
+          proofLikeMask := proofLikeMask.push true
           sawProofArg := true
         else
           app := mkApp app arg
+          proofLikeMask := proofLikeMask.push false
         remainingType := body.instantiate1 arg
 
       if !sawProofArg then
@@ -559,11 +640,12 @@ mutual
         let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts used decompileExpr
         return some result
 
-      let notationTerm ← theoremAppToNotationTermSyntax headName args
-      if ← refineTacMatchesProofArgs notationTerm exprTy proofArgs lctx localInsts then
-        let refineTac ← `(tactic| refine $notationTerm)
-        let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts used decompileExpr
-        return some result
+      if let some headName := headName? then
+        let notationTerm ← theoremAppToNotationTermSyntax headName args proofLikeMask
+        if ← refineTacMatchesProofArgs notationTerm exprTy proofArgs lctx localInsts then
+          let refineTac ← `(tactic| refine $notationTerm)
+          let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts used decompileExpr
+          return some result
 
       let compactTerm ← ppExprToTermSyntaxWith app false
       let usePpAll := !(← refineTacProducesGoals compactTerm exprTy proofArgs.size lctx localInsts)

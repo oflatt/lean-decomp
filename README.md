@@ -79,76 +79,154 @@ Notes:
 
 **Goal**: a low-level decompiler from grind proof terms to basic tactics. Short term we want to decompile every `grind` call in mathlib; long term we will simplify the resulting proof via a tactic-level pass.
 
-Current state:
-- The old `Omega.lean` path has been removed; the project is now exercising only the structural decompiler path.
-- The `eagerReduce` / certificate re-elaboration blocker for the `Nat` arithmetic examples in `LeanDecomp/Test.lean` is fixed.
-- Tests 6 and 7 in `LeanDecomp/Test.lean` now pass and are locked in with `#guard_msgs`.
-- Low-level handlers now cover `let` bindings, `eagerReduce -> decide`, `Eq.refl -> rfl`, structural `Eq.mp`, and a late theorem-application fallback that turns proof arguments into recursive subgoals instead of collapsing everything into one `exact`.
-- Recursive subproofs are validated in isolation; if a recursively generated tactic block does not close its subgoal, the decompiler falls back to `exact` for that subproof to preserve the re-elaboration invariant.
-- Hygiene artifacts such as `@Eq.mp✝` have been cleaned up in generated output.
-- Specialized handling now has an extension point: `LeanDecomp/Specialized.lean` runs package-specific handlers, and grind-specific helpers live in `LeanDecomp/Specialized/Grind.lean`.
+This section is intended as a handoff snapshot of the current branch state.
 
-### Nightly Baseline Check: `Unbundled/Int.lean` and `Int/Sum.lean`
+### What Is Working
 
-We re-ran the two historical baseline files with `scripts/nightly.py` using `--treatment decompile --no-benchmark`.
+- The project is fully on the structural decompiler path; the old `Omega.lean` route is gone.
+- `LeanDecomp/Test.lean` builds successfully, including the arithmetic regressions that previously failed on certificate-heavy `Eq.mp` terms.
+- The decompiler now has stable structural handlers for:
+  - lambdas / `intro`
+  - `let` bindings
+  - `casesOn`
+  - `False.rec` / contradiction-style eliminators
+  - `Eq.refl -> rfl`
+  - `eagerReduce -> decide`
+  - structural `Eq.mp`
+  - `propext` and `Iff.intro`
+  - late theorem-application fallback with recursive proof subgoals
+- Specialized grind handling now includes an `mt` handler, so terms of the shape `mt hPQ hnQ` decompile structurally instead of collapsing into a large `exact` term.
+- The theorem-application fallback now treats proof-valued functions as proof-like, which helps recurse into higher-order proof arguments instead of embedding large lambdas raw.
+- Proposition-valued `Eq.rec` / `Eq.ndrec` transports now have a dedicated decompiler-side handler in `LeanDecomp/EqDecomp.lean`, exposing them as explicit `Eq.mp`-style subgoals.
+- The output is back in line with the README policy: the decompiler does **not** emit `simp`, `simp_all`, `grind`, or `omega` as generated proof steps.
+
+### What We Learned Recently
+
+- Bigger proof terms are sometimes acceptable if they remove grind-specific scaffolding and expose recursive structure that the decompiler can handle.
+- A naive simplifier for single-cast `Eq.mp (Lean.Grind.not_eq_prop ...) h` was benchmark-negative on real mathlib examples, so that experiment was reverted.
+- Targeted decompiler-side transport handlers were safer than broad simplifier rewrites. A more aggressive `Eq.rec` simplification in `Simplify.lean` caused recursion-depth problems and was removed.
+- The `Int/Sum` failures are not just outer `convert` noise. Even the bare `sum_nbij` obligations still contain substantial proposition transport, `propext`, `congrArg`, `byContradiction`, and arithmetic structure.
+
+### Nightly Snapshot
+
+Recent focused nightly runs used:
+
+```bash
+python scripts/nightly.py \
+  mathlib4/Mathlib/Algebra/Order/Group/Unbundled/Int.lean \
+  --treatment decompile \
+  --no-benchmark \
+  --dump dump-nightly-int \
+  --output results-nightly-int.json
+
+python scripts/nightly.py \
+  mathlib4/Mathlib/Algebra/Order/Group/Int/Sum.lean \
+  --treatment decompile \
+  --no-benchmark \
+  --dump dump-nightly-sum \
+  --output results-nightly-sum.json
+```
 
 Current results:
 - `mathlib4/Mathlib/Algebra/Order/Group/Unbundled/Int.lean`: 5 `grind` sites found, 0 decompile successes.
-- `mathlib4/Mathlib/Algebra/Order/Group/Int/Sum.lean`: 4 `grind` sites found, 0 decompile successes.
+- `mathlib4/Mathlib/Algebra/Order/Group/Int/Sum.lean`: 4 `grind` sites found, 2 decompile successes.
 
-Current blockers from those nightly runs:
-- `Unbundled/Int.lean`: every decompile query currently fails during import/lint checking with `Declaration @Set.Subsingleton is not allowed to be imported by this file.` This is a query-generation/module-boundary problem, not yet a decompiler proof reconstruction failure.
-- `Int/Sum.lean`: current failures are decompiler-side. We saw:
-  - one heartbeat timeout during `whnf`
-  - two cast/certificate re-elaboration failures involving arithmetic boolean certificates (`Eq.refl true` no longer matching the expected certificate type)
-  - one generated-script bug with an unknown identifier `hEq`
+Current failure mode in both files:
+- the queries now fail because the decompiler eventually reaches the exact-fallback size guard and refuses to emit a giant proof term
+- this is progress compared to earlier generated-script breakage, because the current blocker is mostly "still too much low-level structure survives" rather than an obviously malformed tactic script
 
-The dumped nightly artifacts are useful for debugging these regressions:
+Recent progress inside `Int/Sum.lean`:
+- lines 55 and 81 now decompile successfully
+- both currently simplify to `apply Classical.byContradiction; intro hp; lia`
+- the remaining failures are lines 36 and 70
+
+Current fallback-size failures from the saved result files:
+- `results-nightly-int.json`: lines 47, 69, 76, 79, 91 fail with proof terms sized `55567`, `26945`, `16613`, `61538`, and `23007` nodes respectively
+- `results-nightly-sum.json`: lines 36 and 70 still fail with proof terms sized `12479` and `8521` nodes respectively
+
+Useful debug artifacts:
 - `dump-nightly-int/Mathlib/Algebra/Order/Group/Unbundled/Int/`
 - `dump-nightly-sum/Mathlib/Algebra/Order/Group/Int/Sum/`
 
-### Recent Milestone: Structural `Nat` Arithmetic Proofs Work
+### Main Open Blockers
 
-The key recent milestone was getting the `Nat` arithmetic `decompile grind` examples to validate without falling back to the original elaborated proof. The decompiler now reconstructs these proofs structurally, including the cast/certificate-heavy `Eq.mp` chains generated by grind.
+- `Unbundled/Int.lean` still contains grind-specific proposition transport, `Lean.Grind.not_eq_prop`, `mt`, `byContradiction`, `Or.casesOn`, and arithmetic certificates. The `mt` case improved, but not enough to get under the exact fallback limit.
+- `Int/Sum.lean` remains blocked on `sum_nbij` obligations. The hard obligations are full of transport around interval-membership statements such as `Finset.mem_Ico` / `Finset.mem_Ioc`, plus `propext`, `congrArg`, and contradiction-driven arithmetic reasoning.
+- An early arithmetic shortcut for `byContradiction` now handles some of those obligations before the decompiler unfolds the giant `Or.casesOn` / `Int.Linear` witness trees, which is why lines 55 and 81 now succeed.
+- The current decompiler can often preserve more structure than before, but it still lacks enough targeted handlers to turn those transported obligations into small recursive subgoals.
+- There is still no stage-3 tactic simplifier. That means even successful structural decompilation would remain noisier than desired.
 
-Important techniques that made this work:
-- decompile `Eq.mp` structurally with `refine @Eq.mp ... ?_ ?_`
-- special-case `eagerReduce` as `decide`
-- special-case cast-sensitive `Eq.refl`
-- split theorem applications into theorem head plus recursively decompiled proof arguments
+### Recommended Next Steps
 
-### Current Problem: Output Is Correct But Too Low-Level
+- Continue debugging from the saved `Int/Sum` query files, especially the standalone `sum_nbij` obligation shapes around lines 55 and 81.
+- Add targeted handling for transported interval-membership goals, especially proofs involving `Finset.mem_Ico`, `Finset.mem_Ioc`, and `Finset.mem_range` after `convert`.
+- Keep transport cleanup narrow and decompiler-side when possible; broad global rewrites in `Simplify.lean` have been fragile.
+- Preserve the current output policy: avoid introducing `simp` as a generated tactic even if it makes some obligations easier.
+- After more of the transport scaffolding is removed, re-run the two nightly slices above before broadening to larger mathlib folders.
 
-The generated tactics are now valid, but they still expose low-level theorem scaffolding that a human would not usually write directly. For example, arithmetic contradictions often begin with terms like:
+### Debugging Playbook
 
-```lean
-@Lean.Grind.Order.eq_trans_false
-  (@LE.le Nat _ 5 n)
-  (@LE.le Int _ 5 n)
-  ?_ ?_
+If you are resuming work on the current failures, this is the shortest path back into the problem.
+
+Start with the saved nightly artifacts rather than re-running all of mathlib:
+
+```bash
+# Re-check a saved failing query directly
+cd mathlib4
+lake env lean ../dump-nightly-sum/Mathlib/Algebra/Order/Group/Int/Sum/L55.decompile.query.lean
+
+# Or inspect a different preserved query
+lake env lean ../dump-nightly-sum/Mathlib/Algebra/Order/Group/Int/Sum/L81.decompile.query.lean
 ```
 
-This is faithful to the proof term, but not pleasant output. The next cleanup pass should aim to compress such terms into something closer to the human mathematical statement they represent, for example by:
-- pretty-printing proposition arguments instead of full elaborated `@LE.le ...` forms
-- recognizing common transport/cast lemmas such as `Nat.ToInt.le_eq`
-- collapsing theorem-head chains like `eq_trans_false` / `eq_trans_true'` into more direct contradiction steps
-- cleaning up explicit coercions and numerals
+Useful entry points:
+- `dump-nightly-sum/Mathlib/Algebra/Order/Group/Int/Sum/L55.decompile.query.lean`
+- `dump-nightly-sum/Mathlib/Algebra/Order/Group/Int/Sum/L81.decompile.query.lean`
+- `dump-nightly-int/Mathlib/Algebra/Order/Group/Unbundled/Int/`
+- `results-nightly-sum.json`
+- `results-nightly-int.json`
 
-This is exactly the kind of cleanup intended for the planned tactic-simplification stage, but some lightweight simplifications may also fit naturally in the term-to-tactic phase.
+When changing decompilation behavior, rebuild the focused regression file first:
 
-### Extension Architecture
+```bash
+lake build LeanDecomp.Test
+```
 
-We now have a small extensible layer for specialized decompilation logic:
-- core structural handlers remain in `Decompiler.lean`
-- package-specific hacks or cleanups can live under `LeanDecomp/Specialized/*`
-- the first package is `LeanDecomp/Specialized/Grind.lean`
+Then rerun just the targeted nightly slice:
 
-The intent is to keep the core decompiler generic while still making it easy to add targeted cleanup rules for particular proof producers such as `grind`.
+```bash
+python scripts/nightly.py \
+  mathlib4/Mathlib/Algebra/Order/Group/Int/Sum.lean \
+  --treatment decompile \
+  --no-benchmark \
+  --dump dump-nightly-sum \
+  --output results-nightly-sum.json
+```
 
-### Immediate Next Steps
+For `Int/Sum`, the most promising workflow is:
+- inspect the preserved `*.query.lean` file
+- isolate the failing obligation into a smaller probe if needed
+- inspect the simplified proof shape, especially whether the remaining head is `Eq.rec`, `Eq.ndrec`, `Eq.mp`, `propext`, `congrArg`, `mt`, or `byContradiction`
+- add the narrowest possible structural handler
+- rebuild `LeanDecomp.Test`
+- rerun only the affected nightly slice
 
-- Fix nightly query generation for restrictive module files such as `mathlib4/Mathlib/Algebra/Order/Group/Unbundled/Int.lean`, where the injected imports currently violate the file's allowed import boundary.
-- Fix the `Int/Sum.lean` regressions: the `hEq` name leak, the arithmetic certificate re-elaboration failures, and the expensive `whnf` path.
-- Simplify verbose theorem heads such as `Lean.Grind.Order.eq_trans_false` into output closer to what a human would write.
-- Build the tactic-simplification pass (stage 3) to clean up structurally correct but noisy proofs.
+Where to make changes:
+- if the issue is a proof-term normalization problem before decompilation, start in `LeanDecomp/Simplify.lean`
+- if the issue is equality transport or congruence structure, start in `LeanDecomp/EqDecomp.lean`
+- if the issue is theorem-application structure or fallback behavior, start in `LeanDecomp/Decompiler.lean`
+- if the issue is clearly grind-specific, start in `LeanDecomp/Specialized/Grind.lean`
+
+Things that already failed and should not be retried naively:
+- broad `Eq.rec` simplification in `LeanDecomp/Simplify.lean`
+- naive expansion of single-cast `Lean.Grind.not_eq_prop`
+- adding `simp` to generated proof output just to close arithmetic subgoals
+
+### Architecture Notes For Handoff
+
+- `LeanDecomp/Simplify.lean` performs Expr-level proof-term cleanup before decompilation.
+- `LeanDecomp/Decompiler.lean` is the main structural term-to-tactic pass and contains the late theorem-app fallback.
+- `LeanDecomp/EqDecomp.lean` is where equality, congruence, and proposition-transport handlers live.
+- `LeanDecomp/Specialized/Grind.lean` is the right place for grind-specific structural handlers such as the `mt` case.
+- When a recursive tactic block does not validate, the system should keep falling back to `exact` for that subproof rather than risk breaking the re-elaboration invariant.
 

@@ -227,11 +227,38 @@ private def simplifyEqMpTrueIntroEqTrue (e : Expr) : MetaM (Option Expr) := do
     f : Prop → Prop, h : a₁ = a₂, evidence : f a₁ → result : f a₂ -/
 private def simplifyCongrArgTransport (a₁ a₂ f h evidence : Expr)
     : MetaM (Option Expr) := do
+  let mkIffCongrRight (lhs rhs : Expr) : MetaM Expr := do
+    let fwd := Expr.lam `h lhs
+      (mkApp4 (mkConst ``Eq.mp [Level.zero]) a₁ a₂ h
+        (mkApp4 (mkConst ``Iff.mp) lhs a₁ evidence (.bvar 0))) .default
+    let bwd := Expr.lam `h rhs
+      (mkApp4 (mkConst ``Iff.mpr) lhs a₁ evidence
+        (mkApp4 (mkConst ``Eq.mpr [Level.zero]) a₁ a₂ h (.bvar 0))) .default
+    pure (mkApp4 (mkConst ``Iff.intro) lhs rhs fwd bwd)
+  let mkIffCongrLeft (lhs rhs : Expr) : MetaM Expr := do
+    let fwd := Expr.lam `h lhs
+      (mkApp4 (mkConst ``Iff.mp) a₁ rhs evidence
+        (mkApp4 (mkConst ``Eq.mpr [Level.zero]) a₁ a₂ h (.bvar 0))) .default
+    let bwd := Expr.lam `h rhs
+      (mkApp4 (mkConst ``Eq.mp [Level.zero]) a₁ a₂ h
+        (mkApp4 (mkConst ``Iff.mpr) a₁ rhs evidence (.bvar 0))) .default
+    pure (mkApp4 (mkConst ``Iff.intro) lhs rhs fwd bwd)
   -- f is a lambda: fun x => body
   if let .lam _ _ body _ := f then
     if !body.hasLooseBVars then return some evidence  -- constant function
     if body == .bvar 0 then  -- identity
       return some (mkApp4 (mkConst ``Eq.mp [Level.zero]) a₁ a₂ h evidence)
+    -- fun x => (P ↔ x) represented as proposition equality P = x
+    let (bodyFn, bodyArgs) := peelArgs body
+    if bodyFn.isConstOf ``Iff && bodyArgs.length == 2
+        && bodyArgs[1]! == .bvar 0 && !bodyArgs[0]!.hasLooseBVars then
+      let lhs := bodyArgs[0]!
+      return some (← mkIffCongrRight lhs a₂)
+    -- fun x => (x ↔ P) represented as proposition equality x = P
+    if bodyFn.isConstOf ``Iff && bodyArgs.length == 2
+        && bodyArgs[0]! == .bvar 0 && !bodyArgs[1]!.hasLooseBVars then
+      let rhs := bodyArgs[1]!
+      return some (← mkIffCongrLeft a₂ rhs)
     let (bodyFn, bodyArgs) := peelArgs body
     -- fun x => x ∧ Q  (And on left)
     if bodyFn.isConstOf ``And && bodyArgs.length == 2
@@ -262,6 +289,10 @@ private def simplifyCongrArgTransport (a₁ a₂ f h evidence : Expr)
   -- f = And P (partially applied)
   let fHead := f.getAppFn
   let fArgs := f.getAppArgs
+  -- Iff P (partially applied): transport equality evidence via transitivity.
+  if fHead.isConstOf ``Iff && fArgs.size == 1 then
+    let lhs := fArgs[0]!
+    return some (← mkIffCongrRight lhs a₂)
   if fHead.isConstOf ``And && fArgs.size == 1 then
     let P := fArgs[0]!
     let left := mkApp3 (mkConst ``And.left) P a₁ evidence
