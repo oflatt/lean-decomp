@@ -325,7 +325,12 @@ private partial def tryDecompAndProj (expr : Expr) (lctx : LocalContext)
     let some constName := Expr.constName? fn | return none
     if constName != ``And.left && constName != ``And.right then
       return none
-    let some andProof := args.getLast? | return none
+    -- @And.left/right takes {a b : Prop} (h : a ∧ b), so exactly 3 args.
+    -- Let the applied case (extra args) fall through to the theorem-app fallback
+    -- so both the And proof and the extra proof args get recursive subgoals.
+    if args.length != 3 then
+      return none
+    let andProof := args[2]!
     let headIdent : Ident := ⟨mkIdent constName |>.raw.setInfo .none⟩
     let applyTac ← `(tactic| apply $headIdent:ident)
     let result ← LeanDecomp.emitTacticWithSubgoals applyTac #[andProof] lctx localInsts used decompileExpr

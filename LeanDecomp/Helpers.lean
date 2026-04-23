@@ -146,14 +146,15 @@ def validateOrExact (proof : Expr) (lctx : LocalContext) (localInsts : LocalInst
     (used : List String) (build : TacticM (Array (TSyntax `tactic) × List String))
     : TacticM (Array (TSyntax `tactic) × List String) := do
   let proofTy ← instantiateMVars (← Meta.inferType proof)
-  let fallbackTacs ← mkExactFallbackTactics proof
   try
     let (candidateTacs, used') ← build
     if ← subproofTacticsCloseGoal candidateTacs proofTy lctx localInsts then
       return (candidateTacs, used')
     else
+      let fallbackTacs ← mkExactFallbackTactics proof
       return (fallbackTacs, used')
   catch _ =>
+    let fallbackTacs ← mkExactFallbackTactics proof
     return (fallbackTacs, used)
 
 def decompileOrExact (proof : Expr) (lctx : LocalContext) (localInsts : LocalInstances)

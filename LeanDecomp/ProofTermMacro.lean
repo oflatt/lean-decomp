@@ -143,5 +143,24 @@ elab "showtermexpanded " t:tacticSeq : tactic => withMainContext do
     let fmt ← ppExpr expandedProof
     logInfo m!"proof term:\n{fmt}"
 
+elab "showsimpl " t:tacticSeq : tactic => withMainContext do
+  let goalMVar ← getMainGoal
+  evalTactic (← `(tacticSeq| $t))
+  let proof ← instantiateMVars (mkMVar goalMVar)
+  let expandedProof ← expandAuxiliaryProofs proof
+  let simplifiedProof ← simplifyProofTerm expandedProof
+  let fmt ← ppExpr simplifiedProof
+  logInfo m!"simplified proof term:\n{fmt}"
+
+elab "showsimplexp " t:tacticSeq : tactic => withMainContext do
+  withOptions (fun o => o.setBool `pp.all true) do
+    let goalMVar ← getMainGoal
+    evalTactic (← `(tacticSeq| $t))
+    let proof ← instantiateMVars (mkMVar goalMVar)
+    let expandedProof ← expandAuxiliaryProofs proof
+    let simplifiedProof ← simplifyProofTerm expandedProof
+    let fmt ← ppExpr simplifiedProof
+    logInfo m!"simplified proof term:\n{fmt}"
+
 
 end LeanDecomp

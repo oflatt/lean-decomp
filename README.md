@@ -111,6 +111,8 @@ This section is intended as a handoff snapshot of the current branch state.
 - Targeted decompiler-side transport handlers were safer than broad simplifier rewrites. A more aggressive `Eq.rec` simplification in `Simplify.lean` caused recursion-depth problems and was removed.
 - The `Int/Sum` failures are not just outer `convert` noise. Even the bare `sum_nbij` obligations still contain substantial proposition transport, `propext`, `congrArg`, `byContradiction`, and arithmetic structure.
 - Preferring structural decompilation inside `byContradiction` unblocked `Int.lean` line 69 but also made the remaining `Sum.lean` failure terms larger (36 went `12479 → 17321`, 70 went `8521 → 12039`). The extra structure is real information, not regression — the fallback-size guard just rejects it when no handler closes the leaves.
+- `tryDecompAndProj` used `args.getLast?` to pick the And proof, which is correct only when `.left`/`.right` is applied with exactly 3 arguments. For the applied case `(h.right) extraArg ...` (where `h.right` returns a function), `getLast?` would pick the extra argument instead of the And proof, producing a wrong `apply And.right` with the wrong subgoal. Fixed by bailing out when `args.length != 3`, letting the theorem-app fallback handle the applied case by refining with holes for both the And proof and the extra proof args.
+- For some grind-produced proofs (Sum L70, Int L47), the structural decomposition now succeeds and closes the goal, but the generated `refine` tactics elaborate more slowly than the original `grind` call (e.g., 20s of refines vs. 100ms grind). This is an inherent limitation: the sub-terms still contain the same amount of low-level unification work, just wrapped in `refine` layers. Without targeted handlers that collapse `Int.Linear` / `Lean.Grind.CommRing` normalization chains into smaller tactics, some proofs cannot be usefully decomposed.
 
 ### Nightly Snapshot
 
@@ -136,15 +138,15 @@ Current results:
 - `mathlib4/Mathlib/Algebra/Order/Group/Unbundled/Int.lean`: 5 `grind` sites found, 1 decompile success (line 69).
 - `mathlib4/Mathlib/Algebra/Order/Group/Int/Sum.lean`: 4 `grind` sites found, 2 decompile successes (lines 55 and 81).
 
-All three successes currently simplify to `apply Classical.byContradiction; intro hp; lia`.
+Int L69 simplifies to `apply Classical.byContradiction; intro hp; lia`. Sum L55 and L81 now produce longer structural scripts (cases + let bindings + refines) after the `And.right` applied-projection fix exposed more of the proof structure.
 
-Current failure mode in both files:
-- the queries fail because the decompiler eventually reaches the exact-fallback size guard and refuses to emit a giant proof term
-- this is progress compared to earlier generated-script breakage, because the current blocker is mostly "still too much low-level structure survives" rather than an obviously malformed tactic script
+Current failure mode splits into two categories after recent decompiler work:
+- **Exact-fallback-too-large** (Int L76, L79, L91): the proof term still contains `Or.casesOn` / `Int.Linear` witness trees that no handler can decompose, so the size guard rejects the raw `exact` fallback.
+- **Deterministic timeout during elaboration** (Int L47, Sum L36, Sum L70): the structural decomposition now completes and produces valid tactics, but the resulting `refine` chain exceeds the 200k heartbeat limit when the elaborator re-checks the transported arithmetic arguments. This is progress (we no longer fall through to raw `exact`), but the generated tactics are slower than the original `grind` call and therefore not useful to suggest.
 
-Current fallback-size failures from the saved result files:
-- `results-nightly-int.json`: lines 47, 76, 79, 91 fail with proof terms sized `55567`, `16613`, `61538`, and `23007` nodes respectively
-- `results-nightly-sum.json`: lines 36 and 70 fail with proof terms sized `17321` and `12039` nodes respectively
+Current fallback-size failures and timeouts from the saved result files:
+- `results-nightly-int.json`: L76, L79, L91 fail with proof terms sized `16613`, `61538`, `23007` nodes; L47 times out during tactic execution.
+- `results-nightly-sum.json`: L36 and L70 time out at `whnf` / `isDefEq` during elaboration of the generated `refine` chain.
 
 Useful debug artifacts:
 - `dump-nightly-int/Mathlib/Algebra/Order/Group/Unbundled/Int/`
@@ -157,12 +159,12 @@ Useful debug artifacts:
 - The arithmetic-terminal fallback inside `byContradiction` continues to handle the easy obligations (lines 55 and 81 in `Sum.lean`, line 69 in `Int.lean`) before the decompiler would unfold the giant `Or.casesOn` / `Int.Linear` witness trees.
 - The current decompiler can often preserve more structure than before, but it still lacks enough targeted handlers to turn those transported obligations into small recursive subgoals.
 - There is still no stage-3 tactic simplifier. That means even successful structural decompilation would remain noisier than desired.
+- The structural-first failures that now timeout (Sum L36/L70, Int L47) reveal an efficiency gap: `refine` over raw `Int.Linear.norm_le` / `Lean.Grind.CommRing.*` arguments requires the elaborator to redo work that `grind` had already collapsed. Decomposition only helps when the sub-terms are themselves cheaper to elaborate than the full proof.
 
 ### Recommended Next Steps
 
-- Focus on the remaining `Sum.lean` failures (lines 36 and 70) — the preserved `*.query.lean` files are the fastest starting point.
-- Add targeted handling for transported interval-membership goals, especially proofs involving `Finset.mem_Ico`, `Finset.mem_Ioc`, and `Finset.mem_range` after `convert`.
-- For `Int.lean`, the remaining failures (L47, L76, L79, L91) are dominated by `Or.casesOn` / `Int.Linear` witness trees. New structural handlers for those shapes would likely unblock multiple sites at once.
+- Investigate whether the `Int.Linear.norm_le` normalization chains that dominate Sum L36/L70 and Int L47 can be replaced by a single `lia` / `cutsat` step at a higher level in the proof tree. A handler that detects `Eq.mp (Int.Linear.norm_le ...) h` and emits `(h : <original_type>)` with a `show` cast, or simply replaces the chain with `lia` when the result type is an arithmetic inequality, would shrink both the generated text and the elaboration time.
+- Add structural handlers for `Or.casesOn` / `And.casesOn` over arithmetic disjunctions (Int L76/L79/L91). These typically destructure a hypothesis of the form `a = 0 ∨ a = 1 ∨ a = -1` and call arithmetic terminals in each branch.
 - Keep transport cleanup narrow and decompiler-side when possible; broad global rewrites in `Simplify.lean` have been fragile.
 - Preserve the current output policy: avoid introducing `simp` as a generated tactic even if it makes some obligations easier.
 - After more of the transport scaffolding is removed, re-run the two nightly slices above before broadening to larger mathlib folders.
