@@ -94,11 +94,15 @@ This section is intended as a handoff snapshot of the current branch state.
   - `eagerReduce -> decide`
   - structural `Eq.mp`
   - `propext` and `Iff.intro`
+  - `Iff.mp` / `Iff.mpr` (via `refine` with two subgoals)
+  - `And.left` / `And.right` (via `apply` on the conjunction witness)
+  - proposition-valued `Eq.rec` / `Eq.ndrec` transports (`EqDecomp.lean`)
   - late theorem-application fallback with recursive proof subgoals
-- Specialized grind handling now includes an `mt` handler, so terms of the shape `mt hPQ hnQ` decompile structurally instead of collapsing into a large `exact` term.
-- The theorem-application fallback now treats proof-valued functions as proof-like, which helps recurse into higher-order proof arguments instead of embedding large lambdas raw.
-- Proposition-valued `Eq.rec` / `Eq.ndrec` transports now have a dedicated decompiler-side handler in `LeanDecomp/EqDecomp.lean`, exposing them as explicit `Eq.mp`-style subgoals.
-- The output is back in line with the README policy: the decompiler does **not** emit `simp`, `simp_all`, `grind`, or `omega` as generated proof steps.
+- `byContradiction` now tries structural decompilation of the contradiction body first, and only falls back to arithmetic terminals (`lia`, `grind_order`) when the structural script does not validate.
+- Specialized grind handling includes an `mt` handler, so terms of the shape `mt hPQ hnQ` decompile structurally instead of collapsing into a large `exact` term.
+- The theorem-application fallback treats proof-valued functions as proof-like, which helps recurse into higher-order proof arguments instead of embedding large lambdas raw. Proof-like arguments are also elided from generated notation terms as `?_` holes.
+- Arithmetic-like goal detection now recognizes grind automation constants (`Int.Linear.*`, `Nat.Linear.*`, `Lean.Grind.Order.*`, `Lean.Grind.CommRing.*`), which widens where `lia` is a safe terminal.
+- The output is in line with the README policy: the decompiler does **not** emit `simp`, `simp_all`, `grind`, or `omega` as generated proof steps.
 
 ### What We Learned Recently
 
@@ -106,6 +110,7 @@ This section is intended as a handoff snapshot of the current branch state.
 - A naive simplifier for single-cast `Eq.mp (Lean.Grind.not_eq_prop ...) h` was benchmark-negative on real mathlib examples, so that experiment was reverted.
 - Targeted decompiler-side transport handlers were safer than broad simplifier rewrites. A more aggressive `Eq.rec` simplification in `Simplify.lean` caused recursion-depth problems and was removed.
 - The `Int/Sum` failures are not just outer `convert` noise. Even the bare `sum_nbij` obligations still contain substantial proposition transport, `propext`, `congrArg`, `byContradiction`, and arithmetic structure.
+- Preferring structural decompilation inside `byContradiction` unblocked `Int.lean` line 69 but also made the remaining `Sum.lean` failure terms larger (36 went `12479 → 17321`, 70 went `8521 → 12039`). The extra structure is real information, not regression — the fallback-size guard just rejects it when no handler closes the leaves.
 
 ### Nightly Snapshot
 
@@ -128,21 +133,18 @@ python scripts/nightly.py \
 ```
 
 Current results:
-- `mathlib4/Mathlib/Algebra/Order/Group/Unbundled/Int.lean`: 5 `grind` sites found, 0 decompile successes.
-- `mathlib4/Mathlib/Algebra/Order/Group/Int/Sum.lean`: 4 `grind` sites found, 2 decompile successes.
+- `mathlib4/Mathlib/Algebra/Order/Group/Unbundled/Int.lean`: 5 `grind` sites found, 1 decompile success (line 69).
+- `mathlib4/Mathlib/Algebra/Order/Group/Int/Sum.lean`: 4 `grind` sites found, 2 decompile successes (lines 55 and 81).
+
+All three successes currently simplify to `apply Classical.byContradiction; intro hp; lia`.
 
 Current failure mode in both files:
-- the queries now fail because the decompiler eventually reaches the exact-fallback size guard and refuses to emit a giant proof term
+- the queries fail because the decompiler eventually reaches the exact-fallback size guard and refuses to emit a giant proof term
 - this is progress compared to earlier generated-script breakage, because the current blocker is mostly "still too much low-level structure survives" rather than an obviously malformed tactic script
 
-Recent progress inside `Int/Sum.lean`:
-- lines 55 and 81 now decompile successfully
-- both currently simplify to `apply Classical.byContradiction; intro hp; lia`
-- the remaining failures are lines 36 and 70
-
 Current fallback-size failures from the saved result files:
-- `results-nightly-int.json`: lines 47, 69, 76, 79, 91 fail with proof terms sized `55567`, `26945`, `16613`, `61538`, and `23007` nodes respectively
-- `results-nightly-sum.json`: lines 36 and 70 still fail with proof terms sized `12479` and `8521` nodes respectively
+- `results-nightly-int.json`: lines 47, 76, 79, 91 fail with proof terms sized `55567`, `16613`, `61538`, and `23007` nodes respectively
+- `results-nightly-sum.json`: lines 36 and 70 fail with proof terms sized `17321` and `12039` nodes respectively
 
 Useful debug artifacts:
 - `dump-nightly-int/Mathlib/Algebra/Order/Group/Unbundled/Int/`
@@ -150,16 +152,17 @@ Useful debug artifacts:
 
 ### Main Open Blockers
 
-- `Unbundled/Int.lean` still contains grind-specific proposition transport, `Lean.Grind.not_eq_prop`, `mt`, `byContradiction`, `Or.casesOn`, and arithmetic certificates. The `mt` case improved, but not enough to get under the exact fallback limit.
+- `Unbundled/Int.lean` still contains grind-specific proposition transport, `Lean.Grind.not_eq_prop`, `mt`, `byContradiction`, `Or.casesOn`, and arithmetic certificates. The `mt` case and the `byContradiction`-first structural pass improved L69, but not enough to get L47/L76/L79/L91 under the exact fallback limit.
 - `Int/Sum.lean` remains blocked on `sum_nbij` obligations. The hard obligations are full of transport around interval-membership statements such as `Finset.mem_Ico` / `Finset.mem_Ioc`, plus `propext`, `congrArg`, and contradiction-driven arithmetic reasoning.
-- An early arithmetic shortcut for `byContradiction` now handles some of those obligations before the decompiler unfolds the giant `Or.casesOn` / `Int.Linear` witness trees, which is why lines 55 and 81 now succeed.
+- The arithmetic-terminal fallback inside `byContradiction` continues to handle the easy obligations (lines 55 and 81 in `Sum.lean`, line 69 in `Int.lean`) before the decompiler would unfold the giant `Or.casesOn` / `Int.Linear` witness trees.
 - The current decompiler can often preserve more structure than before, but it still lacks enough targeted handlers to turn those transported obligations into small recursive subgoals.
 - There is still no stage-3 tactic simplifier. That means even successful structural decompilation would remain noisier than desired.
 
 ### Recommended Next Steps
 
-- Continue debugging from the saved `Int/Sum` query files, especially the standalone `sum_nbij` obligation shapes around lines 55 and 81.
+- Focus on the remaining `Sum.lean` failures (lines 36 and 70) — the preserved `*.query.lean` files are the fastest starting point.
 - Add targeted handling for transported interval-membership goals, especially proofs involving `Finset.mem_Ico`, `Finset.mem_Ioc`, and `Finset.mem_range` after `convert`.
+- For `Int.lean`, the remaining failures (L47, L76, L79, L91) are dominated by `Or.casesOn` / `Int.Linear` witness trees. New structural handlers for those shapes would likely unblock multiple sites at once.
 - Keep transport cleanup narrow and decompiler-side when possible; broad global rewrites in `Simplify.lean` have been fragile.
 - Preserve the current output policy: avoid introducing `simp` as a generated tactic even if it makes some obligations easier.
 - After more of the transport scaffolding is removed, re-run the two nightly slices above before broadening to larger mathlib folders.
@@ -206,7 +209,7 @@ python scripts/nightly.py \
 For `Int/Sum`, the most promising workflow is:
 - inspect the preserved `*.query.lean` file
 - isolate the failing obligation into a smaller probe if needed
-- inspect the simplified proof shape, especially whether the remaining head is `Eq.rec`, `Eq.ndrec`, `Eq.mp`, `propext`, `congrArg`, `mt`, or `byContradiction`
+- inspect the simplified proof shape, especially whether the remaining head is `Eq.rec`, `Eq.ndrec`, `Eq.mp`, `propext`, `congrArg`, `mt`, `Iff.mp`, `And.left`, `Or.casesOn`, or `byContradiction`
 - add the narrowest possible structural handler
 - rebuild `LeanDecomp.Test`
 - rerun only the affected nightly slice
