@@ -118,4 +118,20 @@ info: Try this:
 example (h : False) : False := by
   decompile exact h
 
+-- Test 12: nested `not_eq_prop` casts simplify to a direct proof of `¬ Q`.
+/--
+info: Try this:
+  [apply] intro hq
+    apply h
+    · apply propext
+      · constructor
+        · intro x1
+          exact hq
+        · intro x1_1
+          exact hp
+-/
+#guard_msgs (whitespace := lax) in
+example (P Q : Prop) (h : ¬ (P = Q)) (hp : P) : ¬ Q := by
+  decompile exact (Eq.mp (Eq.mp (Lean.Grind.not_eq_prop P Q) h) hp)
+
 end LeanDecomp.Test

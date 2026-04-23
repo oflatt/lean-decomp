@@ -1,5 +1,6 @@
 import Lean
 import LeanDecomp.CasesOn
+import LeanDecomp.Simplify.Grind
 
 /-! # Proof term simplification pass
 
@@ -88,319 +89,6 @@ private def simplifyId (e : Expr) : Option Expr := do
   let cname ← idConst.constName?
   guard (cname == ``id)
   return body
-
-/-- Unfold grind marker wrappers that are just identity functions.
-    `Lean.Grind.alreadyNorm p` → `p` (it's `def alreadyNorm (p : Prop) : Prop := p`)
-    `Lean.Grind.nestedProof p h` → `h` (it's `def nestedProof (p : Prop) {h : p} : p := h`)
-    `Lean.Grind.Marker a` → `a` (it's `@[inline] def Marker {α} (a : α) : α := a`)
-    `Lean.Grind.em p` → `Classical.em p` (it's `theorem em (p) : alreadyNorm p ∨ alreadyNorm (¬ p) := Classical.em p`) -/
-private def simplifyGrindWrappers (e : Expr) : MetaM (Option Expr) := do
-  let (fn, args) := peelArgs e
-  let some cname := fn.constName? | return none
-  if cname == ``Lean.Grind.alreadyNorm then
-    -- alreadyNorm p := p, so just delta-expand
-    let reduced ← Meta.deltaExpand e (· == ``Lean.Grind.alreadyNorm)
-    if reduced != e then return some reduced
-    return none
-  if cname == ``Lean.Grind.nestedProof then
-    let reduced ← Meta.deltaExpand e (· == ``Lean.Grind.nestedProof)
-    if reduced != e then return some reduced
-    return none
-  if cname == ``Lean.Grind.Marker then
-    let reduced ← Meta.deltaExpand e (· == ``Lean.Grind.Marker)
-    if reduced != e then return some reduced
-    return none
-  if cname == ``Lean.Grind.em then
-    -- em p : alreadyNorm p ∨ alreadyNorm (¬ p) := Classical.em p
-    -- After unfolding alreadyNorm, this is just Classical.em p
-    if args.length >= 1 then
-      let p := args[0]!
-      return some (mkApp (mkConst ``Classical.em []) p)
-    return none
-  return none
-
--- ═══════════════════════════════════════════════════════
--- Grind combinator simplification
--- ═══════════════════════════════════════════════════════
-
-/-- Build `Eq.mpr h True.intro` for `h : src = True`. -/
-private def mkMprTrue (src h : Expr) : Expr :=
-  mkApp4 (mkConst ``Eq.mpr [Level.zero]) src (mkConst ``True) h (mkConst ``True.intro)
-
-/-- Build `propext (Iff.intro fwd bwd) : lhs = rhs`. -/
-private def mkPropextIff (lhs rhs fwd bwd : Expr) : Expr :=
-  mkApp3 (mkConst ``propext) lhs rhs
-    (mkApp4 (mkConst ``Iff.intro) lhs rhs fwd bwd)
-
-/-- Simplify `Lean.Grind.*` theorem-based combinator applications to standard-library
-    equivalents (`eq_true`, `eq_false'`, `propext`).  These standard forms are then
-    handled by `simplifyPropCast` on re-traversal. -/
-private def simplifyGrindCombinators (e : Expr) : MetaM (Option Expr) := do
-  let (fn, args) := peelArgs e
-  let some cname := fn.constName? | return none
-  match cname with
-  -- ═══ And ═══
-  | ``Lean.Grind.eq_true_of_and_eq_true_left =>
-    -- {a b} (h : (a ∧ b) = True) : a = True
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let pair := mkMprTrue (mkApp2 (mkConst ``And) a b) h
-    return some (mkApp2 (mkConst ``eq_true) a (mkApp3 (mkConst ``And.left) a b pair))
-  | ``Lean.Grind.eq_true_of_and_eq_true_right =>
-    -- {a b} (h : (a ∧ b) = True) : b = True
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let pair := mkMprTrue (mkApp2 (mkConst ``And) a b) h
-    return some (mkApp2 (mkConst ``eq_true) b (mkApp3 (mkConst ``And.right) a b pair))
-  | ``Lean.Grind.and_eq_of_eq_true_left =>
-    -- {a b} (h : a = True) : (a ∧ b) = b
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let andAB := mkApp2 (mkConst ``And) a b
-    let fwd := Expr.lam `h andAB (mkApp3 (mkConst ``And.right) a b (.bvar 0)) .default
-    let bwd := Expr.lam `h b (mkApp4 (mkConst ``And.intro) a b (mkMprTrue a h) (.bvar 0)) .default
-    return some (mkPropextIff andAB b fwd bwd)
-  | ``Lean.Grind.and_eq_of_eq_true_right =>
-    -- {a b} (h : b = True) : (a ∧ b) = a
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let andAB := mkApp2 (mkConst ``And) a b
-    let fwd := Expr.lam `h andAB (mkApp3 (mkConst ``And.left) a b (.bvar 0)) .default
-    let bwd := Expr.lam `h a (mkApp4 (mkConst ``And.intro) a b (.bvar 0) (mkMprTrue b h)) .default
-    return some (mkPropextIff andAB a fwd bwd)
-  | ``Lean.Grind.and_eq_of_eq_false_left =>
-    -- {a b} (h : a = False) : (a ∧ b) = False
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let andAB := mkApp2 (mkConst ``And) a b
-    let body := mkApp
-      (mkApp3 (mkConst ``Eq.mp [Level.zero]) a (mkConst ``False) h)
-      (mkApp3 (mkConst ``And.left) a b (.bvar 0))
-    return some (mkApp2 (mkConst ``eq_false') andAB (Expr.lam `h andAB body .default))
-  | ``Lean.Grind.and_eq_of_eq_false_right =>
-    -- {a b} (h : b = False) : (a ∧ b) = False
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let andAB := mkApp2 (mkConst ``And) a b
-    let body := mkApp
-      (mkApp3 (mkConst ``Eq.mp [Level.zero]) b (mkConst ``False) h)
-      (mkApp3 (mkConst ``And.right) a b (.bvar 0))
-    return some (mkApp2 (mkConst ``eq_false') andAB (Expr.lam `h andAB body .default))
-  -- ═══ Or ═══
-  | ``Lean.Grind.eq_false_of_or_eq_false_left =>
-    -- {a b} (h : (a ∨ b) = False) : a = False
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let orAB := mkApp2 (mkConst ``Or) a b
-    let body := mkApp
-      (mkApp3 (mkConst ``Eq.mp [Level.zero]) orAB (mkConst ``False) h)
-      (mkApp3 (mkConst ``Or.inl) a b (.bvar 0))
-    return some (mkApp2 (mkConst ``eq_false') a (Expr.lam `h a body .default))
-  | ``Lean.Grind.eq_false_of_or_eq_false_right =>
-    -- {a b} (h : (a ∨ b) = False) : b = False
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let orAB := mkApp2 (mkConst ``Or) a b
-    let body := mkApp
-      (mkApp3 (mkConst ``Eq.mp [Level.zero]) orAB (mkConst ``False) h)
-      (mkApp3 (mkConst ``Or.inr) a b (.bvar 0))
-    return some (mkApp2 (mkConst ``eq_false') b (Expr.lam `h b body .default))
-  | ``Lean.Grind.or_eq_of_eq_true_left =>
-    -- {a b} (h : a = True) : (a ∨ b) = True
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let orAB := mkApp2 (mkConst ``Or) a b
-    return some (mkApp2 (mkConst ``eq_true) orAB (mkApp3 (mkConst ``Or.inl) a b (mkMprTrue a h)))
-  | ``Lean.Grind.or_eq_of_eq_true_right =>
-    -- {a b} (h : b = True) : (a ∨ b) = True
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let orAB := mkApp2 (mkConst ``Or) a b
-    return some (mkApp2 (mkConst ``eq_true) orAB (mkApp3 (mkConst ``Or.inr) a b (mkMprTrue b h)))
-  | ``Lean.Grind.or_eq_of_eq_false_left =>
-    -- {a b} (h : a = False) : (a ∨ b) = b
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let orAB := mkApp2 (mkConst ``Or) a b
-    -- fwd: fun hab => Or.elim hab (fun ha => False.elim (Eq.mp h ha)) (fun hb => hb)
-    let leftBr := Expr.lam `h a
-      (mkApp2 (mkConst ``False.elim [Level.zero]) b
-        (mkApp (mkApp3 (mkConst ``Eq.mp [Level.zero]) a (mkConst ``False) h) (.bvar 0))) .default
-    let rightBr := Expr.lam `h b (.bvar 0) .default
-    let fwd := Expr.lam `h orAB
-      (mkAppN (mkConst ``Or.elim) #[a, b, b, .bvar 0, leftBr, rightBr]) .default
-    let bwd := Expr.lam `h b (mkApp3 (mkConst ``Or.inr) a b (.bvar 0)) .default
-    return some (mkPropextIff orAB b fwd bwd)
-  | ``Lean.Grind.or_eq_of_eq_false_right =>
-    -- {a b} (h : b = False) : (a ∨ b) = a
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let orAB := mkApp2 (mkConst ``Or) a b
-    let leftBr := Expr.lam `h a (.bvar 0) .default
-    let rightBr := Expr.lam `h b
-      (mkApp2 (mkConst ``False.elim [Level.zero]) a
-        (mkApp (mkApp3 (mkConst ``Eq.mp [Level.zero]) b (mkConst ``False) h) (.bvar 0))) .default
-    let fwd := Expr.lam `h orAB
-      (mkAppN (mkConst ``Or.elim) #[a, b, a, .bvar 0, leftBr, rightBr]) .default
-    let bwd := Expr.lam `h a (mkApp3 (mkConst ``Or.inl) a b (.bvar 0)) .default
-    return some (mkPropextIff orAB a fwd bwd)
-  -- ═══ Not ═══
-  | ``Lean.Grind.eq_false_of_not_eq_true =>
-    -- {a} (h : (¬a) = True) : a = False
-    if args.length < 2 then return none
-    let a := args[0]!; let h := args[1]!
-    -- Eq.mpr h True.intro : ¬a ≡ a → False
-    return some (mkApp2 (mkConst ``eq_false') a (mkMprTrue (mkApp (mkConst ``Not) a) h))
-  | ``Lean.Grind.eq_true_of_not_eq_false =>
-    -- {a} (h : (¬a) = False) : a = True
-    if args.length < 2 then return none
-    let a := args[0]!; let h := args[1]!
-    let notA := mkApp (mkConst ``Not) a
-    -- Eq.mp h : ¬a → False;  byContradiction (Eq.mp h) : a
-    let mp := mkApp3 (mkConst ``Eq.mp [Level.zero]) notA (mkConst ``False) h
-    return some (mkApp2 (mkConst ``eq_true) a (mkApp2 (mkConst ``Classical.byContradiction) a mp))
-  | ``Lean.Grind.not_eq_of_eq_true =>
-    -- {a} (h : a = True) : (¬a) = False
-    if args.length < 2 then return none
-    let a := args[0]!; let h := args[1]!
-    let notA := mkApp (mkConst ``Not) a
-    -- fun hna : ¬a => hna (Eq.mpr h True.intro)
-    let body := mkApp (.bvar 0) (mkMprTrue a h)
-    return some (mkApp2 (mkConst ``eq_false') notA (Expr.lam `h notA body .default))
-  | ``Lean.Grind.not_eq_of_eq_false =>
-    -- {a} (h : a = False) : (¬a) = True
-    if args.length < 2 then return none
-    let a := args[0]!; let h := args[1]!
-    let notA := mkApp (mkConst ``Not) a
-    -- Eq.mp h : a → False ≡ ¬a
-    return some (mkApp2 (mkConst ``eq_true) notA (mkApp3 (mkConst ``Eq.mp [Level.zero]) a (mkConst ``False) h))
-  -- ═══ Implies ═══
-  | ``Lean.Grind.imp_eq_of_eq_false_left =>
-    -- {a b} (h : a = False) : (a → b) = True
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let impAB := Expr.forallE `_ a b .default
-    -- fun ha : a => False.elim (Eq.mp h ha)
-    let body := mkApp2 (mkConst ``False.elim [Level.zero]) b
-      (mkApp (mkApp3 (mkConst ``Eq.mp [Level.zero]) a (mkConst ``False) h) (.bvar 0))
-    return some (mkApp2 (mkConst ``eq_true) impAB (Expr.lam `h a body .default))
-  | ``Lean.Grind.imp_eq_of_eq_true_right =>
-    -- {a b} (h : b = True) : (a → b) = True
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let impAB := Expr.forallE `_ a b .default
-    return some (mkApp2 (mkConst ``eq_true) impAB (Expr.lam `_ a (mkMprTrue b h) .default))
-  | ``Lean.Grind.imp_eq_of_eq_true_left =>
-    -- {a b} (h : a = True) : (a → b) = b
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let impAB := Expr.forallE `_ a b .default
-    let fwd := Expr.lam `f impAB (mkApp (.bvar 0) (mkMprTrue a h)) .default
-    -- bwd: fun hb : b => fun _ : a => hb  (de Bruijn: bvar 1 = hb)
-    let bwd := Expr.lam `h b (Expr.lam `_ a (.bvar 1) .default) .default
-    return some (mkPropextIff impAB b fwd bwd)
-  | ``Lean.Grind.eq_true_of_imp_eq_false =>
-    -- {a b} (h : (a → b) = False) : a = True
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let impAB := Expr.forallE `_ a b .default
-    -- byContradiction (fun hna : ¬a => Eq.mp h (fun ha : a => False.elim (hna ha)))
-    -- inner: fun ha : a => False.elim b (bvar 1 bvar 0)  [bvar 1=hna, bvar 0=ha]
-    let innerBody := mkApp2 (mkConst ``False.elim [Level.zero]) b (mkApp (.bvar 1) (.bvar 0))
-    let vacuousF := Expr.lam `h a innerBody .default
-    let byContraBody := mkApp
-      (mkApp3 (mkConst ``Eq.mp [Level.zero]) impAB (mkConst ``False) h)
-      vacuousF
-    let notA := mkApp (mkConst ``Not) a
-    let lam := Expr.lam `h notA byContraBody .default
-    return some (mkApp2 (mkConst ``eq_true) a (mkApp2 (mkConst ``Classical.byContradiction) a lam))
-  | ``Lean.Grind.eq_false_of_imp_eq_false =>
-    -- {a b} (h : (a → b) = False) : b = False
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let impAB := Expr.forallE `_ a b .default
-    -- fun hb : b => Eq.mp h (fun _ : a => hb)  [inner bvar 1=hb]
-    let constF := Expr.lam `_ a (.bvar 1) .default
-    let body := mkApp (mkApp3 (mkConst ``Eq.mp [Level.zero]) impAB (mkConst ``False) h) constF
-    return some (mkApp2 (mkConst ``eq_false') b (Expr.lam `h b body .default))
-  | ``Lean.Grind.eq_false_of_imp_eq_true =>
-    -- {a b} (h₁ : (a → b) = True) (h₂ : b = False) : a = False
-    if args.length < 4 then return none
-    let a := args[0]!; let b := args[1]!; let h₁ := args[2]!; let h₂ := args[3]!
-    let impAB := Expr.forallE `_ a b .default
-    -- fun ha : a => Eq.mp h₂ ((Eq.mpr h₁ True.intro) ha)
-    let f := mkMprTrue impAB h₁
-    let body := mkApp
-      (mkApp3 (mkConst ``Eq.mp [Level.zero]) b (mkConst ``False) h₂)
-      (mkApp f (.bvar 0))
-    return some (mkApp2 (mkConst ``eq_false') a (Expr.lam `h a body .default))
-  -- ═══ Prop Eq ═══
-  | ``Lean.Grind.eq_eq_of_eq_true_left =>
-    -- {a b : Prop} (h : a = True) : (a = b) = b
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let prop := mkSort Level.zero
-    let eqAB := mkApp3 (mkConst ``Eq [Level.succ Level.zero]) prop a b
-    let aVal := mkMprTrue a h
-    -- fwd: fun hab : a = b => Eq.mp hab aVal
-    let fwd := Expr.lam `h eqAB
-      (mkApp4 (mkConst ``Eq.mp [Level.zero]) a b (.bvar 0) aVal) .default
-    -- bwd: fun hb : b => propext ⟨fun _ : a => hb, fun _ : b => aVal⟩
-    let iffFwd := Expr.lam `_ a (.bvar 1) .default  -- bvar 1 = hb
-    let iffBwd := Expr.lam `_ b aVal .default
-    let bwd := Expr.lam `h b
-      (mkApp3 (mkConst ``propext) a b (mkApp4 (mkConst ``Iff.intro) a b iffFwd iffBwd)) .default
-    return some (mkPropextIff eqAB b fwd bwd)
-  | ``Lean.Grind.eq_eq_of_eq_true_right =>
-    -- {a b : Prop} (h : b = True) : (a = b) = a
-    if args.length < 3 then return none
-    let a := args[0]!; let b := args[1]!; let h := args[2]!
-    let prop := mkSort Level.zero
-    let eqAB := mkApp3 (mkConst ``Eq [Level.succ Level.zero]) prop a b
-    let bVal := mkMprTrue b h
-    -- fwd: fun hab : a = b => Eq.mpr hab bVal
-    let fwd := Expr.lam `h eqAB
-      (mkApp4 (mkConst ``Eq.mpr [Level.zero]) a b (.bvar 0) bVal) .default
-    -- bwd: fun ha : a => propext ⟨fun _ : a => bVal, fun _ : b => ha⟩
-    let iffFwd := Expr.lam `_ a bVal .default
-    let iffBwd := Expr.lam `_ b (.bvar 1) .default  -- bvar 1 = ha
-    let bwd := Expr.lam `h a
-      (mkApp3 (mkConst ``propext) a b (mkApp4 (mkConst ``Iff.intro) a b iffFwd iffBwd)) .default
-    return some (mkPropextIff eqAB a fwd bwd)
-  | _ => return none
-
-/-- Reduce `intro_with_eq p p' q he k hp` → `k (Eq.mp he hp)` (or `k hp` when p ≡ p'). -/
-private def simplifyIntroWithEq (e : Expr) : MetaM (Option Expr) := do
-  let (fn, args) := peelArgs e
-  let some cname := fn.constName? | return none
-  if cname != ``Lean.Grind.intro_with_eq && cname != ``Lean.Grind.intro_with_eq' then
-    return none
-  if args.length == 6 then
-    -- Fully applied: intro_with_eq p p' q he k hp
-    let p := args[0]!; let p' := args[1]!; let k := args[4]!; let hp := args[5]!
-    let arg ← if (← Meta.withDefault <| Meta.isDefEq p p') then
-      pure hp
-    else
-      let he := args[3]!
-      pure (mkApp4 (mkConst ``Eq.mp [Level.zero]) p p' he hp)
-    return some (Expr.app k arg).headBeta
-  else if args.length == 5 then
-    -- Partially applied: returns p → q, construct lambda
-    let p := args[0]!; let p' := args[1]!; let k := args[4]!
-    let body ← if (← Meta.withDefault <| Meta.isDefEq p p') then
-      pure (Expr.lam `hp p
-        (Expr.app (k.liftLooseBVars 0 1) (.bvar 0))
-        .default)
-    else
-      let he := args[3]!
-      pure (Expr.lam `hp p
-        (Expr.app (k.liftLooseBVars 0 1)
-          (mkApp4 (mkConst ``Eq.mp [Level.zero])
-            (p.liftLooseBVars 0 1) (p'.liftLooseBVars 0 1)
-            (he.liftLooseBVars 0 1) (.bvar 0)))
-        .default)
-    return some body
-  return none
 
 /-- Reduce `*.noConfusion` applications via whnf. -/
 private def simplifyNoConfusion (e : Expr) : MetaM (Option Expr) := do
@@ -519,6 +207,8 @@ private def simplifyCongrArgTransport (a₁ a₂ f h evidence : Expr)
     Converts grind's equality-based propositional transport into Iff-based operations.
     Inspired by lean-calcify's approach of flattening congruence chains. -/
 private def simplifyPropCast (e : Expr) : MetaM (Option Expr) := do
+  if let some r ← simplifyGrindPropCast e then
+    return some r
   let (fn, args) := peelArgs e
   let some cname := fn.constName? | return none
   if cname != ``Eq.mp && cname != ``Eq.mpr then return none
@@ -530,13 +220,6 @@ private def simplifyPropCast (e : Expr) : MetaM (Option Expr) := do
   let evidence := args[3]!
   let (eqFn, eqArgs) := peelArgs eqProof
   let some eqName := eqFn.constName? | return none
-  -- Handle Eq.mp.{1} (iff_eq p q) iff_proof → propext iff_proof
-  -- iff_eq : (p ↔ q) = (p = q) at Sort 1 level
-  if eqName == ``Lean.Grind.iff_eq then
-    if eqArgs.length < 2 then return none
-    if isForward then
-      return some (mkApp3 (mkConst ``propext) eqArgs[0]! eqArgs[1]! evidence)
-    else return none
   -- All remaining cases require Prop-level transport (u = 0)
   match levels with
   | [Level.zero] => pure ()
@@ -650,7 +333,7 @@ private def simplifyPost (e : Expr) : MetaM TransformStep := do
   -- handleable eq proof heads (e.g. iff_eq → propext in children).
   if let some r ← simplifyPropCast e then return .visit r
   if let some r ← simplifyGrindWrappers e then return .visit r
-  if let some r ← simplifyIntroWithEq e then return .visit r
+  if let some r ← simplifyGrindIntroWithEq e then return .visit r
   if let some r ← simplifyNoConfusion e then return .visit r
   if let some r ← simplifyEqRec e then return .visit r
   if let some r ← simplifyFalseElim e then return .visit r
