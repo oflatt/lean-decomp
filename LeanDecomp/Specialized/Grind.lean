@@ -35,9 +35,28 @@ def tryDecompEqMpAutomationCast (expr : Expr) (lctx : LocalContext)
       return some (tactics, used')
     return none
 
+/-- `mt` takes an implication proof as a function-typed argument, so the generic
+    theorem-app fallback treats it as an ordinary term and embeds it raw. Expose
+    both arguments as subgoals instead so the decompiler can recurse into the
+    implication proof structurally. -/
+def tryDecompMt (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  let (fn, args) := peelArgs expr
+  let some cname := fn.constName? | return none
+  if cname != ``mt then return none
+  if args.length < 4 then return none
+  let impProof := args[2]!
+  let negProof := args[3]!
+  let mtIdent : Ident := ⟨mkIdent ``mt |>.raw.setInfo .none⟩
+  let headTac ← `(tactic| apply $mtIdent:ident)
+  let result ← LeanDecomp.emitTacticWithSubgoals headTac #[impProof, negProof] lctx localInsts used decompileExpr
+  return some result
+
 def handlers : List (Expr → LocalContext → LocalInstances → List String → DecompileCallback →
     TacticM (Option (Array (TSyntax `tactic) × List String))) := [
-  tryDecompEqMpAutomationCast
+  tryDecompEqMpAutomationCast,
+  tryDecompMt
 ]
 
 end LeanDecomp.Specialized.Grind

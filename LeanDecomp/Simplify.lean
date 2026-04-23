@@ -111,6 +111,73 @@ private def simplifyEqRec (e : Expr) : MetaM (Option Expr) := do
   if reduced != e then return some reduced
   return none
 
+/-- Reduce lightweight equality/heterogeneous-equality transport wrappers produced by
+    `convert` and generalized-equation elaboration. These are often definitionally
+    reducible once their proof arguments have been simplified, and exposing the
+    transported body lets the decompiler recover theorem structure instead of
+    falling back to a giant exact term. -/
+private def simplifyEqTransport (e : Expr) : MetaM (Option Expr) := do
+  let (fn, _) := peelArgs e
+  let some cname := fn.constName? | return none
+  if cname != ``Eq.casesOn && cname != ``eq_of_heq && cname != ``heq_of_eq then
+    return none
+  let reduced ← Meta.whnf e
+  if reduced != e then return some reduced
+  return none
+
+/-- Simplify HEq transport proofs enough for `eq_of_heq` to collapse. This is a
+    lightweight copy of the convert/generalized-equality reductions we need in the
+    main proof-term simplifier, without pulling in the full equality decompiler. -/
+private partial def simplifyHEqTransportProof (e : Expr) : MetaM Expr := do
+  let e := e.headBeta
+  let (fn, args) := peelArgs e
+  match fn.constName? with
+  | some ``HEq.refl =>
+      pure e
+  | some ``heq_of_eq =>
+      let some hEq := args.getLast? | pure e
+      let hEq' ← simplifyHEqTransportProof hEq
+      let (hEqFn, hEqArgs) := peelArgs hEq'
+      match hEqFn.constName? with
+      | some ``Eq.refl =>
+          let some x := hEqArgs.getLast? | pure e
+          mkHEqRefl x
+      | _ =>
+          if hEq' != hEq then
+            mkAppM ``heq_of_eq #[hEq']
+          else
+            pure e
+  | some ``Eq.ndrec | some ``Eq.rec | some ``Eq.casesOn =>
+      let reduced ← Meta.whnf e
+      if reduced != e then
+        simplifyHEqTransportProof reduced
+      else
+        pure e
+  | _ =>
+      pure e
+
+/-- Collapse `eq_of_heq` once its HEq witness has simplified to either `heq_of_eq`
+    or `HEq.refl`. This removes convert-generated transport wrappers and exposes
+    the underlying equality proof to the decompiler. -/
+private def simplifyEqOfHEq (e : Expr) : MetaM (Option Expr) := do
+  let (fn, args) := peelArgs e
+  if fn.constName? != some ``eq_of_heq then
+    return none
+  let some hHeq := args.getLast? | return none
+  let hHeq' ← simplifyHEqTransportProof hHeq
+  let (hFn, hArgs) := peelArgs hHeq'
+  match hFn.constName? with
+  | some ``HEq.refl =>
+      let some x := hArgs.getLast? | return none
+      return some (← mkEqRefl x)
+  | some ``heq_of_eq =>
+      let some hEq := hArgs.getLast? | return none
+      return some hEq
+  | _ =>
+      if hHeq' != hHeq then
+        return some (mkAppN fn ((args.dropLast ++ [hHeq']).toArray))
+      return none
+
 /-- Collapse `Eq.mp (Eq.refl _) body → body` (identity transport).
     This is common in grind proofs where normalization produces
     `Eq.mp (Eq.refl T) x` which is just `x`. -/
@@ -336,6 +403,8 @@ private def simplifyPost (e : Expr) : MetaM TransformStep := do
   if let some r ← simplifyGrindIntroWithEq e then return .visit r
   if let some r ← simplifyNoConfusion e then return .visit r
   if let some r ← simplifyEqRec e then return .visit r
+  if let some r ← simplifyEqTransport e then return .visit r
+  if let some r ← simplifyEqOfHEq e then return .visit r
   if let some r ← simplifyFalseElim e then return .visit r
   return .done e
 

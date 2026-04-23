@@ -76,7 +76,9 @@ info: Try this:
     · lia
     · refine @Eq.mp (¬n ≤ 9) (9 + 1 ≤ n) ?_ ?_
       · lia
-      · lia
+      · apply mt
+        · lia
+        · exact hp
 -/
 #guard_msgs (whitespace := lax) in
 example (n : Nat) (h : n < 5) : n < 10 := by
@@ -133,5 +135,16 @@ info: Try this:
 #guard_msgs (whitespace := lax) in
 example (P Q : Prop) (h : ¬ (P = Q)) (hp : P) : ¬ Q := by
   decompile exact (Eq.mp (Eq.mp (Lean.Grind.not_eq_prop P Q) h) hp)
+
+-- Test 13: recurse into `mt` implication proofs instead of embedding them raw.
+/--
+info: Try this:
+  [apply] apply mt
+    · exact hPQ
+    · exact hnQ
+-/
+#guard_msgs (whitespace := lax) in
+example (P Q : Prop) (hPQ : P → Q) (hnQ : ¬ Q) : ¬ P := by
+  decompile exact mt hPQ hnQ
 
 end LeanDecomp.Test
