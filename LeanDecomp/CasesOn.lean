@@ -424,9 +424,29 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
 
       alts := alts.push altStx
 
-    let discriminantStx ← withOptions (fun o =>
-        (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
-      delabToRefinableSyntax info.discriminant
+    -- When the discriminant is a complex term application (not a local fvar),
+    -- emit `have hOr : <type> := by <disc_tactics>; cases hOr with ...` so the
+    -- big term is built tactically and the `cases` sees only a simple name.
+    -- This avoids the re-elaboration failures we get when a giant `Eq.mp`
+    -- chain is embedded inline in a `cases` position.
+    let mut preTacs : Array (TSyntax `tactic) := #[]
+    let useHaveWrapper := info.discriminant.isApp && info.discriminant.fvarId?.isNone
+    let discTerm : Term ← if useHaveWrapper then do
+        let discType ← instantiateMVars (← Meta.inferType info.discriminant)
+        let discTypeStx ← delabToRefinableSyntax discType
+        let (discTactics, usedAfter) ←
+          LeanDecomp.decompileOrExact info.discriminant lctx localInsts used decompileExpr
+        let discSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$discTactics]*)
+        let hOrName := LeanDecomp.mkUniqueName "hOr" usedAfter
+        used := hOrName :: usedAfter
+        let hOrIdent : Ident := ⟨mkIdent (Name.mkSimple hOrName) |>.raw.setInfo .none⟩
+        let haveTac ← `(tactic| have $hOrIdent:ident : $discTypeStx := by $discSeq)
+        preTacs := #[haveTac]
+        `($hOrIdent:ident)
+      else
+        withOptions (fun o =>
+          (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
+        delabToRefinableSyntax info.discriminant
     let casesTac ← if let some (eqName, _) := eqInfo then do
       let discName := getDiscriminantName info.discriminant lctx
       let eqBinderName :=
@@ -436,10 +456,10 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
           eqName
       let hIdent : TSyntax `Lean.binderIdent ←
         `(Lean.binderIdent| $(mkIdent (Name.mkSimple eqBinderName)):ident)
-      `(tactic| cases $hIdent : $discriminantStx:term with $[$alts:inductionAlt]*)
+      `(tactic| cases $hIdent : $discTerm:term with $[$alts:inductionAlt]*)
     else
-      `(tactic| cases $discriminantStx:term with $[$alts:inductionAlt]*)
+      `(tactic| cases $discTerm:term with $[$alts:inductionAlt]*)
 
-    return some (#[casesTac], used)
+    return some (preTacs ++ #[casesTac], used)
 
 end LeanDecomp

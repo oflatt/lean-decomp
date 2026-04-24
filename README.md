@@ -167,10 +167,10 @@ Useful debug artifacts:
 
 ### Recommended Next Steps
 
-- Investigate whether the `Int.Linear.norm_le` normalization chains that dominate Sum L36/L70 and Int L47 can be replaced by a single `lia` / `cutsat` step at a higher level in the proof tree. A handler that detects `Eq.mp (Int.Linear.norm_le ...) h` and emits `(h : <original_type>)` with a `show` cast, or simply replaces the chain with `lia` when the result type is an arithmetic inequality, would shrink both the generated text and the elaboration time.
-- Add structural handlers for `Or.casesOn` / `And.casesOn` over arithmetic disjunctions (Int L76/L79/L91). These typically destructure a hypothesis of the form `a = 0 ∨ a = 1 ∨ a = -1` and call arithmetic terminals in each branch.
+- **In progress: `have hOr := ...; cases hOr` rewrite for complex `casesOn` discriminants.** L76's inner body decompiles to `cases <Eq.mp (Lean.Grind.not_eq_prop ...) (mt ... hp)> with | inl h_1 => ... | inr h_2 => ...`. Traces confirmed the individual branch leaves close (via the new `tryDecompAbsLeaf` handler), but the composed tactic fails re-elaboration because the inline discriminant term is a giant `Eq.mp` chain that doesn't replay cleanly through Lean's parser in a `cases` position. The plan is to refactor `tryDecompCasesOn` to emit `have hOr : <type> := by <decompiled discriminant>; cases hOr with ...` whenever the discriminant is not a local fvar, so the big term is proved via tactics instead of being elaborated inline.
+- Investigate whether the `Int.Linear.norm_le` normalization chains that dominate Sum L36/L70 and Int L47 can be replaced by a single `lia` step at a higher level. A handler that detects `Eq.mp (Int.Linear.norm_le ...) h` and emits `(h : <original_type>)` with a `show` cast, or simply replaces the chain with `lia` when the result type is an arithmetic inequality, would shrink both the generated text and the elaboration time.
 - Keep transport cleanup narrow and decompiler-side when possible; broad global rewrites in `Simplify.lean` have been fragile.
-- Preserve the current output policy: avoid introducing `simp` as a generated tactic even if it makes some obligations easier.
+- Preserve the current output policy: avoid introducing `simp`, `grind`, or `omega` as generated tactics even if it makes some obligations easier.
 - After more of the transport scaffolding is removed, re-run the two nightly slices above before broadening to larger mathlib folders.
 
 ### Debugging Playbook
