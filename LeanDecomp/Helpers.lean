@@ -99,12 +99,11 @@ private def mkExactFallbackTactics (proof : Expr) : MetaM (Array (TSyntax `tacti
   let usePrettyPrintedTerm :=
     containsEagerReduce proof || containsConstName proof ``propext || containsConstName proof ``Iff.intro
   let termStx ← if usePrettyPrintedTerm then
-      ppExprToTermSyntaxWith proof true
+      try ppExprToTermSyntaxWith proof true
+      catch _ => delabToRefinableSyntax proof
     else
-      try
-        delabToRefinableSyntax proof
-      catch _ =>
-        ppExprToTermSyntaxWith proof true
+      try delabToRefinableSyntax proof
+      catch _ => ppExprToTermSyntaxWith proof true
   if containsEagerReduce proof then
     let tac ← `(tactic| with_unfolding_all exact $termStx)
     return #[tac]

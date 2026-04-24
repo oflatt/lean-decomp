@@ -76,7 +76,8 @@ private def theoremAppToNotationTermSyntax (headName : Name) (args : List Expr)
       else
         let argType ← instantiateMVars (← Meta.inferType arg)
         if argType.isSort then
-          ppExprToTermSyntaxWith arg false
+          try ppExprToTermSyntaxWith arg false
+          catch _ => delabToRefinableSyntax arg
         else
           delabToRefinableSyntax arg
     argTerms := argTerms.push argTerm
@@ -652,10 +653,13 @@ mutual
           let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts used decompileExpr
           return some result
 
-      let compactTerm ← ppExprToTermSyntaxWith app false
+      let compactTerm ←
+        try ppExprToTermSyntaxWith app false
+        catch _ => delabToRefinableSyntax app
       let usePpAll := !(← refineTacProducesGoals compactTerm exprTy proofArgs.size lctx localInsts)
       let refineTerm ← if usePpAll then
-          ppExprToTermSyntaxWith app true
+          try ppExprToTermSyntaxWith app true
+          catch _ => pure compactTerm
         else
           pure compactTerm
       let refineTac ← `(tactic| refine $refineTerm)
@@ -681,9 +685,11 @@ mutual
     let usePrettyPrintedTerm :=
       containsEagerReduce body || containsConstName body ``propext || containsConstName body ``Iff.intro
     let termStx ← if usePrettyPrintedTerm then
-        ppExprToTermSyntaxWith body true
+        try ppExprToTermSyntaxWith body true
+        catch _ => delabToRefinableSyntax body
       else
-        delabToRefinableSyntax body
+        try delabToRefinableSyntax body
+        catch _ => ppExprToTermSyntaxWith body true
     if containsEagerReduce body then
       let tac ← `(tactic| with_unfolding_all exact $termStx)
       return (#[tac], used)
