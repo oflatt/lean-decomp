@@ -113,6 +113,73 @@ private partial def collectFinsetMemRewrites (proof : Expr) : MetaM (Array (TSyn
     rwTacs := rwTacs.push (← `(tactic| rw [$rwRule] $loc))
   return rwTacs
 
+/-- Check whether a type is arithmetic-shaped (LE/LT/Eq of integer/natural
+    expressions). Used to decide whether `lia` is a plausible terminal. -/
+private def isArithLeafGoal (ty : Expr) : MetaM Bool := do
+  let (fn, _) := peelArgs ty
+  let some n := fn.constName? | return false
+  return n == ``LE.le || n == ``LT.lt || n == ``GE.ge || n == ``GT.gt || n == ``Eq
+
+/-- Try `lia` after introducing each extracted "interesting" sub-fact of the
+    proof as a `have`. This handles leaves whose proof applies a forall hyp
+    `hs : ∀ y ∈ S, P y` to a membership witness — `lia` cannot apply such
+    hypotheses on its own, so we precompute the result via `have` before
+    handing the goal to `lia`. -/
+private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (memRws : Array (TSyntax `tactic))
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  -- Only attempt this for moderately-sized proofs. Walking and delabbing all
+  -- subterms of giant proofs is itself expensive; the handler is intended for
+  -- arithmetic leaves where `lia` failed but a small set of forall-membership
+  -- applications would close.
+  if LeanDecomp.exprNodeCount expr > 1500 then return none
+  let facts ← LeanDecomp.extractGrindFacts expr
+  if facts.isEmpty then return none
+  -- Only keep facts that:
+  --   * are application proofs of an arithmetic statement (LE/LT/Eq), so
+  --     adding them to lctx actually helps `lia`,
+  --   * are small (so delab is fast and the resulting `have` body
+  --     re-elaborates cheaply),
+  --   * do not contain `eagerReduce` (which forces `with_unfolding_all`
+  --     transparency at re-elaboration time and is the original cause of the
+  --     timeout we are trying to avoid).
+  let isArithType : Expr → Bool := fun ty =>
+    match ty.getAppFn.constName? with
+    | some n => n == ``LE.le || n == ``LT.lt || n == ``GE.ge || n == ``GT.gt || n == ``Eq
+    | none => false
+  let mut haveTacs : Array (TSyntax `tactic) := #[]
+  let mut used := used
+  let mut count := 0
+  for fact in facts do
+    if count >= 4 then break
+    if LeanDecomp.exprNodeCount fact > 80 then continue
+    if Lean.Expr.find? (fun sub => sub.getAppFn.isConstOf ``eagerReduce) fact |>.isSome then
+      continue
+    let factTy ← Meta.inferType fact
+    unless isArithType factTy do continue
+    let factStx ← try
+      withOptions (fun o =>
+        (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
+        Lean.Meta.Tactic.TryThis.delabToRefinableSyntax fact
+    catch _ => continue
+    let factTyStx ← try
+      withOptions (fun o =>
+        (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
+        Lean.Meta.Tactic.TryThis.delabToRefinableSyntax factTy
+    catch _ => continue
+    let hName := LeanDecomp.mkUniqueName "h_fact" used
+    used := hName :: used
+    let hIdent : Ident := mkIdent (Name.mkSimple hName)
+    let haveTac ← `(tactic| have $hIdent:ident : $factTyStx := $factStx)
+    haveTacs := haveTacs.push haveTac
+    count := count + 1
+  if haveTacs.isEmpty then return none
+  let liaTac ← `(tactic| lia)
+  let candidate := memRws ++ haveTacs ++ #[liaTac]
+  if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
+    return some (candidate, used)
+  return none
+
 /-- `Eq.mp (Int.Linear.norm_le ...) <ev>` produces a user-form arithmetic
     inequality from grind's polynomial-normalization certificate. The cast
     proof itself carries `eagerReduce (Eq.refl true)` polynomial-equality
@@ -120,12 +187,10 @@ private partial def collectFinsetMemRewrites (proof : Expr) : MetaM (Array (TSyn
     + `with_unfolding_all exact` blocks. Those re-elaborate slowly because
     the explicit polynomial coefficients have to be re-checked.
 
-    Instead, when the goal is an arithmetic statement and `lia` can close it
-    from the available hypotheses, emit `lia` directly and discard the
-    polynomial transport entirely. If `lia` does not close on its own, try
-    rewriting Finset interval memberships in the lctx via their `mem_*`
-    lemmas and retry — `lia` does not unfold these, but the post-rewrite
-    arithmetic form is exactly what `lia` works on. -/
+    Instead, try `lia` directly on the result type. If it does not close, walk
+    the proof for `Iff.mp Finset.mem_*` references and emit
+    `rw [Finset.mem_*] at <hyp>` before retrying — `lia` does not unfold
+    Finset membership lemmas. -/
 def tryDecompEqMpIntLinearNormLe (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
@@ -405,8 +470,107 @@ def tryDecompAbsCaseSplitContradiction (expr : Expr) (lctx : LocalContext)
       return some (cand, hName :: used)
     return none
 
+/-- When the goal is `x ∈ Finset.<Interval> a b` for an arithmetic interval
+    constructor (Ico, Ioc, Icc, Ioo, range, …), bypass any structural transport
+    that grind built between user-form and its polynomial form by emitting
+    `rw [Finset.mem_<Interval>]; refine ⟨?_, ?_⟩ <;> lia` (or `rw + lia` for
+    half-open shapes whose RHS is a single inequality).
+
+    This is goal-shape-driven, not proof-term-driven: any proof that has a
+    Finset interval membership at the top is a candidate. If `lia` cannot
+    discharge the resulting arithmetic from the local hypotheses, the handler
+    returns `none` and dispatch falls through. -/
+def tryDecompFinsetIntervalMembership (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let exprTy ← Meta.inferType expr
+    let (fn, args) := peelArgs exprTy
+    if !fn.isConstOf ``Membership.mem || args.length < 5 then return none
+    let setExprRaw := args[args.length - 1]!
+    let setExpr ← match setExprRaw.fvarId? with
+      | some fid =>
+        let fdecl ← fid.getDecl
+        match fdecl.value? with
+        | some v => pure v
+        | none => pure setExprRaw
+      | none => pure setExprRaw
+    let (setFn, _) := peelArgs setExpr
+    -- Determine which Finset interval we're dealing with. Prefer the const
+    -- name on the goal's RHS (if visible). When `set r := Finset.<X> …`
+    -- introduced an opaque fvar, walk the proof term for an `Iff.mp/mpr
+    -- Finset.mem_<X>` reference, which tells us the membership lemma.
+    let goalConstName : Option String := setFn.constName?.map (·.toString)
+    let probeProofForMemLemma : MetaM (Option String) := do
+      let memNames : List String := [
+        "Finset.mem_Ico", "Finset.mem_Ioc", "Finset.mem_Icc", "Finset.mem_Ioo",
+        "Finset.mem_Iic", "Finset.mem_Iio", "Finset.mem_Ici", "Finset.mem_Ioi",
+        "Finset.mem_range"
+      ]
+      let mut stack : List Expr := [expr]
+      let mut iters := 0
+      while !stack.isEmpty && iters < 5000 do
+        iters := iters + 1
+        let cur := stack.head!
+        stack := stack.tail!
+        let (cfn, cargs) := peelArgs cur
+        if (cfn.isConstOf ``Iff.mp || cfn.isConstOf ``Iff.mpr) && cargs.length >= 3 then
+          let iffArg := cargs[2]!
+          let (iffFn, _) := peelArgs iffArg
+          if let some n := iffFn.constName? then
+            let s := n.toString
+            if memNames.contains s then
+              -- Convert "Finset.mem_<X>" → "Finset.<X>" to align with goalConstName check.
+              let setShape := s.replace "mem_" ""
+              return some setShape
+        match cur with
+        | .app f a => stack := f :: a :: stack
+        | .lam _ t b _ => stack := t :: b :: stack
+        | .forallE _ t b _ => stack := t :: b :: stack
+        | .letE _ t v b _ => stack := t :: v :: b :: stack
+        | .mdata _ b => stack := b :: stack
+        | .proj _ _ b => stack := b :: stack
+        | _ => pure ()
+      return none
+    let setShape ← match goalConstName with
+      | some s => pure (some s)
+      | none => probeProofForMemLemma
+    let some setShape := setShape | return none
+    -- Map Finset interval constructor to its `mem_*` lemma and arity hint.
+    -- arity = 2 means RHS of the iff is an And (two-sided interval);
+    -- arity = 1 means RHS is a single inequality (half-open at one end).
+    let info? : Option (Name × Nat) := match setShape with
+      | "Finset.Ico" => some (Name.mkStr2 "Finset" "mem_Ico", 2)
+      | "Finset.Ioc" => some (Name.mkStr2 "Finset" "mem_Ioc", 2)
+      | "Finset.Icc" => some (Name.mkStr2 "Finset" "mem_Icc", 2)
+      | "Finset.Ioo" => some (Name.mkStr2 "Finset" "mem_Ioo", 2)
+      | "Finset.Iic" => some (Name.mkStr2 "Finset" "mem_Iic", 1)
+      | "Finset.Iio" => some (Name.mkStr2 "Finset" "mem_Iio", 1)
+      | "Finset.Ici" => some (Name.mkStr2 "Finset" "mem_Ici", 1)
+      | "Finset.Ioi" => some (Name.mkStr2 "Finset" "mem_Ioi", 1)
+      | "Finset.range" => some (Name.mkStr2 "Finset" "mem_range", 1)
+      | _ => none
+    let some (memLemma, arity) := info? | return none
+    let lemmaIdent : Ident := mkIdent memLemma
+    let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
+    let rwTac ← `(tactic| rw [$rwRule])
+    let liaTac ← `(tactic| lia)
+    -- Also include any Finset interval memberships in the hypotheses that
+    -- might need their own unfolding for `lia` to use.
+    let memRws ← collectFinsetMemRewrites expr
+    let preTacs := memRws.push rwTac
+    let candAnd ← do
+      let refineAnd ← `(tactic| refine ⟨?_, ?_⟩ <;> lia)
+      pure (preTacs.push refineAnd)
+    let candSingle := preTacs.push liaTac
+    let cand := if arity == 2 then candAnd else candSingle
+    if ← LeanDecomp.candidateTacticsCloseGoal cand exprTy lctx localInsts then
+      return some (cand, used)
+    return none
+
 def handlers : List (Expr → LocalContext → LocalInstances → List String → DecompileCallback →
     TacticM (Option (Array (TSyntax `tactic) × List String))) := [
+  tryDecompFinsetIntervalMembership,
   tryDecompEqMpIntLinearNormLe,
   tryDecompEqMpIffEq,
   tryDecompEqMpNotEqProp,
