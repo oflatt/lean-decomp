@@ -62,6 +62,93 @@ private def tryDecompEqMpKnownGrindCast (castName : Name) (expr : Expr)
     let result ← LeanDecomp.emitTacticWithSubgoals headTac #[inner] lctx localInsts used decompileExpr
     return some result
 
+/-- Walk a proof term for occurrences of `Finset.mem_<Shape>.mp <fvar>` (which
+    desugars to `Iff.mp Finset.mem_<Shape> <fvar>`). For each such occurrence,
+    return a `rw [Finset.mem_<Shape>] at <fvar>` tactic. `lia` does not unfold
+    Finset memberships on its own, so this preprocessing exposes the
+    underlying arithmetic conjunction.
+
+    We walk the proof term (rather than the lctx) because `set r := Finset.Ico …`
+    leaves an opaque fvar `r` in the lctx, but the proof itself uses
+    `Finset.mem_Ico.mp h` against the destructured form, telling us exactly
+    which `mem_*` lemma applies. -/
+private partial def collectFinsetMemRewrites (proof : Expr) : MetaM (Array (TSyntax `tactic)) := do
+  let memLemmas : List String := [
+    "Finset.mem_Ico", "Finset.mem_Ioc", "Finset.mem_Icc", "Finset.mem_Ioo",
+    "Finset.mem_Iic", "Finset.mem_Iio", "Finset.mem_Ici", "Finset.mem_Ioi",
+    "Finset.mem_range", "Finset.mem_sdiff", "Finset.mem_inter", "Finset.mem_union"
+  ]
+  let mut found : Std.HashSet (Name × Name) := {}
+  let mut stack : List Expr := [proof]
+  let mut iters := 0
+  while !stack.isEmpty && iters < 5000 do
+    iters := iters + 1
+    let cur := stack.head!
+    stack := stack.tail!
+    -- Look for `Iff.mp <memLemma> <fvar>` patterns.
+    let (fn, args) := peelArgs cur
+    if fn.isConstOf ``Iff.mp && args.length >= 4 then
+      let iffArg := args[2]!
+      let hypArg := args[3]!
+      let (iffFn, _) := peelArgs iffArg
+      if let some iffName := iffFn.constName? then
+        if memLemmas.contains iffName.toString then
+          if let some fid := hypArg.fvarId? then
+            let hypDecl ← fid.getDecl
+            found := found.insert (iffName, hypDecl.userName)
+    match cur with
+    | .app f a => stack := f :: a :: stack
+    | .lam _ t b _ => stack := t :: b :: stack
+    | .forallE _ t b _ => stack := t :: b :: stack
+    | .letE _ t v b _ => stack := t :: v :: b :: stack
+    | .mdata _ b => stack := b :: stack
+    | .proj _ _ b => stack := b :: stack
+    | _ => pure ()
+  let mut rwTacs : Array (TSyntax `tactic) := #[]
+  for (lemmaName, hypName) in found do
+    let lemmaIdent : Ident := mkIdent lemmaName
+    let hypIdent : Ident := mkIdent hypName
+    let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
+    let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
+    rwTacs := rwTacs.push (← `(tactic| rw [$rwRule] $loc))
+  return rwTacs
+
+/-- `Eq.mp (Int.Linear.norm_le ...) <ev>` produces a user-form arithmetic
+    inequality from grind's polynomial-normalization certificate. The cast
+    proof itself carries `eagerReduce (Eq.refl true)` polynomial-equality
+    witnesses, which the generic `tryDecompEqMp` would propagate as `pp.all`
+    + `with_unfolding_all exact` blocks. Those re-elaborate slowly because
+    the explicit polynomial coefficients have to be re-checked.
+
+    Instead, when the goal is an arithmetic statement and `lia` can close it
+    from the available hypotheses, emit `lia` directly and discard the
+    polynomial transport entirely. If `lia` does not close on its own, try
+    rewriting Finset interval memberships in the lctx via their `mem_*`
+    lemmas and retry — `lia` does not unfold these, but the post-rewrite
+    arithmetic form is exactly what `lia` works on. -/
+def tryDecompEqMpIntLinearNormLe (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  let (fn, args) := peelArgs expr
+  let some cname := fn.constName? | return none
+  if cname != ``Eq.mp then return none
+  if args.length < 4 then return none
+  let castProof := args[2]!
+  let (castFn, _) := peelArgs castProof
+  let some castName := castFn.constName? | return none
+  if castName != ``Int.Linear.norm_le then return none
+  withLCtx lctx localInsts do
+    let exprTy ← Meta.inferType expr
+    let liaTac ← `(tactic| lia)
+    if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] exprTy lctx localInsts then
+      return some (#[liaTac], used)
+    let memRws ← collectFinsetMemRewrites expr
+    if memRws.isEmpty then return none
+    let candidate := memRws ++ #[liaTac]
+    if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
+      return some (candidate, used)
+    return none
+
 /-- `Eq.mp (Lean.Grind.iff_eq p q) (h : p ↔ q) : p = q`. -/
 def tryDecompEqMpIffEq (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
@@ -193,13 +280,19 @@ private def findSignHypForAbs (x : Expr) : MetaM (Option SignHyp) := do
                           negHelper := some helper }
   return none
 
-/-- Return the names of hypotheses whose type syntactically contains `abs x`. -/
+/-- Return the names of hypotheses whose type syntactically contains `abs x`.
+    Skips compound hypotheses (And/Or-headed) because the surrounding decompiler
+    typically destructures these via `cases`, removing them before any rewrite
+    against them would run. -/
 private def findHypsWithAbsOf (x : Expr) : MetaM (List Name) := do
   let lctx ← getLCtx
   let mut result : List Name := []
   for decl in lctx do
     if decl.isImplementationDetail then continue
     let ty ← instantiateMVars decl.type
+    let tyHead := ty.getAppFn.constName?
+    if tyHead == some ``And || tyHead == some ``Or then
+      continue
     let found := Expr.find? (fun sub =>
       let fn := sub.getAppFn
       let args := sub.getAppArgs
@@ -251,13 +344,76 @@ def tryDecompAbsLeaf (expr : Expr) (lctx : LocalContext)
       return some (cand2, used)
     return none
 
+/-- When the goal is `False` and the local context contains a hypothesis whose
+    type mentions `abs x` for some `x`, do a sign case split on `x`, rewrite
+    the abs in every relevant hypothesis, and close with `lia`. This is broader
+    than `tryDecompAbsLeaf`: it does not require `abs.eq_1` to appear in the
+    proof term, which lets it discharge `Int.Linear.*` arithmetic certificates
+    whose end result is False but which never explicitly unfold abs. -/
+def tryDecompAbsCaseSplitContradiction (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let exprTy ← Meta.inferType expr
+    unless exprTy.isConstOf ``False do return none
+    let lctx' ← getLCtx
+    let mut absX? : Option Expr := none
+    for decl in lctx' do
+      if decl.isImplementationDetail then continue
+      let ty ← instantiateMVars decl.type
+      let tyHead := ty.getAppFn.constName?
+      if tyHead == some ``And || tyHead == some ``Or then continue
+      let found := Expr.find? (fun sub =>
+        match sub.getAppFn.constName? with
+        | some name => name == `abs && sub.getAppArgs.size >= 1
+        | _ => false) ty
+      if let some absExpr := found then
+        let absArgs := absExpr.getAppArgs
+        if absArgs.size >= 1 then
+          absX? := some absArgs[absArgs.size - 1]!
+          break
+    let some x := absX? | return none
+    let targets ← findHypsWithAbsOf x
+    if targets.isEmpty then return none
+    let xStx ← delabToRefinableSyntax x
+    let xTy ← Meta.inferType x
+    let xTyStx ← delabToRefinableSyntax xTy
+    let hName := LeanDecomp.mkUniqueName "h_abs" used
+    let hIdent : Ident := mkIdent (Name.mkSimple hName)
+    let nonposLemma : Ident := mkIdent `abs_of_nonpos
+    let posLemma : Ident := mkIdent `abs_of_pos
+    let notLeMp : Ident := mkIdent (Name.mkStr2 "not_le" "mp")
+    let liaTac ← `(tactic| lia)
+    -- Build rewrites for each branch.
+    let mut nonposRws : Array (TSyntax `tactic) := #[]
+    let mut posRws : Array (TSyntax `tactic) := #[]
+    for target in targets do
+      let targetIdent : Ident := mkIdent target
+      let loc ← `(Lean.Parser.Tactic.location| at $targetIdent:term)
+      let nonposRule ← `(Parser.Tactic.rwRule| $nonposLemma:ident $hIdent:ident)
+      let posInner ← `(($notLeMp:ident $hIdent:ident))
+      let posRule ← `(Parser.Tactic.rwRule| $posLemma:ident $posInner)
+      nonposRws := nonposRws.push (← `(tactic| rw [$nonposRule] $loc))
+      posRws := posRws.push (← `(tactic| rw [$posRule] $loc))
+    let nonposBlock ← `(tactic| · $[$nonposRws]* ; $liaTac)
+    let posBlock ← `(tactic| · $[$posRws]* ; $liaTac)
+    -- Type-annotate the predicate so Lean does not infer the wrong arithmetic
+    -- type (e.g. picking ℕ when the abs argument is ℤ-typed in the proof).
+    let byCasesTac ← `(tactic| by_cases $hIdent:ident : ($xStx : $xTyStx) ≤ 0)
+    let cand : Array (TSyntax `tactic) := #[byCasesTac, nonposBlock, posBlock]
+    if ← LeanDecomp.candidateTacticsCloseGoal cand exprTy lctx localInsts then
+      return some (cand, hName :: used)
+    return none
+
 def handlers : List (Expr → LocalContext → LocalInstances → List String → DecompileCallback →
     TacticM (Option (Array (TSyntax `tactic) × List String))) := [
+  tryDecompEqMpIntLinearNormLe,
   tryDecompEqMpIffEq,
   tryDecompEqMpNotEqProp,
   tryDecompEqMpAutomationCast,
   tryDecompMt,
-  tryDecompAbsLeaf
+  tryDecompAbsLeaf,
+  tryDecompAbsCaseSplitContradiction
 ]
 
 end LeanDecomp.Specialized.Grind

@@ -318,6 +318,31 @@ private partial def tryDecompIffMpMpr (expr : Expr) (lctx : LocalContext)
     let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[iffProof, premiseProof] lctx localInsts used decompileExpr
     return some result
 
+/-- Handle `And.intro a b <pfA> <pfB>` by emitting `refine ⟨?_, ?_⟩` with the
+    two component proofs as recursive subgoals. Without this, the theorem-app
+    fallback bails on constructor heads and the whole `And.intro` collapses
+    into a single `exact` term. When the components are large, splitting them
+    lets each side be closed by a cheaper handler such as `lia`.
+
+    Skip when both components are local hypotheses: for trivial cases like
+    `And.intro a b ha hb` the natural decomp is `exact ⟨ha, hb⟩`, which the
+    theorem-app fallback handles directly. Splitting those is just churn. -/
+private partial def tryDecompAndIntro (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let (fn, args) := peelArgs expr
+    let some constName := Expr.constName? fn | return none
+    if constName != ``And.intro then return none
+    -- @And.intro takes {a b : Prop} (left : a) (right : b), so exactly 4 args.
+    if args.length != 4 then return none
+    let leftProof := args[2]!
+    let rightProof := args[3]!
+    if leftProof.isFVar && rightProof.isFVar then return none
+    let refineTac ← `(tactic| refine ⟨?_, ?_⟩)
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[leftProof, rightProof] lctx localInsts used decompileExpr
+    return some result
+
 private partial def tryDecompAndProj (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
     : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
@@ -379,6 +404,7 @@ mutual
             tryDecompPropext body lctx localInsts used decompileExpr,
             tryDecompIffIntro body lctx localInsts used decompileExpr,
             tryDecompIffMpMpr body lctx localInsts used decompileExpr,
+            tryDecompAndIntro body lctx localInsts used decompileExpr,
             tryDecompAndProj body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongr body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompCongrArg body lctx localInsts used decompileExpr,
@@ -553,8 +579,14 @@ mutual
         let casesTac ← `(tactic| cases $hFalseTarget)
         return some (#[casesTac], used)
 
-      -- For complex proofs of False (e.g., noConfusion-derived Eq.ndrec),
-      -- use `contradiction` which handles noConfusion automatically.
+      -- `contradiction` only meaningfully closes a `False` goal; for any other
+      -- goal type (typically when `False.elim` is being used polymorphically
+      -- to derive a non-`False` conclusion), it cannot close and emitting it
+      -- forces the caller to fall back to a giant `exact`. Return none in
+      -- that case so dispatch falls through to the theorem-app fallback,
+      -- which decomposes False.rec/elim structurally.
+      let exprTy ← Meta.inferType expr
+      unless exprTy.isConstOf ``False do return none
       let contradictionTac ← `(tactic| contradiction)
       return some (#[contradictionTac], used)
 
@@ -682,8 +714,11 @@ mutual
       with the same all-transparency setting grind used to build the term. -/
   private partial def decompExact (body : Expr) (used : List String) :
       TacticM (Array (TSyntax `tactic) × List String) := do
-    let usePrettyPrintedTerm :=
-      containsEagerReduce body || containsConstName body ``propext || containsConstName body ``Iff.intro
+    -- Only use pp.all for `eagerReduce` gadgets, where the explicit polynomial
+    -- coefficients matter for elaboration. `propext` / `Iff.intro` containing
+    -- bodies elaborate fine with regular delab, and pp.all makes them
+    -- dramatically slower to re-check (they fully expand instances).
+    let usePrettyPrintedTerm := containsEagerReduce body
     let termStx ← if usePrettyPrintedTerm then
         try ppExprToTermSyntaxWith body true
         catch _ => delabToRefinableSyntax body

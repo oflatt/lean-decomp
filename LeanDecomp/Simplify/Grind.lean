@@ -33,17 +33,11 @@ def simplifyGrindWrappers (e : Expr) : MetaM (Option Expr) := do
     if args.length >= 1 then
       return some (mkApp (mkConst ``Classical.em []) args[0]!)
     return none
-  if cname == ``Lean.Grind.of_eq_eq_true then
-    if let some h := args.getLast? then
-      let lhs ← match (← Meta.inferType h) with
-        | .app (.app (.app (.const ``Eq _) _) lhs) rhs =>
-            if rhs.isConstOf ``True then
-              pure lhs
-            else
-              return none
-        | _ => return none
-      return some (mkApp4 (mkConst ``Eq.mpr [Level.zero]) lhs (mkConst ``True) h (mkConst ``True.intro))
-    return none
+  -- Note: `Lean.Grind.of_eq_eq_true h : a ∧ b ∨ ¬a ∧ ¬b` was previously
+  -- rewritten to `Eq.mpr lhs True h True.intro : a = b`. That rewrite is
+  -- type-incorrect (different result types) and produces ill-typed proof
+  -- terms when this expression sits under `Or.casesOn`. Leave it alone here
+  -- so the structural decompiler can recurse via the theorem-app fallback.
   if cname == ``Lean.Grind.of_eq_eq_false then
     if let some h := args.getLast? then
       match (← Meta.inferType h) with

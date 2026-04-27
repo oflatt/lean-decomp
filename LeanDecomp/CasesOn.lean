@@ -252,10 +252,13 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
 
       -- Check if this branch is a contradiction (impossible constructor).
       -- We enter the lambda telescope and check the body.
+      -- Only skip for multi-constructor types: for a single-constructor type
+      -- like `And`, skipping the only branch leaves `cases hOr with` empty,
+      -- which Lean rejects with "Alternative `intro` has not been provided".
       let isContradiction ← Meta.lambdaTelescope caseBranch fun _xs body => do
         isBranchContradiction body
 
-      if isContradiction then
+      if isContradiction && ctorNames.length > 1 then
         continue
 
       let (branchTactics, ctorParamNames, used') ← Meta.lambdaTelescope caseBranch fun xs body => do
@@ -442,7 +445,12 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     let mut preTacs : Array (TSyntax `tactic) := #[]
     let discTerm : Term ← if useHaveWrapper then do
         let discType ← instantiateMVars (← Meta.inferType info.discriminant)
-        let discTypeStx ← delabToRefinableSyntax discType
+        -- Set pp.numericTypes so generated have-types like
+        -- `(-1 : ℤ) * ↑a + ↑b ≤ 0` are unambiguous when re-elaborated. Without
+        -- this, mixed ℕ/ℤ expressions can fail because `-1` requires `Neg`.
+        let discTypeStx ← withOptions (fun o =>
+            (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
+          delabToRefinableSyntax discType
         let discSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$discTacticsEarly]*)
         let hOrName := LeanDecomp.mkUniqueName "hOr" used
         used := hOrName :: used

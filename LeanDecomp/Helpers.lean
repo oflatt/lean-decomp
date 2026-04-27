@@ -75,7 +75,7 @@ private partial def containsEagerReduce (e : Expr) : Bool :=
     | some n => n == ``eagerReduce
     | none => false) e |>.isSome
 
-private partial def exprNodeCount (e : Expr) : Nat :=
+partial def exprNodeCount (e : Expr) : Nat :=
   match e with
   | .bvar _ | .fvar _ | .mvar _ | .sort _ | .const _ _ | .lit _ => 1
   | .app f a => exprNodeCount f + exprNodeCount a + 1

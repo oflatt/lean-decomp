@@ -408,6 +408,41 @@ private def simplifyPropCast (e : Expr) : MetaM (Option Expr) := do
 -- Main traversal
 -- ═══════════════════════════════════════════════════════
 
+/-- Reduce projection-of-constructor patterns:
+    - `And.left/right (And.intro _ _ pa pb) → pa/pb`
+    - `Iff.mp (Iff.intro f g) ev → f ev`
+    - `Iff.mpr (Iff.intro f g) ev → g ev`
+    The kernel does this reduction on demand, but the simplifier needs it
+    explicit so downstream handlers see the projected component (e.g. an
+    `Eq.mp` hidden under `(And.intro ... ).left`, or grind's iff transport
+    written as `Iff.mp (Iff.intro f g) ev` rather than just `f ev`). -/
+private def simplifyProjOfIntro (e : Expr) : Option Expr :=
+  let (fn, args) := peelArgs e
+  match fn.constName? with
+  | some name =>
+    -- And.left/right: args = [a, b, h, extra...], pick from inner And.intro
+    if (name == ``And.left || name == ``And.right) && args.length >= 3 then
+      let andProof := args[2]!
+      let extra := args.drop 3
+      let (innerFn, innerArgs) := peelArgs andProof
+      if innerFn.isConstOf ``And.intro && innerArgs.length >= 4 then
+        let component := if name == ``And.left then innerArgs[2]! else innerArgs[3]!
+        some (extra.foldl (init := component) fun acc a => mkApp acc a)
+      else none
+    -- Iff.mp/mpr: args = [a, b, iff, ev, extra...], beta-apply the iff branch
+    else if (name == ``Iff.mp || name == ``Iff.mpr) && args.length >= 4 then
+      let iffProof := args[2]!
+      let ev := args[3]!
+      let extra := args.drop 4
+      let (innerFn, innerArgs) := peelArgs iffProof
+      if innerFn.isConstOf ``Iff.intro && innerArgs.length >= 4 then
+        let branch := if name == ``Iff.mp then innerArgs[2]! else innerArgs[3]!
+        let result := mkApp branch ev
+        some (extra.foldl (init := result) fun acc a => mkApp acc a)
+      else none
+    else none
+  | none => none
+
 /-- Pre-step: cheap pure rewrites applied before recursing into children.
     Returns `.visit` to re-traverse after rewriting, `.continue` to recurse normally. -/
 private def simplifyPre (e : Expr) : MetaM TransformStep := do
@@ -417,6 +452,8 @@ private def simplifyPre (e : Expr) : MetaM TransformStep := do
   if let some r := simplifyId e then return .visit r
   -- Collapse Eq.mp/Eq.mpr (Eq.refl _) body → body
   if let some r := simplifyEqMpRefl e then return .visit r
+  -- Reduce And.left/And.right of explicit And.intro and Iff.mp/mpr of Iff.intro
+  if let some r := simplifyProjOfIntro e then return .visit r
   -- Simplify propositional casts (propext/congr chains → Iff operations)
   if let some r ← simplifyPropCast e then return .visit r
   return .continue
