@@ -219,13 +219,6 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
   withLCtx lctx localInsts do
     let some info ← parseCasesOn expr
       | return none
-    -- If the discriminant's head is a grind-internal normalization helper
-    -- (e.g. `Lean.Grind.of_eq_eq_true`, `Lean.Grind.or_of_and_eq_false`),
-    -- skip the structural `cases` decompiler so we do not emit an unreadable
-    -- scrutinee. We check only the head constant; checking transitively would
-    -- falsely trigger on innocuous `Classical.em (prop-containing-grind-term)`.
-    if let some n := info.discriminant.getAppFn.constName? then
-      if n.toString.startsWith "Lean.Grind." then return none
     let ctorNames := info.indVal.ctors
 
     -- Check if the motive has equality parameters (generalized equation pattern)
@@ -233,8 +226,25 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     let eqInfo ← motiveEqInfo info.motive
     let hasEqMotive := eqInfo.isSome
 
+    -- Decompile the discriminant up front when we'll need a `have hOr := ...`
+    -- wrapper. If recursive decompilation throws (e.g. exact-fallback size
+    -- guard on a giant chain), return `none` so dispatch can continue with
+    -- another handler instead of propagating the error out.
+    let useHaveWrapper := info.discriminant.isApp && info.discriminant.fvarId?.isNone
+    let discBundle? : Option (Array (TSyntax `tactic) × List String) ←
+      if useHaveWrapper then
+        try
+          let (tacs, used') ← LeanDecomp.decompileOrExact info.discriminant lctx localInsts used decompileExpr
+          pure (some (tacs, used'))
+        catch _ =>
+          pure none
+      else
+        pure (some (#[], used))
+    let some (discTacticsEarly, usedAfterDisc) := discBundle?
+      | return none
+    let mut used := usedAfterDisc
+
     let mut alts : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt) := #[]
-    let mut used := used
 
     for (ctorName, caseBranch) in ctorNames.zip info.caseBranches do
       let ctorShortName := ctorName.getString!
@@ -430,15 +440,12 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     -- This avoids the re-elaboration failures we get when a giant `Eq.mp`
     -- chain is embedded inline in a `cases` position.
     let mut preTacs : Array (TSyntax `tactic) := #[]
-    let useHaveWrapper := info.discriminant.isApp && info.discriminant.fvarId?.isNone
     let discTerm : Term ← if useHaveWrapper then do
         let discType ← instantiateMVars (← Meta.inferType info.discriminant)
         let discTypeStx ← delabToRefinableSyntax discType
-        let (discTactics, usedAfter) ←
-          LeanDecomp.decompileOrExact info.discriminant lctx localInsts used decompileExpr
-        let discSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$discTactics]*)
-        let hOrName := LeanDecomp.mkUniqueName "hOr" usedAfter
-        used := hOrName :: usedAfter
+        let discSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$discTacticsEarly]*)
+        let hOrName := LeanDecomp.mkUniqueName "hOr" used
+        used := hOrName :: used
         let hOrIdent : Ident := ⟨mkIdent (Name.mkSimple hOrName) |>.raw.setInfo .none⟩
         let haveTac ← `(tactic| have $hOrIdent:ident : $discTypeStx := by $discSeq)
         preTacs := #[haveTac]

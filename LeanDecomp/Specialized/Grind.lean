@@ -1,8 +1,10 @@
 import Lean
+import Lean.Meta.Tactic.TryThis
 import LeanDecomp.Helpers
 
 namespace LeanDecomp.Specialized.Grind
 open Lean Elab Meta Tactic
+open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
 private def peelArgs (e : Expr) : Expr × List Expr :=
   let rec go (cur : Expr) (acc : List Expr) : Expr × List Expr :=
@@ -34,6 +36,43 @@ def tryDecompEqMpAutomationCast (expr : Expr) (lctx : LocalContext)
       let (tactics, used') ← LeanDecomp.decompileOrExact innerWithArgs lctx localInsts used decompileExpr
       return some (tactics, used')
     return none
+
+/-- Peel `Eq.mp <named-grind-cast> inner`: when the cast is a fully-applied
+    `Lean.Grind.<castName>` const, emit `refine Eq.mp <cast> ?_` and recurse
+    on `inner`. The cast term is small (just the const + its Prop args), so
+    delabbing it inline avoids a recursive descent into a structural cast that
+    the generic `tryDecompEqMp` would otherwise do. -/
+private def tryDecompEqMpKnownGrindCast (castName : Name) (expr : Expr)
+    (lctx : LocalContext) (localInsts : LocalInstances) (used : List String)
+    (decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  let (fn, args) := peelArgs expr
+  let some cname := fn.constName? | return none
+  if cname != ``Eq.mp then return none
+  if args.length < 4 then return none
+  let castProof := args[2]!
+  let inner := args[3]!
+  let (castFn, _) := peelArgs castProof
+  let some n := castFn.constName? | return none
+  if n != castName then return none
+  withLCtx lctx localInsts do
+    let castStx ← delabToRefinableSyntax castProof
+    let eqMpIdent : Ident := ⟨mkIdent ``Eq.mp |>.raw.setInfo .none⟩
+    let headTac ← `(tactic| refine $eqMpIdent:ident $castStx ?_)
+    let result ← LeanDecomp.emitTacticWithSubgoals headTac #[inner] lctx localInsts used decompileExpr
+    return some result
+
+/-- `Eq.mp (Lean.Grind.iff_eq p q) (h : p ↔ q) : p = q`. -/
+def tryDecompEqMpIffEq (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) :=
+  tryDecompEqMpKnownGrindCast ``Lean.Grind.iff_eq expr lctx localInsts used decompileExpr
+
+/-- `Eq.mp (Lean.Grind.not_eq_prop p q) (h : ¬p = q) : p = ¬q`. -/
+def tryDecompEqMpNotEqProp (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) :=
+  tryDecompEqMpKnownGrindCast ``Lean.Grind.not_eq_prop expr lctx localInsts used decompileExpr
 
 /-- `mt` takes an implication proof as a function-typed argument, so the generic
     theorem-app fallback treats it as an ordinary term and embeds it raw. Expose
@@ -214,6 +253,8 @@ def tryDecompAbsLeaf (expr : Expr) (lctx : LocalContext)
 
 def handlers : List (Expr → LocalContext → LocalInstances → List String → DecompileCallback →
     TacticM (Option (Array (TSyntax `tactic) × List String))) := [
+  tryDecompEqMpIffEq,
+  tryDecompEqMpNotEqProp,
   tryDecompEqMpAutomationCast,
   tryDecompMt,
   tryDecompAbsLeaf
