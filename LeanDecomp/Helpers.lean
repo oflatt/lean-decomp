@@ -111,6 +111,37 @@ private def mkExactFallbackTactics (proof : Expr) : MetaM (Array (TSyntax `tacti
     let tac ← `(tactic| exact $termStx)
     return #[tac]
 
+/-! **Decompiler invariant**: when any decomp action runs, the main TacticM goal
+    must equal the type of the proof term being decompiled, with a lctx that
+    reflects what the real run of the surrounding tactics would produce.
+    `runInGoal` and `runInSubgoal` are the building blocks that uphold this. -/
+
+/-- Allocate a fresh synthetic-opaque mvar of `goalType` in (lctx, localInsts),
+    set it as the only main goal, run `k`, then restore the original goals.
+    Use this when entering a recursive decomp call from a synthetic context
+    (lambda telescope, let-binder, byContradiction binder, etc.). -/
+def runInGoal (lctx : LocalContext) (localInsts : LocalInstances) (goalType : Expr)
+    (k : TacticM α) : TacticM α := do
+  let savedGoals ← getGoals
+  try
+    withLCtx lctx localInsts do
+      let mvar ← Meta.mkFreshExprMVar (some goalType) .syntheticOpaque
+      setGoals [mvar.mvarId!]
+      k
+  finally
+    setGoals savedGoals
+
+/-- Focus an existing mvarId as the sole main goal, run `k` in its local
+    context, then restore the original goals.  Use this when the goal already
+    exists (e.g. a subgoal returned by `MVarId.cases`). -/
+def runInSubgoal (mvarId : MVarId) (k : TacticM α) : TacticM α := do
+  let savedGoals ← getGoals
+  try
+    setGoals [mvarId]
+    mvarId.withContext k
+  finally
+    setGoals savedGoals
+
 /-- Recursively decompile a proof term, but preserve correctness by falling back
     to an exact proof term when the generated tactics do not re-elaborate or do
     not fully close a fresh goal of the same type. -/
@@ -120,13 +151,12 @@ private def subproofTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedT
   Core.setMessageLog {}
   let ok ← try
       withoutModifyingState do
-        withLCtx lctx localInsts do
-          let goal ← Meta.mkFreshExprMVar (some expectedType) .syntheticOpaque
+        runInGoal lctx localInsts expectedType do
           let seq ← mkTacticSeq tacs
-          let goals ← Tactic.run goal.mvarId! do
-            evalTactic seq
+          evalTactic seq
+          let remainingGoals ← getGoals
           let newMsgs ← Core.getMessageLog
-          pure (!newMsgs.hasErrors && goals.isEmpty)
+          pure (!newMsgs.hasErrors && remainingGoals.isEmpty)
     catch _ =>
       pure false
   Core.setMessageLog savedMsgs

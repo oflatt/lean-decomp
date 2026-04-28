@@ -246,6 +246,44 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
 
     let mut alts : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt) := #[]
 
+    -- Set up a synthetic outer mvar and run `MVarId.cases` once.  This
+    -- produces subgoals whose lctxs reflect the real cases substitution
+    -- (the discriminant fvar is replaced by the constructor application
+    -- throughout the lctx, just as the real `cases` tactic would do).
+    -- Recursive per-branch decomp then runs in the real substituted lctx —
+    -- matching the **decompiler invariant** that every recursive call sees
+    -- the proof state the real run would produce.
+    --
+    -- Generalized motives (`cases h : disc with`) currently take the older
+    -- Meta.lambdaTelescope path because `MVarId.cases` doesn't reproduce the
+    -- trailing `heq : disc = ctor xs` hypothesis.  A naive extension that
+    -- generalizes with `hName?` and substitutes the eq param with the real
+    -- eq fvar broke `LeanDecomp.simple`: the old body's `Eq.rec` cleanup
+    -- (substituting `heq → Eq.refl s` and stripping the resulting transport)
+    -- is load-bearing for downstream handlers like `contradiction` and
+    -- `noConfusion` — they consume the type-incorrect intermediate that the
+    -- cleanup produces.  Improving this is documented in the README.
+    let casesSubgoals : Option (Array Meta.CasesSubgoal) ←
+      if hasEqMotive then
+        pure none
+      else
+        try
+          let exprTy ← Meta.inferType expr
+          let outerMvar ← Meta.mkFreshExprMVar (some exprTy) .syntheticOpaque
+          let (majorFVarId, mvarAfterGen) ←
+            if let some fid := info.discriminant.fvarId? then
+              pure (fid, outerMvar.mvarId!)
+            else
+              let (newFvarIds, newMvarId) ← outerMvar.mvarId!.generalize
+                #[{ expr := info.discriminant }]
+              pure (newFvarIds[0]!, newMvarId)
+          let subgoals ← mvarAfterGen.cases majorFVarId
+          pure (some subgoals)
+        catch _ =>
+          -- If `generalize` or `cases` fails (unusual goal shape, etc.), fall
+          -- back to the old lambdaTelescope path so we still emit something.
+          pure none
+
     for (ctorName, caseBranch) in ctorNames.zip info.caseBranches do
       let ctorShortName := ctorName.getString!
       let ctorIdent := mkIdent (Name.mkSimple ctorShortName)
@@ -260,6 +298,11 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
 
       if isContradiction && ctorNames.length > 1 then
         continue
+
+      -- Locate the matching subgoal from MVarId.cases (if we took that path).
+      let matchingSubgoal? : Option Meta.CasesSubgoal :=
+        casesSubgoals.bind fun subs =>
+          subs.find? (fun s => s.ctorName == some ctorName)
 
       let (branchTactics, ctorParamNames, used') ← Meta.lambdaTelescope caseBranch fun xs body => do
         let telescopeLctx ← getLCtx
@@ -375,14 +418,42 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
             if cname == ``Eq.ndrec || cname == ``Eq.rec then
               innerBody ← Meta.whnf innerBody
 
-        -- Generalized equation branches carry transport artifacts that do not
-        -- replay faithfully on a synthetic fresh goal rebuilt from `innerBody`.
-        -- Decompile them directly and let the outer replay check the real branch.
+        -- Recurse on the branch body.  When `MVarId.cases` succeeded above,
+        -- run the recursion in the subgoal's real (substituted) lctx —
+        -- maintaining the decompiler invariant.  Otherwise (generalized
+        -- motive, or `MVarId.cases` failed) fall back to the synthesized
+        -- `newLctx` and let the outer replay catch errors.
         let (bodyTactics, _usedInBranch) ←
-          if hasEqMotive then
-            decompileExpr innerBody newLctx telescopeInsts usedAfterCtorParams
-          else
-            LeanDecomp.decompileOrExact innerBody newLctx telescopeInsts usedAfterCtorParams decompileExpr
+          match matchingSubgoal? with
+          | some sub =>
+              -- Map the telescope's `xs` to the subgoal's `fields` so the
+              -- branch body references the real cases-introduced fvars
+              -- (whose surrounding lctx has the discriminant substituted).
+              let mut substs : Array (FVarId × Expr) := #[]
+              for i in List.range (Nat.min ctorParamCount sub.fields.size) do
+                if let some fid := xs[i]!.fvarId? then
+                  substs := substs.push (fid, sub.fields[i]!)
+              let innerBodyMapped := substFVars innerBody substs
+              -- Rename the subgoal's constructor-arg fields to our chosen
+              -- ctorParamNames so the recursive lctx exposes the names we'll
+              -- emit in the alt syntax.
+              let renamedSubgoal ← do
+                let mut subLctx ← sub.mvarId.withContext getLCtx
+                let mut nameIdx := 0
+                for i in List.range ctorParamCount do
+                  if let some fid := sub.fields[i]!.fvarId? then
+                    if nameIdx < ctorParamNames.length then
+                      subLctx := subLctx.setUserName fid (Name.mkSimple ctorParamNames[nameIdx]!)
+                      nameIdx := nameIdx + 1
+                pure subLctx
+              let subInsts ← sub.mvarId.withContext getLocalInstances
+              LeanDecomp.decompileOrExact innerBodyMapped renamedSubgoal subInsts
+                usedAfterCtorParams decompileExpr
+          | none =>
+              if hasEqMotive then
+                decompileExpr innerBody newLctx telescopeInsts usedAfterCtorParams
+              else
+                LeanDecomp.decompileOrExact innerBody newLctx telescopeInsts usedAfterCtorParams decompileExpr
         return (bodyTactics, ctorParamNames, used)
 
       used := used'

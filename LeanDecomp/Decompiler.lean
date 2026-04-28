@@ -378,7 +378,34 @@ private partial def tryDecompPropext (expr : Expr) (lctx : LocalContext)
 
 mutual
 
-  /-- Convert a proof term expression into tactic syntax. -/
+  /-- Convert a proof term expression into tactic syntax.
+
+  **Decompiler invariant**.  The `lctx` and `localInsts` parameters define the
+  local context in which `expr` is well-typed; this same context is the one in
+  which any candidate tactics produced for `expr` are validated by
+  `validateOrExact`.  For every recursive call into `decompileExpr`, callers
+  must supply a `(lctx, localInsts)` that matches the proof state the *real*
+  run of the surrounding tactics would produce — otherwise validation false-
+  negatives sneak in (the canonical example is `tryDecompCasesOn`'s per-branch
+  recursion, which uses `MVarId.cases` to obtain the substituted lctx for
+  exactly this reason).
+
+  Recursion sites that already maintain the invariant naturally:
+  - `tryDecompIntro`: synthesizes a renamed lctx for the lambda binders, which
+    matches what real `intro` produces.
+  - `tryDecompLet` / `tryDecompBetaRedex`: extends lctx with a let-decl, which
+    matches what real `let` produces.
+  - `tryDecompByContradiction`: synthesizes a binder via `Meta.forallTelescope`,
+    matching what real `intro` does after `apply Classical.byContradiction`.
+  - `emitTacticWithSubgoals`: passes the outer lctx through, valid for refines
+    that don't change the lctx (apply, refine `?_`, And.intro, etc.).
+  - `tryDecompCasesOn`: uses `MVarId.cases` to produce the real substituted
+    lctx for non-generalized motives.
+
+  Documented limitations:
+  - Generalized cases motives (`cases h : disc with`) currently fall back to
+    a synthesized lctx.  Validation false-negatives are still possible there;
+    `decompileOrExact` will silently degrade to `exact` when they bite. -/
   partial def decompileExpr (expr : Expr) (lctx : LocalContext)
       (localInsts : LocalInstances) (used : List String) : TacticM (Array (TSyntax `tactic) × List String) := do
     withLCtx lctx localInsts do
