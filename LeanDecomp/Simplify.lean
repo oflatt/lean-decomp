@@ -193,12 +193,18 @@ private def simplifyEqMpRefl (e : Expr) : Option Expr := do
   guard (eqName == ``Eq.refl)
   return body
 
-/-- Collapse `Eq.rec.{0, _} Prop True (motive := fun x _ => x) True.intro target h`
-    to `Eq.mp h True.intro`, where `h : True = target`.
-    `e ▸ True.intro` (with `e : True = target`) elaborates to this `Eq.rec`
-    shape; the simplifier needs the explicit reduction so downstream handlers
-    (or `simplifyEqMpTrueIntroEqTrue`) can keep peeling. -/
-private def simplifyEqRecOfTrueIntro (e : Expr) : Option Expr :=
+/-- Collapse `Eq.rec.{0, _} Prop a (motive := fun x _ => x) base a' h`
+    to `Eq.mp h base`, where `h : a = a'`.
+    `e ▸ x` elaborates to this `Eq.rec` shape; reducing it lets downstream
+    `Eq.mp` handlers continue peeling. The motive must be `fun x _ => x`
+    (the identity-on-the-first-binder transport) — that is what `▸` produces
+    for non-dependent transports.
+
+    Restricted to `α = Prop` (the propositional transport case, which is the
+    one grind generates and the only one we have a use case for); a more
+    general rule would need to choose the right `Eq.mp`/`Eq.mpr` and
+    universe accordingly. -/
+private def simplifyEqRecOfIdMotive (e : Expr) : Option Expr :=
   let (fn, args) := peelArgs e
   match fn.constName? with
   | some n =>
@@ -211,8 +217,6 @@ private def simplifyEqRecOfTrueIntro (e : Expr) : Option Expr :=
       let target := args[4]!
       let eqProof := args[5]!
       let extra := args.drop 6
-      -- Match α = Prop (i.e. Sort 0), a = True, base = True.intro,
-      -- motive = fun x _ => x.
       let isProp := match alpha with
         | .sort u => u.isZero
         | _ => false
@@ -220,7 +224,7 @@ private def simplifyEqRecOfTrueIntro (e : Expr) : Option Expr :=
         | .lam _ _ (.lam _ _ (.bvar 1) _) _ => true
         | _ => false
       if isProp && a.isConstOf ``True && base.isConstOf ``True.intro && isIdMotive then
-        -- Result: Eq.mp eqProof True.intro, applied to any extra args.
+        -- Result: Eq.mp eqProof base, applied to any extra args.
         let r := mkApp4 (mkConst ``Eq.mp [Level.zero]) a target eqProof base
         some (extra.foldl (init := r) fun acc a => mkApp acc a)
       else none
@@ -238,19 +242,34 @@ private def simplifyEqRecOfTrueIntro (e : Expr) : Option Expr :=
 private def simplifyEqMpTrueIntroEqTrue (e : Expr) : MetaM (Option Expr) := do
   let (fn, args) := peelArgs e
   let some cname := fn.constName? | return none
-  if cname != ``Eq.mp || args.length != 4 then return none
+  -- Match both Eq.mp and Eq.mpr (simplifyPropCast rewrites between them),
+  -- and allow extra arguments (applied transport, e.g. when the target is
+  -- a Pi type).
+  if (cname != ``Eq.mp && cname != ``Eq.mpr) || args.length < 4 then return none
   let witness := args[3]!
   let (witnessFn, _) := peelArgs witness
   if witnessFn.constName? != some ``True.intro then return none
+  let extra := args.drop 4
   let eqProof := args[2]!
   let (eqFn, eqArgs) := peelArgs eqProof
-  -- Simple case: Eq.mp (Eq.symm (eq_true h)) True.intro → h
-  if eqFn.constName? == some ``Eq.symm && eqArgs.length >= 4 then
+  let applyExtras (h : Expr) : Expr := Id.run do
+    let mut r := extra.foldl (init := h) fun acc a => mkApp acc a
+    -- Beta-reduce in case `h` was a lambda whose body absorbs the extras.
+    -- Cap iterations defensively to avoid any chance of looping.
+    let mut iters := 0
+    while r.isHeadBetaTarget && iters < 100 do
+      r := r.headBeta
+      iters := iters + 1
+    return r
+  -- Direct case (post-simplifyPropCast): Eq.mpr (eq_true h) True.intro → h
+  if cname == ``Eq.mpr && eqFn.constName? == some ``eq_true && eqArgs.length >= 2 then
+    return some (applyExtras eqArgs[1]!)
+  -- Pre-simplifyPropCast variant: Eq.mp (Eq.symm (eq_true h)) True.intro → h
+  if cname == ``Eq.mp && eqFn.constName? == some ``Eq.symm && eqArgs.length >= 4 then
     let inner := eqArgs[3]!
     let (innerFn, innerArgs) := peelArgs inner
     if innerFn.constName? == some ``eq_true && innerArgs.length >= 2 then
-      let h := innerArgs[1]!
-      return some h
+      return some (applyExtras innerArgs[1]!)
   -- Trans case: Eq.trans (Eq.symm (eq_true h)) heq
   if eqFn.constName? != some ``Eq.trans || eqArgs.length < 6 then return none
   let eq1 := eqArgs[4]!
@@ -499,9 +518,9 @@ private def simplifyPre (e : Expr) : MetaM TransformStep := do
   if let some r := simplifyEqMpRefl e then return .visit r
   -- Reduce And.left/And.right of explicit And.intro and Iff.mp/mpr of Iff.intro
   if let some r := simplifyProjOfIntro e then return .visit r
-  -- Reduce `Eq.rec.{0, _} Prop True (id-motive) True.intro target h` to
-  -- `Eq.mp h True.intro`, which downstream rules can simplify further.
-  if let some r := simplifyEqRecOfTrueIntro e then return .visit r
+  -- Reduce `Eq.rec.{0, _} Prop a (id-motive) base target h` to
+  -- `Eq.mp h base`, which downstream rules can simplify further.
+  if let some r := simplifyEqRecOfIdMotive e then return .visit r
   -- Simplify propositional casts (propext/congr chains → Iff operations)
   if let some r ← simplifyPropCast e then return .visit r
   return .continue

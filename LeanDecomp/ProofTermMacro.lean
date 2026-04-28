@@ -87,6 +87,8 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   let localInstances ← getLocalInstances
   let tactics ← buildDecompiledTactics simplifiedProof lctx localInstances
   let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
+  let probeStr := toString (← PrettyPrinter.ppTactic ⟨tacticSeq⟩)
+  liftM (m := IO) (IO.FS.writeFile "/tmp/decompile_generated.txt" probeStr)
 
   -- restore the original state with the original goal before validating
   stateBefore.restore
