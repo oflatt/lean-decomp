@@ -54,31 +54,22 @@ info: Try this:
 example : ∀ n : Nat, 0 + n = n := by
   decompile intro n; exact Nat.zero_add n
 
--- Test 6: grind arithmetic contradiction.
--- The decompiler emits the full structural proof term, replacing grind's
--- `eagerReduce (Eq.refl true)` certificate gadgets with holes closed by `rfl`.
+-- Test 6: grind arithmetic contradiction. Closes via single `lia` once the
+-- byContradiction body's grind certificate is collapsed by `tryDecompFalseFromLia`.
 /--
 info: Try this:
-  [apply] refine @Eq.mp (5 ≤ n) False ?_ ?_
-    · lia
-    · exact h2
+  [apply] lia
 -/
 #guard_msgs (whitespace := lax) in
 example (n : Nat) (h1 : n ≤ 3) (h2 : 5 ≤ n) : False := by
   decompile grind
 
--- Test 7: grind byContradiction + derived have.
+-- Test 7: grind byContradiction + derived have. Closes via `lia` after intro.
 /--
 info: Try this:
   [apply] apply Classical.byContradiction
     intro hp
-    refine @Eq.mp (10 ≤ n) False ?_ ?_
-    · lia
-    · refine @Eq.mp (¬n ≤ 9) (9 + 1 ≤ n) ?_ ?_
-      · lia
-      · apply mt
-        · lia
-        · exact hp
+    lia
 -/
 #guard_msgs (whitespace := lax) in
 example (n : Nat) (h : n < 5) : n < 10 := by

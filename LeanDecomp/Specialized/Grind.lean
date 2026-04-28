@@ -473,8 +473,9 @@ def tryDecompAbsCaseSplitContradiction (expr : Expr) (lctx : LocalContext)
 /-- When the goal is `x ∈ Finset.<Interval> a b` for an arithmetic interval
     constructor (Ico, Ioc, Icc, Ioo, range, …), bypass any structural transport
     that grind built between user-form and its polynomial form by emitting
-    `rw [Finset.mem_<Interval>]; refine ⟨?_, ?_⟩ <;> lia` (or `rw + lia` for
-    half-open shapes whose RHS is a single inequality).
+    `rw [Finset.mem_<Interval>]; lia`. `lia` handles And-shaped arithmetic
+    goals directly, so we don't need to `refine ⟨?_, ?_⟩ <;> lia` — fewer
+    `lia` invocations during validation, and a tighter generated tactic.
 
     This is goal-shape-driven, not proof-term-driven: any proof that has a
     Finset interval membership at the top is a candidate. If `lia` cannot
@@ -536,41 +537,56 @@ def tryDecompFinsetIntervalMembership (expr : Expr) (lctx : LocalContext)
       | some s => pure (some s)
       | none => probeProofForMemLemma
     let some setShape := setShape | return none
-    -- Map Finset interval constructor to its `mem_*` lemma and arity hint.
-    -- arity = 2 means RHS of the iff is an And (two-sided interval);
-    -- arity = 1 means RHS is a single inequality (half-open at one end).
-    let info? : Option (Name × Nat) := match setShape with
-      | "Finset.Ico" => some (Name.mkStr2 "Finset" "mem_Ico", 2)
-      | "Finset.Ioc" => some (Name.mkStr2 "Finset" "mem_Ioc", 2)
-      | "Finset.Icc" => some (Name.mkStr2 "Finset" "mem_Icc", 2)
-      | "Finset.Ioo" => some (Name.mkStr2 "Finset" "mem_Ioo", 2)
-      | "Finset.Iic" => some (Name.mkStr2 "Finset" "mem_Iic", 1)
-      | "Finset.Iio" => some (Name.mkStr2 "Finset" "mem_Iio", 1)
-      | "Finset.Ici" => some (Name.mkStr2 "Finset" "mem_Ici", 1)
-      | "Finset.Ioi" => some (Name.mkStr2 "Finset" "mem_Ioi", 1)
-      | "Finset.range" => some (Name.mkStr2 "Finset" "mem_range", 1)
+    -- Map Finset interval constructor to its `mem_*` lemma.
+    let memLemma? : Option Name := match setShape with
+      | "Finset.Ico" => some (Name.mkStr2 "Finset" "mem_Ico")
+      | "Finset.Ioc" => some (Name.mkStr2 "Finset" "mem_Ioc")
+      | "Finset.Icc" => some (Name.mkStr2 "Finset" "mem_Icc")
+      | "Finset.Ioo" => some (Name.mkStr2 "Finset" "mem_Ioo")
+      | "Finset.Iic" => some (Name.mkStr2 "Finset" "mem_Iic")
+      | "Finset.Iio" => some (Name.mkStr2 "Finset" "mem_Iio")
+      | "Finset.Ici" => some (Name.mkStr2 "Finset" "mem_Ici")
+      | "Finset.Ioi" => some (Name.mkStr2 "Finset" "mem_Ioi")
+      | "Finset.range" => some (Name.mkStr2 "Finset" "mem_range")
       | _ => none
-    let some (memLemma, arity) := info? | return none
+    let some memLemma := memLemma? | return none
     let lemmaIdent : Ident := mkIdent memLemma
     let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
     let rwTac ← `(tactic| rw [$rwRule])
     let liaTac ← `(tactic| lia)
-    -- Also include any Finset interval memberships in the hypotheses that
-    -- might need their own unfolding for `lia` to use.
+    -- Also include any Finset interval memberships in the hypotheses.
     let memRws ← collectFinsetMemRewrites expr
-    let preTacs := memRws.push rwTac
-    let candAnd ← do
-      let refineAnd ← `(tactic| refine ⟨?_, ?_⟩ <;> lia)
-      pure (preTacs.push refineAnd)
-    let candSingle := preTacs.push liaTac
-    let cand := if arity == 2 then candAnd else candSingle
+    let cand := memRws.push rwTac |>.push liaTac
     if ← LeanDecomp.candidateTacticsCloseGoal cand exprTy lctx localInsts then
       return some (cand, used)
+    return none
+
+/-- When the goal is `False` and the proof carries grind automation (so the
+    contradiction is via the arithmetic engine), preprocess Finset interval
+    memberships in the lctx via `rw [Finset.mem_*] at <hyp>` and try `lia`.
+    A single `lia` call after the rewrites avoids the per-leaf elaboration
+    cost of decomposing the structural contradiction. -/
+def tryDecompFalseFromLia (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let exprTy ← Meta.inferType expr
+    unless exprTy.isConstOf ``False do return none
+    unless LeanDecomp.containsAutomationInternals expr do return none
+    let liaTac ← `(tactic| lia)
+    if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] exprTy lctx localInsts then
+      return some (#[liaTac], used)
+    let memRws ← collectFinsetMemRewrites expr
+    if memRws.isEmpty then return none
+    let candidate := memRws ++ #[liaTac]
+    if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
+      return some (candidate, used)
     return none
 
 def handlers : List (Expr → LocalContext → LocalInstances → List String → DecompileCallback →
     TacticM (Option (Array (TSyntax `tactic) × List String))) := [
   tryDecompFinsetIntervalMembership,
+  tryDecompFalseFromLia,
   tryDecompEqMpIntLinearNormLe,
   tryDecompEqMpIffEq,
   tryDecompEqMpNotEqProp,
