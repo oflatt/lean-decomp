@@ -507,40 +507,83 @@ private def simplifyProjOfIntro (e : Expr) : Option Expr :=
     else none
   | none => none
 
+/-- Run a simplifier rule, optionally checking that its output preserves the
+    proof term's type.  Type preservation is non-negotiable here: if a rule
+    rewrites `h : P` to a term of type `Q ≠ P`, downstream decompilation builds
+    tactics that elaborate against the wrong goal and validation either
+    silently corrupts the proof or hits cryptic mvar errors.
+
+    The `Lean.Grind.of_eq_eq_true` simplifier rewrite (now reverted, see
+    README "Things that already failed") was a real-world example: it claimed
+    to produce `a = b` but actually produced `Eq.mpr ... True.intro`, a proof
+    of a totally different proposition.  The bug stayed hidden for months.
+
+    Gated on `leanDecomp.simplify.checkTypes`, which defaults `false` (the
+    isDefEq cost on every fired rule is too high for the production path).
+    Turn on when adding new simplifier rules to catch the same class of bug
+    before it ships. -/
+register_option leanDecomp.simplify.checkTypes : Bool := {
+  defValue := false
+  descr := "Check that simplifier rules preserve the proof term's type. \
+    Adds an `isDefEq` per fired rule; expensive — only enable when adding new \
+    rules or hunting a regression."
+}
+
+private def withTypeCheck (ruleName : String) (input : Expr)
+    (act : MetaM (Option Expr)) : MetaM (Option Expr) := do
+  let result? ← act
+  unless leanDecomp.simplify.checkTypes.get (← getOptions) do return result?
+  let some result := result? | return none
+  let inputTy ← Meta.inferType input
+  let resultTy ← Meta.inferType result
+  unless ← Meta.isDefEq inputTy resultTy do
+    throwError "simplifier rule {ruleName} changed the proof term's type:\n\
+      input  : {inputTy}\n\
+      output : {resultTy}\n\
+      input expr  : {input}\n\
+      output expr : {result}"
+  return result?
+
+/-- Wrap a non-MetaM rule (returning `Option Expr` directly) with the type
+    check.  Lifted into MetaM so the typecheck path is uniform. -/
+private def withTypeCheckPure (ruleName : String) (input : Expr)
+    (act : Option Expr) : MetaM (Option Expr) :=
+  withTypeCheck ruleName input (pure act)
+
 /-- Pre-step: cheap pure rewrites applied before recursing into children.
     Returns `.visit` to re-traverse after rewriting, `.continue` to recurse normally. -/
 private def simplifyPre (e : Expr) : MetaM TransformStep := do
   -- Beta reduction (all beta redexes, not just fvar args)
   if e.isHeadBetaTarget then return .visit e.headBeta
   -- Strip `@id T body`
-  if let some r := simplifyId e then return .visit r
+  if let some r ← withTypeCheckPure "simplifyId" e (simplifyId e) then return .visit r
   -- Collapse Eq.mp/Eq.mpr (Eq.refl _) body → body
-  if let some r := simplifyEqMpRefl e then return .visit r
+  if let some r ← withTypeCheckPure "simplifyEqMpRefl" e (simplifyEqMpRefl e) then return .visit r
   -- Reduce And.left/And.right of explicit And.intro and Iff.mp/mpr of Iff.intro
-  if let some r := simplifyProjOfIntro e then return .visit r
+  if let some r ← withTypeCheckPure "simplifyProjOfIntro" e (simplifyProjOfIntro e) then return .visit r
   -- Reduce `Eq.rec.{0, _} Prop a (id-motive) base target h` to
   -- `Eq.mp h base`, which downstream rules can simplify further.
-  if let some r := simplifyEqRecOfIdMotive e then return .visit r
+  if let some r ← withTypeCheckPure "simplifyEqRecOfIdMotive" e (simplifyEqRecOfIdMotive e) then return .visit r
   -- Simplify propositional casts (propext/congr chains → Iff operations)
-  if let some r ← simplifyPropCast e then return .visit r
+  if let some r ← withTypeCheck "simplifyPropCast" e (simplifyPropCast e) then return .visit r
   return .continue
 
 /-- Post-step: MetaM rewrites applied after children are simplified.
     Returns `.visit` to re-traverse after rewriting, `.done` to keep as-is. -/
 private def simplifyPost (e : Expr) : MetaM TransformStep := do
-  if let some r ← simplifyEqMpTrueIntroEqTrue e then return .visit r
+  if let some r ← withTypeCheck "simplifyEqMpTrueIntroEqTrue" e (simplifyEqMpTrueIntroEqTrue e) then return .visit r
   -- Convert grind theorem-based combinators to standard eq_true/eq_false/propext forms.
-  if let some r ← simplifyGrindCombinators e then return .visit r
+  if let some r ← withTypeCheck "simplifyGrindCombinators" e (simplifyGrindCombinators e) then return .visit r
   -- Re-check propositional casts: child simplification may have revealed
   -- handleable eq proof heads (e.g. iff_eq → propext in children).
-  if let some r ← simplifyPropCast e then return .visit r
-  if let some r ← simplifyGrindWrappers e then return .visit r
-  if let some r ← simplifyGrindIntroWithEq e then return .visit r
-  if let some r ← simplifyNoConfusion e then return .visit r
-  if let some r ← simplifyEqRec e then return .visit r
-  if let some r ← simplifyEqTransport e then return .visit r
-  if let some r ← simplifyEqOfHEq e then return .visit r
-  if let some r ← simplifyFalseElim e then return .visit r
+  if let some r ← withTypeCheck "simplifyPropCast" e (simplifyPropCast e) then return .visit r
+  if let some r ← withTypeCheck "simplifyGrindWrappers" e (simplifyGrindWrappers e) then return .visit r
+  if let some r ← withTypeCheck "simplifyGrindIntroWithEq" e (simplifyGrindIntroWithEq e) then return .visit r
+  if let some r ← withTypeCheck "simplifyNoConfusion" e (simplifyNoConfusion e) then return .visit r
+  if let some r ← withTypeCheck "simplifyEqRec" e (simplifyEqRec e) then return .visit r
+  if let some r ← withTypeCheck "simplifyEqTransport" e (simplifyEqTransport e) then return .visit r
+  if let some r ← withTypeCheck "simplifyEqOfHEq" e (simplifyEqOfHEq e) then return .visit r
+  if let some r ← withTypeCheck "simplifyFalseElim" e (simplifyFalseElim e) then return .visit r
   return .done e
 
 /-- Recursively simplify a proof term bottom-up using `Meta.transform`.

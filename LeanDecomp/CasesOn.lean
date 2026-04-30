@@ -237,11 +237,115 @@ private def isBranchContradiction (body : Expr) : MetaM Bool := do
       return true
   return false
 
-/-- Handle `*.casesOn` applications - generate a `cases` tactic.
-    Detects when expr is an application of an inductive type's casesOn eliminator.
-    Takes callbacks for decompileExpr and assignIntroNames to avoid circular dependencies.
-  Supports generalized equality motives by rebinding branch-local equality
-  parameters to the motive arguments and substituting constructor-local fvars. -/
+/-- Run `MVarId.cases` on `expr`'s discriminant.  Allocates a fresh synthetic-
+    opaque mvar of `expr`'s type, generalizes the discriminant if it's not
+    already a fvar, then calls `mvarId.cases` to produce per-branch subgoals
+    whose lctxs reflect the real `cases`-substituted state.
+
+    Returns `none` when `MVarId.cases` fails (unusual goal shape, or the
+    generalized-motive case where `mvarId.cases` doesn't reproduce the
+    `heq : disc = ctor xs` hypothesis — see the README's "Generalized motives
+    extension" item for what was tried).  The caller then falls back to the
+    synthesized `lambdaTelescope` lctx. -/
+private def runMVarIdCases (expr : Expr) (info : CasesOnInfo)
+    : TacticM (Option (Array Meta.CasesSubgoal)) := do
+  try
+    let exprTy ← Meta.inferType expr
+    let outerMvar ← Meta.mkFreshExprMVar (some exprTy) .syntheticOpaque
+    let (majorFVarId, mvarAfterGen) ←
+      if let some fid := info.discriminant.fvarId? then
+        pure (fid, outerMvar.mvarId!)
+      else
+        let (newFvarIds, newMvarId) ← outerMvar.mvarId!.generalize
+          #[{ expr := info.discriminant }]
+        pure (newFvarIds[0]!, newMvarId)
+    let subgoals ← mvarAfterGen.cases majorFVarId
+    pure (some subgoals)
+  catch _ =>
+    pure none
+
+/-- Substitute trailing eq-motive params with the corresponding motive args,
+    then strip residual `Eq.ndrec` / `Eq.rec` transports whose base is a
+    lambda.  This is the "generalized equation motive" cleanup.
+
+    The substitution is type-incorrect at the Expr level (`Eq.refl s` has
+    type `s = s`, not `s = Stmt.skip`), but downstream handlers
+    (`contradiction`, `noConfusion`) consume the type-incorrect intermediate
+    before re-elaboration.  Stripping is gated on `base.isLambda` so we don't
+    erase `noConfusion`'s `Eq.rec` (whose base is const-headed).
+
+    For indexed families a `T.casesOn + nested Eq.ndrec` chain may remain
+    after the lambda strip; iota-reduce via `whnf` to collapse those. -/
+private def cleanupEqMotiveTransport (innerBody : Expr) (motiveArgs : List Expr)
+    (trailingEqParams : Array Expr) (numTrailingEq : Nat) : MetaM Expr := do
+  let motiveArgCount := motiveArgs.length
+  let bindableEqCount := Nat.min numTrailingEq motiveArgCount
+  let mut innerBody := innerBody
+  let mut eqParamSubsts : Array (FVarId × Expr) := #[]
+  for i in List.range bindableEqCount do
+    let eqParam := trailingEqParams[i]!
+    if let some fid := eqParam.fvarId? then
+      eqParamSubsts := eqParamSubsts.push (fid, motiveArgs[i]!)
+  innerBody := substFVars innerBody eqParamSubsts
+  let remainingMotiveArgs := motiveArgs.drop bindableEqCount
+  innerBody := remainingMotiveArgs.foldl (init := innerBody) fun acc arg =>
+    mkApp acc arg
+  if bindableEqCount > 0 then
+    while innerBody.isHeadBetaTarget do
+      innerBody := innerBody.headBeta
+    let mut stripping := true
+    while stripping do
+      let (topFn, topArgs) := peelArgs innerBody
+      if let some cname := topFn.constName? then
+        if (cname == ``Eq.ndrec || cname == ``Eq.rec) && topArgs.length >= 6 then
+          let base := topArgs[3]!
+          if base.isLambda then
+            let extraArgs := topArgs.drop 6
+            let result := extraArgs.foldl (init := base) fun acc arg => mkApp acc arg
+            let mut r := result
+            while r.isHeadBetaTarget do
+              r := r.headBeta
+            innerBody := r
+            continue
+      stripping := false
+    let (headFn, _) := peelArgs innerBody
+    if let some cname := headFn.constName? then
+      if cname == ``Eq.ndrec || cname == ``Eq.rec then
+        innerBody ← Meta.whnf innerBody
+  return innerBody
+
+/-- Build the final `cases <disc> with | ctor₁ … => … | ctor₂ … => …` (or
+    `cases h : <disc> with …` for generalized-equation motives) tactic from
+    the discriminant term, optional eq-binder name, and the pre-built alt
+    syntax. -/
+private def mkCasesWithAltsTactic (discTerm : Term)
+    (eqBinderName? : Option String)
+    (alts : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt))
+    : TermElabM (TSyntax `tactic) := do
+  match eqBinderName? with
+  | some eqName =>
+    let hIdent : TSyntax `Lean.binderIdent ←
+      `(Lean.binderIdent| $(mkIdent (Name.mkSimple eqName)):ident)
+    `(tactic| cases $hIdent : $discTerm:term with $[$alts:inductionAlt]*)
+  | none =>
+    `(tactic| cases $discTerm:term with $[$alts:inductionAlt]*)
+
+/-- Handle `*.casesOn` applications — generate a `cases` tactic.
+    Detects when `expr` is an application of an inductive type's casesOn
+    eliminator.  Takes callbacks for `decompileExpr` and `assignIntroNames`
+    to avoid circular dependencies.  Supports generalized equality motives
+    by rebinding branch-local equality parameters to the motive arguments
+    and substituting constructor-local fvars.
+
+    Implementation walks three phases per branch:
+    1. Telescope the branch lambda, separate ctor params from trailing eq
+       params, assign user names via `assignIntroNames`.
+    2. `cleanupEqMotiveTransport`: substitute eq params with motive args and
+       strip residual `Eq.rec` / `Eq.ndrec` transports (load-bearing for
+       downstream `contradiction` / `noConfusion`).
+    3. Recurse on the cleaned body — using the real substituted lctx from
+       `runMVarIdCases`'s subgoal when available, falling back to the
+       synthesized telescope lctx for generalized motives. -/
 def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String)
     (decompileExpr : DecompileCallback)
@@ -295,25 +399,7 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     -- `noConfusion` — they consume the type-incorrect intermediate that the
     -- cleanup produces.  Improving this is documented in the README.
     let casesSubgoals : Option (Array Meta.CasesSubgoal) ←
-      if hasEqMotive then
-        pure none
-      else
-        try
-          let exprTy ← Meta.inferType expr
-          let outerMvar ← Meta.mkFreshExprMVar (some exprTy) .syntheticOpaque
-          let (majorFVarId, mvarAfterGen) ←
-            if let some fid := info.discriminant.fvarId? then
-              pure (fid, outerMvar.mvarId!)
-            else
-              let (newFvarIds, newMvarId) ← outerMvar.mvarId!.generalize
-                #[{ expr := info.discriminant }]
-              pure (newFvarIds[0]!, newMvarId)
-          let subgoals ← mvarAfterGen.cases majorFVarId
-          pure (some subgoals)
-        catch _ =>
-          -- If `generalize` or `cases` fails (unusual goal shape, etc.), fall
-          -- back to the old lambdaTelescope path so we still emit something.
-          pure none
+      if hasEqMotive then pure none else runMVarIdCases expr info
 
     for (ctorName, caseBranch) in ctorNames.zip info.caseBranches do
       let ctorShortName := ctorName.getString!
@@ -398,56 +484,8 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
         -- we strip it when the base is a lambda (the generalized equation
         -- transport pattern), as opposed to noConfusion's Eq.rec which has
         -- a constant-headed base.
-        let motiveArgCount := info.motiveArgs.length
-        let bindableEqCount := Nat.min numTrailingEq motiveArgCount
-
-        let mut innerBody : Expr := bodyAfterCtorIndex
-
-        -- Substitute trailing eq params with corresponding motive args, then
-        -- apply any remaining motive args as function arguments.
-        let mut eqParamSubsts : Array (FVarId × Expr) := #[]
-        for i in List.range bindableEqCount do
-          let eqParam := trailingEqParams[i]!
-          if let some fid := eqParam.fvarId? then
-            eqParamSubsts := eqParamSubsts.push (fid, info.motiveArgs[i]!)
-        innerBody := substFVars innerBody eqParamSubsts
-        let remainingMotiveArgs := info.motiveArgs.drop bindableEqCount
-        innerBody := remainingMotiveArgs.foldl (init := innerBody) fun acc arg =>
-          mkApp acc arg
-
-        -- Clean up Eq.ndrec/Eq.rec artifacts from the substitution.
-        -- When a generalized equation motive produces `Eq.ndrec ... (Eq.symm h) h`,
-        -- substituting `h ↦ Eq.refl s` yields a type-incorrect intermediate:
-        --   `Eq.rec ... base ... (Eq.symm (Eq.refl s)) (Eq.refl s)`
-        -- where base is a lambda. Beta-reduce to collapse inlined Eq.ndrec,
-        -- then strip Eq.rec when the base is a lambda (the eq transport pattern).
-        -- We do NOT strip Eq.rec with non-lambda bases (e.g. noConfusion internals).
-        if bindableEqCount > 0 then
-          while innerBody.isHeadBetaTarget do
-            innerBody := innerBody.headBeta
-          let mut stripping := true
-          while stripping do
-            let (topFn, topArgs) := peelArgs innerBody
-            if let some cname := topFn.constName? then
-              if (cname == ``Eq.ndrec || cname == ``Eq.rec) && topArgs.length >= 6 then
-                let base := topArgs[3]!
-                if base.isLambda then
-                  let extraArgs := topArgs.drop 6
-                  let result := extraArgs.foldl (init := base) fun acc arg => mkApp acc arg
-                  let mut r := result
-                  while r.isHeadBetaTarget do
-                    r := r.headBeta
-                  innerBody := r
-                  continue
-            stripping := false
-          -- For indexed families, the inner body may still contain transport
-          -- chains (T.casesOn + nested Eq.ndrec) from decomposing index
-          -- equalities. If Eq.rec is still at the head after stripping, use
-          -- whnf to computationally collapse these via iota-reduction.
-          let (headFn, _) := peelArgs innerBody
-          if let some cname := headFn.constName? then
-            if cname == ``Eq.ndrec || cname == ``Eq.rec then
-              innerBody ← Meta.whnf innerBody
+        let innerBody ← cleanupEqMotiveTransport bodyAfterCtorIndex
+          info.motiveArgs trailingEqParams numTrailingEq
 
         -- Recurse on the branch body.  When `MVarId.cases` succeeded above,
         -- run the recursion in the subgoal's real (substituted) lctx —
@@ -527,19 +565,10 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
         withOptions (fun o =>
           (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
         delabToRefinableSyntax info.discriminant
-    let casesTac ← if let some (eqName, _) := eqInfo then do
+    let eqBinderName? : Option String := eqInfo.map fun (eqName, _) =>
       let discName := getDiscriminantName info.discriminant lctx
-      let eqBinderName :=
-        if discName == some eqName then
-          s!"{eqName}_eq"
-        else
-          eqName
-      let hIdent : TSyntax `Lean.binderIdent ←
-        `(Lean.binderIdent| $(mkIdent (Name.mkSimple eqBinderName)):ident)
-      `(tactic| cases $hIdent : $discTerm:term with $[$alts:inductionAlt]*)
-    else
-      `(tactic| cases $discTerm:term with $[$alts:inductionAlt]*)
-
+      if discName == some eqName then s!"{eqName}_eq" else eqName
+    let casesTac ← mkCasesWithAltsTactic discTerm eqBinderName? alts
     return some (preTacs ++ #[casesTac], used)
 
 end LeanDecomp

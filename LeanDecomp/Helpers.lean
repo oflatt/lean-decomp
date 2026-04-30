@@ -75,6 +75,19 @@ def peelArgs (e : Expr) : Expr × List Expr :=
     | _ => (e, acc)
   go e []
 
+/-- Match an expression `e` against the shape `<constName> a₁ a₂ … aₙ` with
+    `n ≥ minArity`.  Returns the argument list on match, `none` otherwise.
+    Replaces the boilerplate `let (fn, args) := peelArgs e; let some name :=
+    fn.constName? | return none; if name != ``Foo then return none; if
+    args.length < N then return none` that every `tryDecompXxx` handler
+    repeats.  Use as `let some args := matchConstApp? e ``Foo N | return none`. -/
+def matchConstApp? (e : Expr) (constName : Name) (minArity : Nat) : Option (List Expr) :=
+  let (fn, args) := peelArgs e
+  if fn.isConstOf constName && args.length >= minArity then
+    some args
+  else
+    none
+
 partial def containsConstName (e : Expr) (target : Name) : Bool :=
   Expr.find? (fun sub => sub.getAppFn.constName? == some target) e |>.isSome
 
@@ -185,15 +198,23 @@ private def subproofTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedT
     `validateOrExact` / `subproofTacticsCloseGoal` directly is *not* bounded
     — that is the workhorse final check and must reflect the real elaborator.
 
-    The value here is in user-visible units (Lean multiplies internally by 1000
-    to get the actual heartbeat counter threshold), so 100000 corresponds to
-    `set_option maxHeartbeats 100000` — half of Lean's default per-command
-    budget of 200000. -/
-  private def candidateMaxHeartbeats : Nat := 100000
+    The value is in user-visible units (Lean multiplies internally by 1000
+    to get the actual heartbeat counter threshold).  Default 100000 — half of
+    Lean's default per-command budget of 200000 — and adjustable via the
+    `leanDecomp.candidateMaxHeartbeats` option for nightly tuning without a
+    rebuild. -/
+  register_option leanDecomp.candidateMaxHeartbeats : Nat := {
+    defValue := 100000
+    descr := "Per-call heartbeat cap on speculative validation in \
+      `candidateTacticsCloseGoal`. Tighter values fail more candidates fast \
+      (more `exact` fallbacks); looser values let one slow candidate eat the \
+      ambient budget. Default 100000 (= 100k user-visible heartbeats)."
+  }
 
   def candidateTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedType : Expr)
     (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool := do
-    withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := candidateMaxHeartbeats * 1000 }) do
+    let bound := leanDecomp.candidateMaxHeartbeats.get (← getOptions)
+    withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := bound * 1000 }) do
       Core.withCurrHeartbeats <|
         subproofTacticsCloseGoal tacs expectedType lctx localInsts
 
@@ -206,40 +227,78 @@ private def isBoolEqTrue (ty : Expr) : Bool :=
   | some (α, _, rhs) => α.isConstOf ``Bool && rhs.isConstOf ``Bool.true
   | none => false
 
-/-- Build a robust exact fallback for a subproof. Prefer direct delaboration when
-    possible, but fall back to fully pretty-printed syntax for low-level proofs.
+/-- Configuration for `chooseExactStrategy`.  The three fallback sites differ
+    only in this config (size check on/off, decide-first on/off, and whether
+    propext/Iff.intro forces pp.all rendering). -/
+structure ExactStrategyConfig where
+  /-- Throw if the proof exceeds `throwIfFallbackProofTooLarge`'s node-count
+      cap.  Used by `validateOrExact` (where the proof was meant to be a
+      structural decomp result, not a giant raw term) but not by the final
+      `decompExact` (where falling through to a giant `exact` is the
+      last-resort behaviour anyway). -/
+  enforceMaxSize : Bool := false
+  /-- Try `decide` before `with_unfolding_all exact` when the proof contains
+      `eagerReduce` and has type `_ = (true : Bool)` (the certificate shape).
+      Same kernel work, much smaller residual term.  Gated on type shape
+      because `decide` would fail on transport-wrapped forms and the
+      validation attempt itself is expensive. -/
+  tryDecideFirst : Bool := false
+  /-- Extra predicates that force `pp.all` rendering on top of the always-on
+      `containsEagerReduce` gate.  `mkExactFallbackTactics` adds propext /
+      Iff.intro because validation just failed and the candidate is more
+      likely to need full disambiguation; `decompExact` doesn't because
+      pp.all on propext-containing proofs is dramatically slower to
+      re-elaborate and most propext shapes are caught by earlier handlers. -/
+  forcePrettyPrint : Expr → Bool := fun _ => false
 
-    For proofs that ARE an eagerReduce certificate (type shape `_ = true` over
-    Bool), try `decide` first: it does the same kernel reduction as
-    `with_unfolding_all exact` but produces a much smaller residual term —
-    sometimes cutting heartbeat cost enough to fit the default budget.  We
-    gate on the type shape rather than just `containsEagerReduce` because
-    transport-wrapped forms (e.g. `Eq.mp transport (eagerReduce ...)`) have a
-    non-decidable outer type; `decide` would fail there, and the validation
-    attempt itself is expensive.  Falls back to `with_unfolding_all exact`
-    when `decide` doesn't close the goal. -/
-private def mkExactFallbackTactics (proof : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) : TacticM (Array (TSyntax `tactic)) := do
-  throwIfFallbackProofTooLarge proof
-  let usePrettyPrintedTerm :=
-    containsEagerReduce proof || containsConstName proof ``propext || containsConstName proof ``Iff.intro
-  let termStx ← if usePrettyPrintedTerm then
+/-- Unified policy for emitting an `exact` / `with_unfolding_all exact` /
+    `decide` fallback.  Three call sites use this:
+
+    - `mkExactFallbackTactics` (validation-failure fallback in
+      `validateOrExact`): max-size check on, decide-first on, propext / Iff.intro
+      force pp.all.
+    - `decompExact` (last-resort fallback when no handler matched): max-size
+      check off, decide-first off, only `eagerReduce` forces pp.all.
+
+    A single function captures the term-syntax selection (delab vs pp.all) and
+    the certificate-shape decide attempt so future changes (e.g. always
+    trying `decide` first, or always pp.all-rendering propext) only need to
+    edit one place. -/
+def chooseExactStrategy (proof : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (cfg : ExactStrategyConfig)
+    : TacticM (Array (TSyntax `tactic)) := do
+  if cfg.enforceMaxSize then
+    throwIfFallbackProofTooLarge proof
+  let needsPrettyPrint := containsEagerReduce proof || cfg.forcePrettyPrint proof
+  let termStx ← if needsPrettyPrint then
       try ppExprToTermSyntaxWith proof true
       catch _ => delabToRefinableSyntax proof
     else
       try delabToRefinableSyntax proof
       catch _ => ppExprToTermSyntaxWith proof true
   if containsEagerReduce proof then
-    let proofTy ← instantiateMVars (← Meta.inferType proof)
-    if isBoolEqTrue proofTy then
-      let decideTac ← `(tactic| decide)
-      if ← subproofTacticsCloseGoal #[decideTac] proofTy lctx localInsts then
-        return #[decideTac]
+    if cfg.tryDecideFirst then
+      let proofTy ← instantiateMVars (← Meta.inferType proof)
+      if isBoolEqTrue proofTy then
+        let decideTac ← `(tactic| decide)
+        if ← subproofTacticsCloseGoal #[decideTac] proofTy lctx localInsts then
+          return #[decideTac]
     let tac ← `(tactic| with_unfolding_all exact $termStx)
     return #[tac]
   else
     let tac ← `(tactic| exact $termStx)
     return #[tac]
+
+/-- Validation-failure fallback.  Wraps `chooseExactStrategy` with the config
+    used by `validateOrExact` — see `ExactStrategyConfig` for the rationale. -/
+private def mkExactFallbackTactics (proof : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) : TacticM (Array (TSyntax `tactic)) :=
+  chooseExactStrategy proof lctx localInsts {
+    enforceMaxSize := true
+    tryDecideFirst := true
+    forcePrettyPrint := fun e =>
+      containsConstName e ``propext || containsConstName e ``Iff.intro
+  }
 
 /-- Validate a candidate tactic block against the full proof goal and fall back
     to an exact proof term if validation fails. -/

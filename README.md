@@ -64,6 +64,40 @@ Benchmarks via `scripts/nightly.py --runs 3 --warmup 1 --treatment {original,gri
 
 **Decompile is 1.1× to 14× *slower* than grind on grind-success cases.** The dominant overhead is the `have hOr : φ ∨ ¬φ := by lia; cases hOr with | inl => lia | inr => lia` pattern: each `lia` setup is ~50–150ms; Int L91 makes 4+ of them. A stage-3 tactic simplifier that shares `lia` calls across branches (Top TODO #1) is the highest-leverage perf fix.
 
+### Done: fvar-app handler collapse (2026-04-30, batch 4)
+
+- **Deleted `tryDecompProblematicProofApp`** (`Decompiler.lean`, ~40 lines).  Phase 1 dispatch slot is now empty; fvar-headed apps with proof args fall through to `tryDecompTheoremAppFallback` at Phase 8.  Investigation showed `tryDecompTheoremAppFallback` was already handling fvar heads correctly when reached — the duplicate handler was preserved purely to make fvar-app dispatch happen at Phase 1 rather than Phase 8, which had no semantic effect (no Phase 2-7 handler matches fvar heads).
+- **Generalized `tryDecompTheoremAppFallback`'s emission**.  Previously it always used `refine $delabTerm`.  Added the all-args-proof-like branch that emits `apply $head` instead — recovers the `apply h; · exact a; · exact b` shape that the old `tryDecompProblematicProofApp` produced (test 12, the `not_eq_prop` regression).
+- **Test 4b** (new): fvar head + 2 proof args, regression-locks the fvar-app path through the unified `tryDecompTheoremAppFallback`.  Combined with Test 4 (fvar head + 1 proof arg, falls to `decompExact`) the two snapshots cover both branches of the gating logic.
+- **Updated dispatch-list documentation** (`Decompiler.lean:317-`) to reflect that Phase 1 is now just `tryDecompExactLocalHyp` and Phase 8's `tryDecompTheoremAppFallback` handles both fvar and const heads.
+
+Sum.lean still 4/4, Int.lean still 5/5, all 19 snapshot tests pass.
+
+**Deferred from this batch**: `used : List String` → state monad refactor (Big mechanical refactor, ~30-40 function signatures across 5 files).  Larger than fits a cleanup batch; scheduled for a dedicated session before paper writeup so the architecture is clean for the methodology chapter.
+
+### Done: combinator + strategy + handler-split cleanup (2026-04-30, batch 3)
+
+Continuation of the cleanup pass.  No behavior change (Sum 4/4, Int 5/5, all 18 tests pass).
+- **Heartbeat option exposure**.  `candidateMaxHeartbeats` (`Helpers.lean`) is now `register_option leanDecomp.candidateMaxHeartbeats : Nat := { defValue := 100000, … }`.  Nightly / tests can tune the speculative-validation cap via `set_option leanDecomp.candidateMaxHeartbeats N` without recompiling.
+- **`chooseExactStrategy` unified policy** (`Helpers.lean`).  The three fallback sites — `mkExactFallbackTactics` (validation-failure), `validateOrExact`'s catch arm, and `Decompiler.lean`'s `decompExact` (no-handler-matched) — interleave delab-vs-pp.all, decide-vs-with_unfolding_all-exact decisions differently.  Lifted into a single `chooseExactStrategy` parameterized by an `ExactStrategyConfig` record (`enforceMaxSize`, `tryDecideFirst`, `forcePrettyPrint : Expr → Bool`).  Each call site now passes its config.  Future tuning (e.g. always trying `decide`, or always pp.all-rendering propext) edits one function.
+- **`matchConstApp?` combinator** (`Helpers.lean`).  Most `tryDecompXxx` handlers shared the boilerplate `let (fn, args) := peelArgs e; let some name := fn.constName? | return none; if name != ``Foo then return none; if args.length < N then return none`.  Added `matchConstApp? : Expr → Name → Nat → Option (List Expr)` so handlers become `let some args := matchConstApp? e ``Foo N | return none`.  Applied to 12 handlers across `Decompiler.lean` (Iff.intro/mp/mpr, And.intro/proj, propext), `EqDecomp.lean` (congr, congrArg, Eq.symm, Eq.trans, the two `*Congr` peelers), and `Specialized/Grind.lean` (Eq.mpAutomationCast, Eq.mpKnownGrindCast, Eq.mpIntLinearNormLe, mt).  Net: ~3 lines saved per handler and the *intent* — "match this shape" — is now visible at the top of each handler.
+- **`tryDecompCasesOn` split** (`CasesOn.lean`).  340-line function broken up by extracting three named helpers, each with its own docstring:
+  - `runMVarIdCases` (~20 lines): allocate a fresh synthetic-opaque mvar of `expr`'s type, generalize the discriminant if needed, run `MVarId.cases`, return subgoals.  Returns `none` for generalized motives so the caller falls back to the older `lambdaTelescope` path.
+  - `cleanupEqMotiveTransport` (~40 lines): the load-bearing eq-motive substitution + `Eq.rec`/`Eq.ndrec` strip.  Documented why we strip only when the base is a lambda (would otherwise erase `noConfusion`'s const-headed `Eq.rec`).
+  - `mkCasesWithAltsTactic` (~10 lines): final `cases <disc> with …` syntax build, with optional `cases h : <disc>` form for generalized-equation motives.
+  Main `tryDecompCasesOn` body shrunk by ~70 lines and gained a docstring describing the three-phase per-branch flow (telescope → cleanup → recurse).
+
+### Done: dispatch + simplifier + test cleanup (2026-04-30, batch 2)
+
+Continuation of the cleanup pass.  No behavior change (Sum 4/4, Int 5/5, all 18 tests pass).
+- **Documented `firstSomeM` dispatch** in `Decompiler.lean:363-450`. Annotated 8 phases (Pre / Binder-introducing / Specialized / Structural-propositional / Structural-equality / False / Term-shape / Terminal-arithmetic / Theorem-app fallback) with rationale for each ordering invariant. Swapping phases now obviously breaks correctness — e.g. the comment for Phase 4 spells out that `tryDecompEqMpForallCongr` MUST precede `tryDecompEqMp` so the L70/L36 fast path fires.
+- **Added simplifier type-preservation invariant** in `Simplify.lean`. New `register_option leanDecomp.simplify.checkTypes` (default `false`) wraps every rule's output through `Meta.isDefEq oldTy newTy` and throws if the rule changed the proof term's type. This is the precise class of bug the old `Lean.Grind.of_eq_eq_true` rewrite had — it claimed to produce `a = b` but actually produced `Eq.mpr ... True.intro` of a different proposition. Smoke-tested at `set_option leanDecomp.simplify.checkTypes true` against all 18 snapshot tests; no current rules violate the invariant.
+- **Refactored `collectFinsetMemRewrites`** (`Specialized/Grind.lean`). Three passes (proof-walk for direct `Iff.mp` hits, cross-product of found lemmas × target fvars, lctx scan) are now visually separated with section comments and share a single `pushRw` helper that handles `(lemma, hyp)` deduplication. The shared `emitted : HashSet (Name × Name)` accumulator makes the dedup invariant explicit (preventing the "rw lemma at hyp twice fails" bug that broke L70 in the first iteration).
+- **Removed dead `extractGrindLemmaNames`** (30 lines, zero callers).
+- **Modernized `isStructuralConst` / `isGrindConst`** in `Helpers.lean` to use `Name.isPrefixOf` against namespace literals (`Eq`, `Classical`, `Int.Linear`, `Lean.Grind`, `Lean.RArray`) where possible. Added comment explaining why `congr*` / `*_congr*` / `eq_true*` / `eq_false*` checks remain string-prefixed (root-namespace names with no shared parent).
+- **Extracted `setInductionAltBinders`** in `CasesOn.lean`. The 40-line `Syntax.node` surgery that mutates an `inductionAltLHS`'s binder slot is now a named, documented helper instead of inline raw-syntax matching at the call site. The call site went from ~40 lines to one if-expression.
+- **Reorganized `Test.lean`** into 6 sections grouped by handler (Smoke / byContradiction / Hypothesis-preferences / Specialized-grind / propext-Iff regression locks / forall_congr+implies_congr regression locks) with an introductory comment block. Tests 14–18 are now annotated as "regression locks" so future contributors know not to "fix the snapshot" without reading the relevant handler docstring.
+
 ### Done: utility consolidation pass (2026-04-30)
 
 Code-review punch list found three utility duplicates and several dead files. Cleaned up in one pass with no behavior change (`Sum.lean` still 4/4, `Int.lean` still 5/5, all 18 snapshot tests still pass). Net: −410 lines.

@@ -14,10 +14,7 @@ open LeanDecomp (peelArgs)
 def tryDecompEqMpAutomationCast (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
-  let (fn, args) := peelArgs expr
-  let some cname := fn.constName? | return none
-  if cname != ``Eq.mp then return none
-  if args.length < 4 then return none
+  let some args := LeanDecomp.matchConstApp? expr ``Eq.mp 4 | return none
   let eqProof := args[2]!
   let inner := args[3]!
   if !containsAutomationInternals eqProof then return none
@@ -41,15 +38,10 @@ private def tryDecompEqMpKnownGrindCast (castName : Name) (expr : Expr)
     (lctx : LocalContext) (localInsts : LocalInstances) (used : List String)
     (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
-  let (fn, args) := peelArgs expr
-  let some cname := fn.constName? | return none
-  if cname != ``Eq.mp then return none
-  if args.length < 4 then return none
+  let some args := LeanDecomp.matchConstApp? expr ``Eq.mp 4 | return none
   let castProof := args[2]!
   let inner := args[3]!
-  let (castFn, _) := peelArgs castProof
-  let some n := castFn.constName? | return none
-  if n != castName then return none
+  let some _ := LeanDecomp.matchConstApp? castProof castName 0 | return none
   withLCtx lctx localInsts do
     let castStx ← delabToRefinableSyntax castProof
     let eqMpIdent : Ident := ⟨mkIdent ``Eq.mp |>.raw.setInfo .none⟩
@@ -83,68 +75,8 @@ private partial def collectFinsetMemRewrites (proof : Expr) : MetaM (Array (TSyn
     "Finset.mem_Iic", "Finset.mem_Iio", "Finset.mem_Ici", "Finset.mem_Ioi",
     "Finset.mem_range", "Finset.mem_sdiff", "Finset.mem_inter", "Finset.mem_union"
   ]
-  let mut foundPairs : Std.HashSet (Name × Name) := {}
-  let mut foundLemmas : Std.HashSet Name := {}
-  let mut targetFvars : Std.HashSet Name := {}
-  let mut stack : List Expr := [proof]
-  let mut iters := 0
-  -- Higher than the 5000 used elsewhere because L70's proof has `mem_Ico`
-  -- references buried deep inside the propext/Iff.intro lambda bodies, past
-  -- where the 5000 budget runs out.
-  while !stack.isEmpty && iters < 50000 do
-    iters := iters + 1
-    let cur := stack.head!
-    stack := stack.tail!
-    -- Pass 1: `Iff.mp <memLemma> <fvar>` patterns — produce a (lemma, fvar) pair.
-    let (fn, args) := peelArgs cur
-    if fn.isConstOf ``Iff.mp && args.length >= 4 then
-      let iffArg := args[2]!
-      let hypArg := args[3]!
-      let (iffFn, _) := peelArgs iffArg
-      if let some iffName := iffFn.constName? then
-        if memLemmas.contains iffName.toString then
-          if let some fid := hypArg.fvarId? then
-            let hypDecl ← fid.getDecl
-            foundPairs := foundPairs.insert (iffName, hypDecl.userName)
-            targetFvars := targetFvars.insert hypDecl.userName
-    -- Pass 2: any `Finset.mem_<X>` const reference, regardless of arg position.
-    if let some cname := fn.constName? then
-      if memLemmas.contains cname.toString then
-        foundLemmas := foundLemmas.insert cname
-    match cur with
-    | .app f a => stack := f :: a :: stack
-    | .lam _ t b _ => stack := t :: b :: stack
-    | .forallE _ t b _ => stack := t :: b :: stack
-    | .letE _ t v b _ => stack := t :: v :: b :: stack
-    | .mdata _ b => stack := b :: stack
-    | .proj _ _ b => stack := b :: stack
-    | _ => pure ()
-  let mut rwTacs : Array (TSyntax `tactic) := #[]
-  for (lemmaName, hypName) in foundPairs do
-    let lemmaIdent : Ident := mkIdent lemmaName
-    let hypIdent : Ident := mkIdent hypName
-    let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
-    let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
-    rwTacs := rwTacs.push (← `(tactic| rw [$rwRule] $loc))
-  -- Pass 2 rewrites: for each (lemma, fvar) with lemma not already in Pass 1
-  -- for that fvar, emit `rw [lemma] at fvar`.  The `rw` may not fire (no
-  -- pattern match) — that's caught by the surrounding `candidateTacticsCloseGoal`
-  -- check, which discards a non-firing block.
-  for lemma in foundLemmas do
-    for hypName in targetFvars do
-      unless foundPairs.contains (lemma, hypName) do
-        let lemmaIdent : Ident := mkIdent lemma
-        let hypIdent : Ident := mkIdent hypName
-        let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
-        let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
-        rwTacs := rwTacs.push (← `(tactic| rw [$rwRule] $loc))
-        foundPairs := foundPairs.insert (lemma, hypName)
-  -- Pass 3: lctx-based scan.  Sum L36's proof references `mem_sdiff` only as
-  -- `mem_sdiff.mp (Eq.mp <transport> hp)` — the third arg is an Eq.mp expr,
-  -- not a direct fvar — so Pass 1 misses it.  Pass 2 finds the const but has
-  -- no `targetFvars` to pair it with.  Recover by scanning the lctx for any
-  -- hypothesis whose type matches a known Finset interval / sdiff constructor
-  -- and emitting a rewrite at that hypothesis directly.
+  -- Map from a Finset interval set constructor (e.g. "Finset.Ioc") to the
+  -- corresponding `mem_<X>` lemma. Used by the lctx-based pass.
   let setShapeToMemLemma : List (String × Name) := [
     ("Finset.Ico", Name.mkStr2 "Finset" "mem_Ico"),
     ("Finset.Ioc", Name.mkStr2 "Finset" "mem_Ioc"),
@@ -156,15 +88,87 @@ private partial def collectFinsetMemRewrites (proof : Expr) : MetaM (Array (TSyn
     ("Finset.Ioi", Name.mkStr2 "Finset" "mem_Ioi"),
     ("Finset.range", Name.mkStr2 "Finset" "mem_range")
   ]
-  let lctx ← getLCtx
-  for decl in lctx do
+  -- Output state: `rwTacs` accumulates emitted `rw [lemma] at hyp` tactics;
+  -- `emitted` dedupes (lemma, hyp) pairs across all three passes.  The same
+  -- `rw [lemma] at hyp` issued twice fails on the second call (the LHS no
+  -- longer matches the rewritten type), tanking the whole candidate.
+  let mut rwTacs : Array (TSyntax `tactic) := #[]
+  let mut emitted : Std.HashSet (Name × Name) := {}
+  let pushRw : Name → Name → Array (TSyntax `tactic) → Std.HashSet (Name × Name) →
+      MetaM (Array (TSyntax `tactic) × Std.HashSet (Name × Name)) :=
+    fun lemma hypName tacs seen => do
+      if seen.contains (lemma, hypName) then return (tacs, seen)
+      let lemmaIdent : Ident := mkIdent lemma
+      let hypIdent : Ident := mkIdent hypName
+      let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
+      let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
+      let tac ← `(tactic| rw [$rwRule] $loc)
+      return (tacs.push tac, seen.insert (lemma, hypName))
+  -- ── Pass 1: walk the proof for direct `Iff.mp <memLemma> <fvar>` hits.
+  --    Each hit gives a precise (lemma, fvar) pair to emit. Pass 1 also
+  --    accumulates `lemmasFound` (any reference to `Finset.mem_<X>` anywhere
+  --    in the term) and `targetFvars` (fvars that appeared in any Pass 1
+  --    pair) for Pass 2's cross product.
+  -- ── Pass 2: cross-product `lemmasFound × targetFvars` minus Pass 1 pairs.
+  --    Catches references like `mem_Ico.mp h` inside a propext lambda body
+  --    where `h` is bound — Pass 1 can't pair the lemma with the bound
+  --    `h`, but if any other Pass 1 pair already revealed a target fvar,
+  --    Pass 2 emits the additional rewrite there.
+  let mut lemmasFound : Std.HashSet Name := {}
+  let mut targetFvars : Std.HashSet Name := {}
+  let mut pass1Pairs : Array (Name × Name) := #[]
+  let mut stack : List Expr := [proof]
+  let mut iters := 0
+  -- 50000 iters because L70's proof has `mem_Ico` references buried deep
+  -- inside the propext/Iff.intro lambda bodies, past where 5000 runs out.
+  while !stack.isEmpty && iters < 50000 do
+    iters := iters + 1
+    let cur := stack.head!
+    stack := stack.tail!
+    let (fn, args) := peelArgs cur
+    if fn.isConstOf ``Iff.mp && args.length >= 4 then
+      let iffArg := args[2]!
+      let hypArg := args[3]!
+      let (iffFn, _) := peelArgs iffArg
+      if let some iffName := iffFn.constName? then
+        if memLemmas.contains iffName.toString then
+          if let some fid := hypArg.fvarId? then
+            let hypDecl ← fid.getDecl
+            pass1Pairs := pass1Pairs.push (iffName, hypDecl.userName)
+            targetFvars := targetFvars.insert hypDecl.userName
+    if let some cname := fn.constName? then
+      if memLemmas.contains cname.toString then
+        lemmasFound := lemmasFound.insert cname
+    match cur with
+    | .app f a => stack := f :: a :: stack
+    | .lam _ t b _ => stack := t :: b :: stack
+    | .forallE _ t b _ => stack := t :: b :: stack
+    | .letE _ t v b _ => stack := t :: v :: b :: stack
+    | .mdata _ b => stack := b :: stack
+    | .proj _ _ b => stack := b :: stack
+    | _ => pure ()
+  for (lemma, hyp) in pass1Pairs do
+    let (tacs', seen') ← pushRw lemma hyp rwTacs emitted
+    rwTacs := tacs'; emitted := seen'
+  for lemma in lemmasFound do
+    for hyp in targetFvars do
+      let (tacs', seen') ← pushRw lemma hyp rwTacs emitted
+      rwTacs := tacs'; emitted := seen'
+  -- ── Pass 3: scan the lctx for hypotheses whose type matches a known
+  --    Finset interval / sdiff constructor.  Sum L36's proof references
+  --    `mem_sdiff` only as `mem_sdiff.mp (Eq.mp <transport> hp)` — the
+  --    third arg is an Eq.mp expr, not a direct fvar — so Pass 1 misses
+  --    it and Pass 2 has no `targetFvars` to pair with.  Pass 3 recovers
+  --    by reading directly off the lctx and emitting `rw [Finset.mem_<X>]
+  --    at <hyp>` (and `rw [Finset.mem_sdiff]` first when the set is
+  --    `s \ Finset.<X> a b`).
+  for decl in (← getLCtx) do
     if decl.isImplementationDetail then continue
     let ty ← instantiateMVars decl.type
     let tyArgs := ty.getAppArgs
     unless ty.getAppFn.isConstOf ``Membership.mem && tyArgs.size >= 5 do continue
     let setArg := tyArgs[tyArgs.size - 2]!
-    -- Resolve `set r := …` — when the goal references an opaque fvar, look
-    -- through the let-binding to its definition.
+    -- Resolve `set r := …` opaque fvars by looking through the let-binding.
     let setExpr ← match setArg.fvarId? with
       | some fid =>
         match (← fid.getDecl).value? with
@@ -172,42 +176,24 @@ private partial def collectFinsetMemRewrites (proof : Expr) : MetaM (Array (TSyn
         | none => pure setArg
       | none => pure setArg
     let setFnName? := setExpr.getAppFn.constName?.map (·.toString)
-    let hypIdent : Ident := mkIdent decl.userName
-    -- Skip if Pass 1 / Pass 2 already emitted a rewrite for this fvar — running
-    -- the same `rw [mem_X] at hp` twice fails on the second call (the LHS no
-    -- longer matches), tanking the whole candidate.
     let hypUserName := decl.userName
-    let alreadyEmittedFor : Name → Bool := fun lemmaN =>
-      foundPairs.contains (lemmaN, hypUserName)
     -- Direct interval: `_ ∈ Finset.<X> a b`.
     if let some shape := setFnName? then
       if let some (_, memLemma) := setShapeToMemLemma.find? (·.1 == shape) then
-        unless alreadyEmittedFor memLemma do
-          let lemmaIdent : Ident := mkIdent memLemma
-          let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
-          let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
-          rwTacs := rwTacs.push (← `(tactic| rw [$rwRule] $loc))
-          foundPairs := foundPairs.insert (memLemma, hypUserName)
+        let (tacs', seen') ← pushRw memLemma hypUserName rwTacs emitted
+        rwTacs := tacs'; emitted := seen'
     -- sdiff with interval rhs: `_ ∈ s \ Finset.<X> a b` — rewrite both layers.
     let setSubArgs := setExpr.getAppArgs
     if setExpr.getAppFn.isConstOf ``SDiff.sdiff && setSubArgs.size >= 4 then
       let inner := setSubArgs[setSubArgs.size - 1]!
       let innerFnName? := inner.getAppFn.constName?.map (·.toString)
       let memSdiffName := Name.mkStr2 "Finset" "mem_sdiff"
-      unless alreadyEmittedFor memSdiffName do
-        let memSdiffIdent : Ident := mkIdent memSdiffName
-        let memSdiffRule ← `(Parser.Tactic.rwRule| $memSdiffIdent:ident)
-        let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
-        rwTacs := rwTacs.push (← `(tactic| rw [$memSdiffRule] $loc))
-        foundPairs := foundPairs.insert (memSdiffName, hypUserName)
+      let (tacs', seen') ← pushRw memSdiffName hypUserName rwTacs emitted
+      rwTacs := tacs'; emitted := seen'
       if let some shape := innerFnName? then
         if let some (_, memLemma) := setShapeToMemLemma.find? (·.1 == shape) then
-          unless foundPairs.contains (memLemma, hypUserName) do
-            let innerLemmaIdent : Ident := mkIdent memLemma
-            let innerRule ← `(Parser.Tactic.rwRule| $innerLemmaIdent:ident)
-            let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
-            rwTacs := rwTacs.push (← `(tactic| rw [$innerRule] $loc))
-            foundPairs := foundPairs.insert (memLemma, hypUserName)
+          let (tacs', seen') ← pushRw memLemma hypUserName rwTacs emitted
+          rwTacs := tacs'; emitted := seen'
   return rwTacs
 
 /-- Check whether a type is arithmetic-shaped (LE/LT/Eq of integer/natural
@@ -377,14 +363,9 @@ private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
 def tryDecompEqMpIntLinearNormLe (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
-  let (fn, args) := peelArgs expr
-  let some cname := fn.constName? | return none
-  if cname != ``Eq.mp then return none
-  if args.length < 4 then return none
+  let some args := LeanDecomp.matchConstApp? expr ``Eq.mp 4 | return none
   let castProof := args[2]!
-  let (castFn, _) := peelArgs castProof
-  let some castName := castFn.constName? | return none
-  if castName != ``Int.Linear.norm_le then return none
+  let some _ := LeanDecomp.matchConstApp? castProof ``Int.Linear.norm_le 0 | return none
   withLCtx lctx localInsts do
     let exprTy ← Meta.inferType expr
     let liaTac ← `(tactic| lia)
@@ -426,10 +407,7 @@ def tryDecompEqMpNotEqProp (expr : Expr) (lctx : LocalContext)
 def tryDecompMt (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
-  let (fn, args) := peelArgs expr
-  let some cname := fn.constName? | return none
-  if cname != ``mt then return none
-  if args.length < 4 then return none
+  let some args := LeanDecomp.matchConstApp? expr ``mt 4 | return none
   let impProof := args[2]!
   let negProof := args[3]!
   let mtIdent : Ident := ⟨mkIdent ``mt |>.raw.setInfo .none⟩

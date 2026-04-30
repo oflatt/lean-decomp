@@ -149,20 +149,11 @@ def tryDecompCongr (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelArgs expr
-    let some constName := Expr.constName? fn
-      | return none
-    if constName != ``congr then
-      return none
-    if args.length < 2 then
-      return none
-
+    let some args := matchConstApp? expr ``congr 2 | return none
     let hEqFn := args[args.length - 2]!
     let hEqArg := args[args.length - 1]!
-    let some _ ← inferEqType? hEqFn
-      | return none
-    let some _ ← inferEqType? hEqArg
-      | return none
+    let some _ ← inferEqType? hEqFn | return none
+    let some _ ← inferEqType? hEqArg | return none
     let refineTac ← `(tactic| refine $(mkIdent ``congr) ?_ ?_)
     let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[hEqFn, hEqArg] lctx localInsts used decompileExpr
     return some result
@@ -172,19 +163,10 @@ def tryDecompCongrArg (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelArgs expr
-    let some constName := Expr.constName? fn
-      | return none
-    if constName != ``congrArg then
-      return none
-    if args.length < 2 then
-      return none
-
+    let some args := matchConstApp? expr ``congrArg 2 | return none
     let f := args[args.length - 2]!
     let hEq := args[args.length - 1]!
-    let some _ ← inferEqType? hEq
-      | return none
-
+    let some _ ← inferEqType? hEq | return none
     let fStx ← delabToRefinableSyntax f
     let refineTac ← `(tactic| refine $(mkIdent ``congrArg) $fStx ?_)
     let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[hEq] lctx localInsts used decompileExpr
@@ -238,16 +220,9 @@ def tryDecompEqSymm (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelArgs expr
-    let some constName := Expr.constName? fn
-      | return none
-    if constName != ``Eq.symm then
-      return none
-
-    let some inEq := args.getLast?
-      | return none
-    let some (_α, _lhs, _rhs) ← inferEqType? inEq
-      | return none
+    let some args := matchConstApp? expr ``Eq.symm 1 | return none
+    let some inEq := args.getLast? | return none
+    let some (_α, _lhs, _rhs) ← inferEqType? inEq | return none
     let refineTac ← `(tactic| refine $(mkIdent ``Eq.symm) ?_)
     let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[inEq] lctx localInsts used decompileExpr
     return some result
@@ -257,13 +232,7 @@ def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
   (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelArgs expr
-    let some constName := Expr.constName? fn
-      | return none
-    if constName != ``Eq.trans then
-      return none
-    if args.length < 2 then
-      return none
+    let some _args := matchConstApp? expr ``Eq.trans 2 | return none
 
     let exprNorm ← simplifyEqProof expr
     let type ← whnf (← Meta.inferType exprNorm)
@@ -467,15 +436,11 @@ def tryDecompEqMpForallCongr (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelArgs expr
-    if !fn.isConstOf ``Eq.mp then return none
-    if args.length < 4 then return none
+    let some args := matchConstApp? expr ``Eq.mp 4 | return none
     let eqProof := args[2]!
     let evidence := args[3]!
     let trailingArgs := args.drop 4
-    let (eqFn, eqArgs) := peelArgs eqProof
-    if !eqFn.isConstOf ``forall_congr then return none
-    if eqArgs.length < 4 then return none
+    let some eqArgs := matchConstApp? eqProof ``forall_congr 4 | return none
     let body := eqArgs[3]!
     let outerExprTy ← Meta.inferType expr
     if h : trailingArgs.length > 0 then
@@ -524,19 +489,14 @@ def tryDecompEqMpImpliesCongr (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelArgs expr
-    if !fn.isConstOf ``Eq.mp then return none
-    if args.length < 4 then return none
+    let some args := matchConstApp? expr ``Eq.mp 4 | return none
     let eqProof := args[2]!
     let evidence := args[3]!
     let trailingArgs := args.drop 4
-    let (eqFn, eqArgs) := peelArgs eqProof
-    if !eqFn.isConstOf ``implies_congr then return none
-    if eqArgs.length < 6 then return none
+    let some eqArgs := matchConstApp? eqProof ``implies_congr 6 | return none
     let pEq := eqArgs[4]!
     let qEq := eqArgs[5]!
-    let (pEqFn, _) := peelArgs pEq
-    if !pEqFn.isConstOf ``Eq.refl then return none
+    let some _ := matchConstApp? pEq ``Eq.refl 0 | return none
     let outerExprTy ← Meta.inferType expr
     if h : trailingArgs.length > 0 then
       -- Premise-applied case.
