@@ -24,7 +24,7 @@ def mkFocusedBlock (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax `tactic) :=
   `(tactic| · $seq:tacticSeq)
 
 /-- Replace parser-generated `?m.N` placeholders with anonymous holes. -/
-private def anonymizeSyntheticMVars (s : String) : String := Id.run do
+def anonymizeSyntheticMVars (s : String) : String := Id.run do
   let chars := s.toList.toArray
   let mut out := ""
   let mut i := 0
@@ -46,7 +46,7 @@ private def anonymizeSyntheticMVars (s : String) : String := Id.run do
       i := i + 1
   out
 
-private def ppExprToTermSyntax (e : Expr) : MetaM Term := do
+def ppExprToTermSyntax (e : Expr) : MetaM Term := do
   let env ← getEnv
   let fmt ← Meta.ppExpr e
   let termStr := anonymizeSyntheticMVars fmt.pretty
@@ -55,7 +55,7 @@ private def ppExprToTermSyntax (e : Expr) : MetaM Term := do
   | .error err =>
     throwError "failed to parse pretty-printed term:\n{err}\n\n{termStr}"
 
-private def ppExprToTermSyntaxWith (e : Expr) (usePpAll : Bool) : MetaM Term :=
+def ppExprToTermSyntaxWith (e : Expr) (usePpAll : Bool) : MetaM Term :=
   withOptions (fun o =>
       let o := pp.coercions.types.set o true
       let o := pp.numericTypes.set o true
@@ -66,10 +66,19 @@ private def ppExprToTermSyntaxWith (e : Expr) (usePpAll : Bool) : MetaM Term :=
     ) do
       ppExprToTermSyntax e
 
-private partial def containsConstName (e : Expr) (target : Name) : Bool :=
+/-- Peel off all applications from an expression to get the head and arguments.
+    Returns (head, args) where args is in left-to-right order. -/
+def peelArgs (e : Expr) : Expr × List Expr :=
+  let rec go (e : Expr) (acc : List Expr) : Expr × List Expr :=
+    match e with
+    | Expr.app f arg => go f (arg :: acc)
+    | _ => (e, acc)
+  go e []
+
+partial def containsConstName (e : Expr) (target : Name) : Bool :=
   Expr.find? (fun sub => sub.getAppFn.constName? == some target) e |>.isSome
 
-private partial def containsEagerReduce (e : Expr) : Bool :=
+partial def containsEagerReduce (e : Expr) : Bool :=
   Expr.find? (fun sub =>
     match sub.getAppFn.constName? with
     | some n => n == ``eagerReduce
@@ -123,25 +132,43 @@ def runInSubgoal (mvarId : MVarId) (k : TacticM α) : TacticM α := do
   finally
     setGoals savedGoals
 
+/-- Run a speculative elaboration step that should not affect the surrounding
+    proof state or message log:
+
+    - **State**: wraps `act` in `withoutModifyingState` so any tactic execution
+      it performs is rolled back regardless of outcome.
+    - **Messages**: saves and restores the message log around `act`, so error
+      messages emitted while testing a candidate don't leak to the user.
+    - **Errors**: catches any exception from `act` and returns `default`, since
+      the caller is using a `Bool`/`Option` answer to decide what to do next.
+
+    All five "does this candidate work?" checkers in the decompiler share this
+    boilerplate (`subproofTacticsCloseGoal`, `refineTacProducesGoals`,
+    `refineTacMatchesProofArgs`, plus the `decide` and `lia` speculative
+    attempts in handlers).  Routing them through one helper keeps the
+    state/message-log/error invariants in one place. -/
+def silentTry (default : α) (act : TacticM α) : TacticM α := do
+  let savedMsgs ← Core.getMessageLog
+  Core.setMessageLog {}
+  let result ← try
+    withoutModifyingState act
+  catch _ =>
+    pure default
+  Core.setMessageLog savedMsgs
+  return result
+
 /-- Recursively decompile a proof term, but preserve correctness by falling back
     to an exact proof term when the generated tactics do not re-elaborate or do
     not fully close a fresh goal of the same type. -/
 private def subproofTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedType : Expr)
-    (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool := do
-  let savedMsgs ← Core.getMessageLog
-  Core.setMessageLog {}
-  let ok ← try
-      withoutModifyingState do
-        runInGoal lctx localInsts expectedType do
-          let seq ← mkTacticSeq tacs
-          evalTactic seq
-          let remainingGoals ← getGoals
-          let newMsgs ← Core.getMessageLog
-          pure (!newMsgs.hasErrors && remainingGoals.isEmpty)
-    catch _ =>
-      pure false
-  Core.setMessageLog savedMsgs
-  return ok
+    (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool :=
+  silentTry false do
+    runInGoal lctx localInsts expectedType do
+      let seq ← mkTacticSeq tacs
+      evalTactic seq
+      let remainingGoals ← getGoals
+      let newMsgs ← Core.getMessageLog
+      pure (!newMsgs.hasErrors && remainingGoals.isEmpty)
 
   /-- Check whether a candidate tactic block closes a fresh goal of the given type.
     This is useful for speculative terminal tactics where failure should simply
@@ -175,14 +202,9 @@ private def subproofTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedT
     (`Int.Linear.norm_le`, etc.) — a Bool equality whose RHS is `true`.  Always
     decidable, so `decide` is a safe candidate. -/
 private def isBoolEqTrue (ty : Expr) : Bool :=
-  let rec peel (e : Expr) (acc : List Expr) : Expr × List Expr :=
-    match e with
-    | .app f a => peel f (a :: acc)
-    | _ => (e, acc)
-  let (fn, args) := peel ty []
-  match fn, args with
-  | .const ``Eq _, [α, _, rhs] => α.isConstOf ``Bool && rhs.isConstOf ``Bool.true
-  | _, _ => false
+  match ty.eq? with
+  | some (α, _, rhs) => α.isConstOf ``Bool && rhs.isConstOf ``Bool.true
+  | none => false
 
 /-- Build a robust exact fallback for a subproof. Prefer direct delaboration when
     possible, but fall back to fully pretty-printed syntax for low-level proofs.
@@ -326,25 +348,43 @@ def containsAutomationInternals (e : Expr) : Bool := Id.run do
     | _ => pure ()
   return false
 
-/-- Check if a constant name is "structural" — i.e., part of the equality/congruence
-    machinery that grind uses to chain proofs, not a meaningful library fact. -/
+/-- Check if a constant name is "structural" — i.e., part of the equality /
+    congruence / boolean-decidability machinery that grind uses to chain
+    proofs, not a meaningful library fact.  Used by `extractGrindFacts` to
+    decide which subterms are interesting "user-form" hypotheses worth
+    surfacing as a `have`.
+
+    The namespace checks (`Eq`, `Classical`) use `Name.isPrefixOf` against
+    `Name` literals.  The `congr*` / `*_congr*` / `eq_true*` / `eq_false*`
+    checks remain string-prefixed because those are top-level names with no
+    common namespace parent — there's no `Name` literal that captures
+    "anything starting with `congr` in the root namespace", and enumerating
+    every `congr…` lemma in mathlib is not maintainable.  Misclassification
+    is non-critical: it just shifts whether a fact is named in a `have` or
+    threaded raw, neither of which breaks correctness. -/
 private def isStructuralConst (n : Name) : Bool :=
+  Name.isPrefixOf `Eq n || Name.isPrefixOf `Classical n ||
   let s := n.toString
-  s.startsWith "Eq." || s.startsWith "congr" || s.startsWith "implies_congr" ||
+  s.startsWith "congr" || s.startsWith "implies_congr" ||
   s.startsWith "forall_congr" || s.startsWith "eq_true" || s.startsWith "eq_false" ||
-  s.startsWith "Classical." ||
   n == ``True.intro || n == ``False.rec || n == ``False.elim ||
   n == ``eagerReduce || n == ``id || n == ``funext || n == ``propext ||
   n == ``Iff.intro ||
   n == ``And.intro ||
   n == ``Or.inl || n == ``Or.inr || n == ``Not ||
   n == ``Bool.true || n == ``Bool.false ||
-  n == ``Eq.refl || n == ``rfl
+  n == ``rfl
 
-/-- Check if a constant name is grind-internal. -/
+/-- Check if a constant name is grind-internal — namespaces emitted by grind's
+    polynomial normalizers and indexers, never user-facing facts.
+
+    Single-backtick `Name` literals (raw, unchecked) — these are *namespace*
+    names and don't correspond to any defined constant, so the double-backtick
+    form would fail elaboration. -/
 private def isGrindConst (n : Name) : Bool :=
-  let s := n.toString
-  s.startsWith "Int.Linear." || s.startsWith "Lean.Grind." || s.startsWith "Lean.RArray."
+  Name.isPrefixOf `Int.Linear n ||
+  Name.isPrefixOf `Lean.Grind n ||
+  Name.isPrefixOf `Lean.RArray n
 
 /-- Extract "interesting" subexpressions from a grind proof term.
   These are applications of library lemmas (not structural, not grind-internal)
@@ -402,38 +442,5 @@ def extractGrindFacts (e : Expr) : MetaM (Array Expr) := do
     | _ => pure ()
   return result
 
-/-- Extract the names of library lemma constants from a grind proof term.
-    Returns names that are not structural (Eq.*, congr*, etc.) and not grind-internal
-    (Int.Linear.*, Lean.Grind.*, etc.). These represent the actual mathematical facts
-    that grind used from the library. -/
-def extractGrindLemmaNames (e : Expr) : Std.HashSet Name := Id.run do
-  let mut result : Std.HashSet Name := {}
-  let mut stack : List Expr := [e]
-  let mut seen : Std.HashSet UInt64 := {}
-  let mut count := 0
-  while !stack.isEmpty && count < 10000 do
-    let cur := stack.head!
-    stack := stack.tail!
-    count := count + 1
-    let h := cur.hash
-    if seen.contains h then continue
-    seen := seen.insert h
-    match cur with
-    | .app .. =>
-      let fn := cur.getAppFn
-      let args := cur.getAppArgs
-      match fn with
-      | .const n _ =>
-        if !isGrindConst n && !isStructuralConst n then
-          result := result.insert n
-        for a in args do stack := a :: stack
-      | _ =>
-        for a in args do stack := a :: stack
-        stack := fn :: stack
-    | .lam _ t b _ => stack := t :: b :: stack
-    | .mdata _ e => stack := e :: stack
-    | .letE _ t v b _ => stack := t :: v :: b :: stack
-    | _ => pure ()
-  return result
 
 end LeanDecomp

@@ -7,15 +7,6 @@ namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter Tactic
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
-private partial def containsEagerReduce (e : Expr) : Bool :=
-  Expr.find? (fun sub =>
-    match sub.getAppFn.constName? with
-    | some n => n == ``eagerReduce
-    | none => false) e |>.isSome
-
-private partial def containsConstName (e : Expr) (target : Name) : Bool :=
-  Expr.find? (fun sub => sub.getAppFn.constName? == some target) e |>.isSome
-
 /-- Some proposition-equality proof terms delaborate into anonymous structure
     literals like `{ mp := ..., mpr := ... }`, which are fragile in calc steps
     because the expected structure type is often not inferable there. Route
@@ -30,17 +21,9 @@ private def mkCleanIdent (name : Name) : Ident :=
   let raw := name.eraseMacroScopes.toString.toRawSubstring
   TSyntax.mk (Syntax.ident SourceInfo.none raw name.eraseMacroScopes [])
 
-/-- Local argument peeler to avoid cross-module utility coupling. -/
-private def peelApps (e : Expr) : Expr × List Expr :=
-  let rec go (e : Expr) (acc : List Expr) : Expr × List Expr :=
-    match e with
-    | Expr.app f arg => go f (arg :: acc)
-    | _ => (e, acc)
-  go e []
-
 private def inferEqType? (e : Expr) : MetaM (Option (Expr × Expr × Expr)) := do
   let ty ← Meta.inferType e
-  let (fn, args) := peelApps ty
+  let (fn, args) := peelArgs ty
   if fn.isConstOf ``Eq && args.length >= 3 then
     return some (args[0]!, args[1]!, args[2]!)
   return none
@@ -166,7 +149,7 @@ def tryDecompCongr (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelApps expr
+    let (fn, args) := peelArgs expr
     let some constName := Expr.constName? fn
       | return none
     if constName != ``congr then
@@ -189,7 +172,7 @@ def tryDecompCongrArg (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelApps expr
+    let (fn, args) := peelArgs expr
     let some constName := Expr.constName? fn
       | return none
     if constName != ``congrArg then
@@ -255,7 +238,7 @@ def tryDecompEqSymm (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelApps expr
+    let (fn, args) := peelArgs expr
     let some constName := Expr.constName? fn
       | return none
     if constName != ``Eq.symm then
@@ -274,7 +257,7 @@ def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
   (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelApps expr
+    let (fn, args) := peelArgs expr
     let some constName := Expr.constName? fn
       | return none
     if constName != ``Eq.trans then
@@ -312,7 +295,7 @@ def tryDecompEqRecPropTransport (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelApps expr
+    let (fn, args) := peelArgs expr
     let some constName := Expr.constName? fn | return none
     if constName != ``Eq.rec && constName != ``Eq.ndrec then
       return none
@@ -377,7 +360,7 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelApps expr
+    let (fn, args) := peelArgs expr
     let some constName := Expr.constName? fn
       | return none
     if constName != ``Eq.mp then
@@ -387,7 +370,7 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
     let mut sourceTy? : Option Expr := none
     for a in args do
       let aTy ← Meta.inferType a
-      let (tyFn, tyArgs) := peelApps aTy
+      let (tyFn, tyArgs) := peelArgs aTy
       if tyFn.isConstOf ``Eq && tyArgs.length >= 3 then
         let lhs := tyArgs[1]!
         eqProofArg? := some a
@@ -420,6 +403,47 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
     let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[eqProofNorm, sourceProofArg] lctx localInsts used decompileExpr
     return some result
 
+/-- Common tail for the `forall_congr` / `implies_congr` peelers.  Given a
+    "post-intro" lctx (possibly equal to the outer lctx if no intro is needed),
+    a witness expression for `have h := <ev>`, and an inner `Eq` proof, emit:
+
+      <introTacs>; have h := <ev>; <fast-path lia | recurse on Eq.mp eqProof h>
+
+    `tryFastPath` is `true` for the *instantiated* sub-cases where the goal at
+    the peel point is already a specific arithmetic statement and `lia` may
+    close from the user-form hypothesis directly (the L70 / L36 win).  For
+    the *universal* sub-cases the goal is still a `∀` after the intro, so the
+    fast-path attempt is a near-certain miss; skip it to avoid burning
+    heartbeats on a doomed `lia`. -/
+private def emitHavePeel
+    (introTacs : Array (TSyntax `tactic))
+    (postIntroLctx : LocalContext) (postIntroInsts : LocalInstances)
+    (witness : Expr) (hName : String)
+    (innerEqProof : Expr) (remainingArgs : List Expr)
+    (outerExprTy : Expr) (tryFastPath : Bool)
+    (used : List String) (decompileExpr : DecompileCallback)
+  : TacticM (Array (TSyntax `tactic) × List String) := do
+  let witnessTy ← withLCtx postIntroLctx postIntroInsts (Meta.inferType witness)
+  let hFvarId := FVarId.mk (← mkFreshId)
+  let lctxWithH := postIntroLctx.mkLocalDecl hFvarId (Name.mkSimple hName) witnessTy
+  let hInsts ← withLCtx lctxWithH postIntroInsts getLocalInstances
+  let witnessStx ← withLCtx postIntroLctx postIntroInsts (delabToRefinableSyntax witness)
+  let hIdent := mkIdent (Name.mkSimple hName)
+  let haveTac ← `(tactic| have $hIdent:ident := $witnessStx)
+  let prefixTacs := introTacs.push haveTac
+  if tryFastPath then
+    let liaTac ← `(tactic| lia)
+    if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] outerExprTy lctxWithH hInsts then
+      return (prefixTacs.push liaTac, used)
+    let unfoldLiaTac ← `(tactic| with_unfolding_all lia)
+    if ← LeanDecomp.candidateTacticsCloseGoal #[unfoldLiaTac] outerExprTy lctxWithH hInsts then
+      return (prefixTacs.push unfoldLiaTac, used)
+  let innerCore ← withLCtx lctxWithH hInsts do
+    Meta.mkAppM ``Eq.mp #[innerEqProof, Expr.fvar hFvarId]
+  let innerTerm := remainingArgs.foldl (init := innerCore) fun acc a => mkApp acc a
+  let (innerTactics, used') ← decompileExpr innerTerm lctxWithH hInsts used
+  return (prefixTacs ++ innerTactics, used')
+
 /-- Handle `Eq.mp (forall_congr <body>) <evidence>` (with optional trailing
     applications) where `evidence : ∀ a, p a` transports to `∀ a, q a`.
 
@@ -443,50 +467,27 @@ def tryDecompEqMpForallCongr (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelApps expr
+    let (fn, args) := peelArgs expr
     if !fn.isConstOf ``Eq.mp then return none
     if args.length < 4 then return none
     let eqProof := args[2]!
     let evidence := args[3]!
     let trailingArgs := args.drop 4
-    let (eqFn, eqArgs) := peelApps eqProof
+    let (eqFn, eqArgs) := peelArgs eqProof
     if !eqFn.isConstOf ``forall_congr then return none
     if eqArgs.length < 4 then return none
     let body := eqArgs[3]!
+    let outerExprTy ← Meta.inferType expr
     if h : trailingArgs.length > 0 then
       -- Instantiated case: trailingArgs[0] specializes the universal binder.
-      -- Emit a `have` for the evidence-at-x so downstream `lia` can find the
-      -- user-form hypothesis in the lctx.
       let xSpec := trailingArgs[0]
       let remaining := trailingArgs.drop 1
       let bodyAtX ← Meta.whnf (mkApp body xSpec)
       let evidenceAtX := mkApp evidence xSpec
-      let evidenceAtXTy ← Meta.inferType evidenceAtX
       let (hName, used1) := LeanDecomp.chooseIntroName used.length `h used
-      let hFvarId := FVarId.mk (← mkFreshId)
-      let lctxWithH := lctx.mkLocalDecl hFvarId (Name.mkSimple hName) evidenceAtXTy
-      let hInsts ← withLCtx lctxWithH localInsts getLocalInstances
-      let evidenceAtXStx ← delabToRefinableSyntax evidenceAtX
-      let hIdent := mkIdent (Name.mkSimple hName)
-      let haveTac ← `(tactic| have $hIdent:ident := $evidenceAtXStx)
-      -- Fast path: if `lia` (or `with_unfolding_all lia`) closes the outer
-      -- goal directly with the just-introduced have in the lctx, skip the
-      -- recursive decomp.  This is the L70 win: avoids emitting the slow
-      -- `refine @Eq.mp <denote> <denote> ?_ ?_` chain when the user-form
-      -- hypothesis is enough to close the polynomial goal.
-      let exprTy ← Meta.inferType expr
-      let liaTac ← `(tactic| lia)
-      if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] exprTy lctxWithH hInsts then
-        return some (#[haveTac, liaTac], used1)
-      let unfoldLiaTac ← `(tactic| with_unfolding_all lia)
-      if ← LeanDecomp.candidateTacticsCloseGoal #[unfoldLiaTac] exprTy lctxWithH hInsts then
-        return some (#[haveTac, unfoldLiaTac], used1)
-      -- Slow path: recurse on `Eq.mp (body x_spec) h_user` with remaining args.
-      let innerCore ← withLCtx lctxWithH hInsts do
-        Meta.mkAppM ``Eq.mp #[bodyAtX, Expr.fvar hFvarId]
-      let innerTerm := remaining.foldl (init := innerCore) fun acc a => mkApp acc a
-      let (innerTactics, used2) ← decompileExpr innerTerm lctxWithH hInsts used1
-      return some (#[haveTac] ++ innerTactics, used2)
+      let result ← emitHavePeel #[] lctx localInsts evidenceAtX hName
+        bodyAtX remaining outerExprTy true used1 decompileExpr
+      return some result
     -- Universal case: telescope the body lambda, intro a fresh fvar, have the evidence.
     Meta.lambdaTelescope body fun bodyXs bodyResult => do
       if bodyXs.size != 1 then return none
@@ -497,20 +498,12 @@ def tryDecompEqMpForallCongr (expr : Expr) (lctx : LocalContext)
       let lctxWithX := (← getLCtx).setUserName xFvarId (Name.mkSimple xName)
       let xInsts ← getLocalInstances
       let evidenceAtX := mkApp evidence xFvar
-      let evidenceAtXTy ← withLCtx lctxWithX xInsts (Meta.inferType evidenceAtX)
       let (hName, used2) := LeanDecomp.chooseIntroName used1.length `h used1
-      let hFvarId := FVarId.mk (← mkFreshId)
-      let lctxWithH := lctxWithX.mkLocalDecl hFvarId (Name.mkSimple hName) evidenceAtXTy
-      let hInsts ← withLCtx lctxWithH xInsts getLocalInstances
-      let innerTerm ← withLCtx lctxWithH hInsts do
-        Meta.mkAppM ``Eq.mp #[bodyResult, Expr.fvar hFvarId]
-      let evidenceAtXStx ← withLCtx lctxWithX xInsts (delabToRefinableSyntax evidenceAtX)
       let xIdent := mkIdent (Name.mkSimple xName)
-      let hIdent := mkIdent (Name.mkSimple hName)
       let introTac ← `(tactic| intro $xIdent:ident)
-      let haveTac ← `(tactic| have $hIdent:ident := $evidenceAtXStx)
-      let (innerTactics, used3) ← decompileExpr innerTerm lctxWithH hInsts used2
-      return some (#[introTac, haveTac] ++ innerTactics, used3)
+      let result ← emitHavePeel #[introTac] lctxWithX xInsts evidenceAtX hName
+        bodyResult [] outerExprTy false used2 decompileExpr
+      return some result
 
 /-- Handle `Eq.mp (implies_congr p_eq q_eq) <evidence>` (with optional trailing
     applications) where `evidence : p → q` transports to `p' → q'`.
@@ -531,68 +524,41 @@ def tryDecompEqMpImpliesCongr (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
   withLCtx lctx localInsts do
-    let (fn, args) := peelApps expr
+    let (fn, args) := peelArgs expr
     if !fn.isConstOf ``Eq.mp then return none
     if args.length < 4 then return none
     let eqProof := args[2]!
     let evidence := args[3]!
     let trailingArgs := args.drop 4
-    let (eqFn, eqArgs) := peelApps eqProof
+    let (eqFn, eqArgs) := peelArgs eqProof
     if !eqFn.isConstOf ``implies_congr then return none
     if eqArgs.length < 6 then return none
     let pEq := eqArgs[4]!
     let qEq := eqArgs[5]!
-    let (pEqFn, _) := peelApps pEq
+    let (pEqFn, _) := peelArgs pEq
     if !pEqFn.isConstOf ``Eq.refl then return none
+    let outerExprTy ← Meta.inferType expr
     if h : trailingArgs.length > 0 then
-      -- Premise-applied case: trailingArgs[0] is the premise proof.
-      -- Emit a `have` for the evidence-at-premise so downstream `lia` can
-      -- find the user-form hypothesis in the lctx.
+      -- Premise-applied case.
       let hpSpec := trailingArgs[0]
       let remaining := trailingArgs.drop 1
       let evidenceAtHp := mkApp evidence hpSpec
-      let evidenceAtHpTy ← Meta.inferType evidenceAtHp
       let (hName, used1) := LeanDecomp.chooseIntroName used.length `h used
-      let hFvarId := FVarId.mk (← mkFreshId)
-      let lctxWithH := lctx.mkLocalDecl hFvarId (Name.mkSimple hName) evidenceAtHpTy
-      let hInsts ← withLCtx lctxWithH localInsts getLocalInstances
-      let evidenceAtHpStx ← delabToRefinableSyntax evidenceAtHp
-      let hIdent := mkIdent (Name.mkSimple hName)
-      let haveTac ← `(tactic| have $hIdent:ident := $evidenceAtHpStx)
-      -- Fast path: try `lia` / `with_unfolding_all lia` against the outer
-      -- goal with the just-introduced have in the lctx. See the matching
-      -- comment in `tryDecompEqMpForallCongr` above.
-      let exprTy ← Meta.inferType expr
-      let liaTac ← `(tactic| lia)
-      if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] exprTy lctxWithH hInsts then
-        return some (#[haveTac, liaTac], used1)
-      let unfoldLiaTac ← `(tactic| with_unfolding_all lia)
-      if ← LeanDecomp.candidateTacticsCloseGoal #[unfoldLiaTac] exprTy lctxWithH hInsts then
-        return some (#[haveTac, unfoldLiaTac], used1)
-      let innerCore ← withLCtx lctxWithH hInsts do
-        Meta.mkAppM ``Eq.mp #[qEq, Expr.fvar hFvarId]
-      let innerTerm := remaining.foldl (init := innerCore) fun acc a => mkApp acc a
-      let (innerTactics, used2) ← decompileExpr innerTerm lctxWithH hInsts used1
-      return some (#[haveTac] ++ innerTactics, used2)
+      let result ← emitHavePeel #[] lctx localInsts evidenceAtHp hName
+        qEq remaining outerExprTy true used1 decompileExpr
+      return some result
+    -- Universal case.
     let p2 := eqArgs[1]!
     let (hpName, used1) := LeanDecomp.chooseIntroName used.length `hp used
     let hpFvarId := FVarId.mk (← mkFreshId)
     let lctxWithHp := lctx.mkLocalDecl hpFvarId (Name.mkSimple hpName) p2
     let hpInsts ← withLCtx lctxWithHp localInsts getLocalInstances
     let evidenceAtHp := mkApp evidence (Expr.fvar hpFvarId)
-    let evidenceAtHpTy ← withLCtx lctxWithHp hpInsts (Meta.inferType evidenceAtHp)
     let (hUserName, used2) := LeanDecomp.chooseIntroName used1.length `h used1
-    let hUserFvarId := FVarId.mk (← mkFreshId)
-    let lctxWithUser := lctxWithHp.mkLocalDecl hUserFvarId (Name.mkSimple hUserName) evidenceAtHpTy
-    let userInsts ← withLCtx lctxWithUser hpInsts getLocalInstances
-    let innerTerm ← withLCtx lctxWithUser userInsts do
-      Meta.mkAppM ``Eq.mp #[qEq, Expr.fvar hUserFvarId]
-    let evidenceAtHpStx ← withLCtx lctxWithHp hpInsts (delabToRefinableSyntax evidenceAtHp)
     let hpIdent := mkIdent (Name.mkSimple hpName)
-    let hUserIdent := mkIdent (Name.mkSimple hUserName)
     let introTac ← `(tactic| intro $hpIdent:ident)
-    let haveTac ← `(tactic| have $hUserIdent:ident := $evidenceAtHpStx)
-    let (innerTactics, used3) ← decompileExpr innerTerm lctxWithUser userInsts used2
-    return some (#[introTac, haveTac] ++ innerTactics, used3)
+    let result ← emitHavePeel #[introTac] lctxWithHp hpInsts evidenceAtHp hUserName
+      qEq [] outerExprTy false used2 decompileExpr
+    return some result
 
 end LeanDecomp

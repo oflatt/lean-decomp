@@ -6,12 +6,7 @@ namespace LeanDecomp.Specialized.Grind
 open Lean Elab Meta Tactic
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
-private def peelArgs (e : Expr) : Expr × List Expr :=
-  let rec go (cur : Expr) (acc : List Expr) : Expr × List Expr :=
-    match cur with
-    | .app f arg => go f (arg :: acc)
-    | _ => (cur, acc)
-  go e []
+open LeanDecomp (peelArgs)
 
 /-- Strip `Eq.mp <cast> inner` when the cast is automation-generated junk and
     the inner proof already has the goal type. This is grind-specific today, so

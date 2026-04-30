@@ -7,14 +7,45 @@ namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter Tactic
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
-/-- Peel off all applications from an expression to get the head and arguments.
-    Returns (head, args) where args is in left-to-right order. -/
-def peelArgs (e : Expr) : Expr × List Expr :=
-  let rec go (e : Expr) (acc : List Expr) : Expr × List Expr :=
-    match e with
-    | Expr.app f arg => go f (arg :: acc)
-    | _ => (e, acc)
-  go e []
+/-- Replace the (empty) binder list of an `inductionAltLHS` node with the given
+    binder identifiers.  An `inductionAlt` parses to
+    `node[pipe, ctorGroup, bindersNull]` wrapped in an outer LHS-wrapper
+    `null` node and a `tacticSeq` RHS — so the surgery is: navigate
+    `node[lhsWrapper, rhsWrapper]` → `node[null[altLHS]]` →
+    `inductionAltLHS[…, …, emptyNull]` and replace the third child with a
+    fresh `null` node carrying the binder idents.
+
+    We do this raw rather than via the quasi-quote `(| ctor a b c => …)` form
+    because `inductionAltLHS`'s binder slot is a plain identifier list, not
+    a `term` antiquotation, so quasi-quote can't splice it.
+
+    Returns the input unchanged if the AST shape doesn't match (defensive
+    against future grammar changes). -/
+private def setInductionAltBinders
+    (alt : TSyntax ``Lean.Parser.Tactic.inductionAlt) (binderNames : Array String)
+  : TSyntax ``Lean.Parser.Tactic.inductionAlt :=
+  match alt.raw with
+  | .node info kind #[lhsWrapper, rhsWrapper] =>
+    match lhsWrapper with
+    | .node lhsInfo `null #[altLHS] =>
+      match altLHS with
+      | .node altLHSInfo ``Lean.Parser.Tactic.inductionAltLHS children =>
+        if children.size >= 3 then
+          let sourceInfo := match children[1]! with
+            | .node info _ _ => info
+            | .atom info _ => info
+            | _ => SourceInfo.none
+          let binderIdents : Array Syntax := binderNames.map fun name =>
+            (mkIdent (Name.mkSimple name)).raw
+          let bindersNode := Syntax.node sourceInfo `null binderIdents
+          let newChildren := children.set! 2 bindersNode
+          let newAltLHS := Syntax.node altLHSInfo ``Lean.Parser.Tactic.inductionAltLHS newChildren
+          let newLHSWrapper := Syntax.node lhsInfo `null #[newAltLHS]
+          ⟨Syntax.node info kind #[newLHSWrapper, rhsWrapper]⟩
+        else alt
+      | _ => alt
+    | _ => alt
+  | _ => alt
 
 /-- Information extracted from a casesOn application -/
 structure CasesOnInfo where
@@ -461,51 +492,14 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
 
       -- Start with quasi-quote pattern that has no binders
       let baseAlt ← `(Lean.Parser.Tactic.inductionAlt| | $ctorIdent => $branchTacticSeq)
-
-
-      -- If we have parameter names, modify the syntax tree to insert them as plain identifiers
-      -- This controls what names `cases` introduces (you were right!)
-      let altStx := if ctorParamNames.isEmpty then
-        baseAlt
-      else
-        -- Navigate into the AST and insert binder identifiers after the constructor group
-        -- Working structure: inductionAltLHS[pipe, group[null[], ctorIdent], null[param1, param2, ...]]
-        match baseAlt.raw with
-        | .node info kind #[lhsWrapper, rhsWrapper] =>
-            match lhsWrapper with
-            | .node lhsInfo `null #[altLHS] =>
-                match altLHS with
-                | .node altLHSInfo `Lean.Parser.Tactic.inductionAltLHS children =>
-                    -- children should be: #[pipe, group, emptyNull]
-                    -- We need to replace emptyNull with: null[binders...]
-                    if children.size >= 3 then
-                      -- Get the source info from the group to use for the binders node
-                      let sourceInfo := match children[1]! with
-                        | .node info _ _ => info
-                        | .atom info _ => info
-                        | _ => SourceInfo.none
-
-                      -- Create identifier syntax nodes for each parameter name
-                      let binderIdents : Array Syntax := ctorParamNames.toArray.map fun name =>
-                        let ident : Ident := mkIdent (Name.mkSimple name)
-                        ident.raw
-
-                      -- Create a null node containing the binder idents
-                      let bindersNode := Syntax.node sourceInfo `null binderIdents
-
-                      -- REPLACE the third child (empty null) with our binders null node
-                      let newChildren := children.set! 2 bindersNode
-
-                      let newAltLHS := Syntax.node altLHSInfo `Lean.Parser.Tactic.inductionAltLHS newChildren
-                      let newLHSWrapper := Syntax.node lhsInfo `null #[newAltLHS]
-                      let newAlt := Syntax.node info kind #[newLHSWrapper, rhsWrapper]
-                      ⟨newAlt⟩
-                    else
-                      baseAlt
-                | _ => baseAlt
-            | _ => baseAlt
-        | _ => baseAlt
-
+      -- Insert the binder names by surgically replacing the LHS's empty
+      -- binder-list `null` node with a populated one.  This is the path
+      -- `cases` uses to learn what names to introduce for the constructor's
+      -- arguments — the quasi-quote can't express it directly because the
+      -- `inductionAltLHS` grammar treats binder names as plain identifiers
+      -- (not `term` antiquotations), so we have to reach into the parsed AST.
+      let altStx := if ctorParamNames.isEmpty then baseAlt
+                    else setInductionAltBinders baseAlt ctorParamNames.toArray
       alts := alts.push altStx
 
     -- When the discriminant is a complex term application (not a local fvar),

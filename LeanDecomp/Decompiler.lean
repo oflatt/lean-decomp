@@ -11,51 +11,6 @@ namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter Tactic
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
-/-- Pretty-print an elaborated expression and parse it back as term syntax.
-  This preserves explicit implicit/typeclass arguments for low-level theorem
-  applications more reliably than `delabToRefinableSyntax`. -/
-private def anonymizeSyntheticMVars (s : String) : String := Id.run do
-  let chars := s.toList.toArray
-  let mut out := ""
-  let mut i := 0
-  while i < chars.size do
-    if chars[i]! == '?' && i + 2 < chars.size && chars[i + 1]! == 'm' && chars[i + 2]! == '.' then
-      let mut j := i + 3
-      let mut sawDigit := false
-      while j < chars.size && chars[j]!.isDigit do
-        sawDigit := true
-        j := j + 1
-      if sawDigit then
-        out := out ++ "?_"
-        i := j
-      else
-        out := out.push chars[i]!
-        i := i + 1
-    else
-      out := out.push chars[i]!
-      i := i + 1
-  out
-
-private def ppExprToTermSyntax (e : Expr) : MetaM Term := do
-  let env ← getEnv
-  let fmt ← Meta.ppExpr e
-  let termStr := anonymizeSyntheticMVars fmt.pretty
-  match Parser.runParserCategory env `term termStr with
-  | .ok stx => pure ⟨stx⟩
-  | .error err =>
-    throwError "failed to parse pretty-printed term:\n{err}\n\n{termStr}"
-
-private def ppExprToTermSyntaxWith (e : Expr) (usePpAll : Bool) : MetaM Term :=
-  withOptions (fun o =>
-      let o := pp.coercions.types.set o true
-      let o := pp.numericTypes.set o true
-      if usePpAll then
-        pp.all.set o true
-      else
-        o
-    ) do
-      ppExprToTermSyntax e
-
 private def theoremHeadToExplicitTermSyntax (headName : Name) : MetaM Term := do
   let env ← getEnv
   let headStr := s!"@{headName}"
@@ -84,61 +39,44 @@ private def theoremAppToNotationTermSyntax (headName : Name) (args : List Expr)
   pure <| Syntax.mkApp headTerm argTerms
 
 private def refineTacProducesGoals (term : Term) (expectedType : Expr)
-  (expectedGoals : Nat) (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool := do
-  let savedMsgs ← Core.getMessageLog
-  Core.setMessageLog {}
-  let ok ← try
-      withoutModifyingState do
-        withLCtx lctx localInsts do
-          let goal ← Meta.mkFreshExprMVar (some expectedType) .syntheticOpaque
-          let tac ← `(tactic| refine $term)
-          let goals ← Tactic.run goal.mvarId! do
-            evalTactic tac
-          let newMsgs ← Core.getMessageLog
-          pure (!newMsgs.hasErrors && goals.length == expectedGoals)
-    catch _ =>
-      pure false
-  Core.setMessageLog savedMsgs
-  return ok
+  (expectedGoals : Nat) (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool :=
+  silentTry false do
+    withLCtx lctx localInsts do
+      let goal ← Meta.mkFreshExprMVar (some expectedType) .syntheticOpaque
+      let tac ← `(tactic| refine $term)
+      let goals ← Tactic.run goal.mvarId! do
+        evalTactic tac
+      let newMsgs ← Core.getMessageLog
+      pure (!newMsgs.hasErrors && goals.length == expectedGoals)
 
 private def refineTacMatchesProofArgs (term : Term) (expectedType : Expr)
-  (proofArgs : Array Expr) (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool := do
-  let savedMsgs ← Core.getMessageLog
-  Core.setMessageLog {}
-  let ok ← try
-      withoutModifyingState do
-        withLCtx lctx localInsts do
-          let goal ← Meta.mkFreshExprMVar (some expectedType) .syntheticOpaque
-          let tac ← `(tactic| refine $term)
-          let goals := (← Tactic.run goal.mvarId! do
-            evalTactic tac
-            ).toArray
-          let newMsgs ← Core.getMessageLog
-          if newMsgs.hasErrors || goals.size != proofArgs.size then
-            pure false
-          else
-            let mut ok := true
-            for i in [:proofArgs.size] do
-              let goalId := goals[i]!
-              let proofArg := proofArgs[i]!
-              let proofTy ← instantiateMVars (← Meta.inferType proofArg)
-              let sameType ← goalId.withContext do
-                let goalTy ← instantiateMVars (← goalId.getType)
-                Meta.isDefEq goalTy proofTy
-              if !sameType then
-                ok := false
-            pure ok
-    catch _ =>
-      pure false
-  Core.setMessageLog savedMsgs
-  return ok
+  (proofArgs : Array Expr) (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool :=
+  silentTry false do
+    withLCtx lctx localInsts do
+      let goal ← Meta.mkFreshExprMVar (some expectedType) .syntheticOpaque
+      let tac ← `(tactic| refine $term)
+      let goals := (← Tactic.run goal.mvarId! do
+        evalTactic tac
+        ).toArray
+      let newMsgs ← Core.getMessageLog
+      if newMsgs.hasErrors || goals.size != proofArgs.size then
+        pure false
+      else
+        let mut ok := true
+        for i in [:proofArgs.size] do
+          let goalId := goals[i]!
+          let proofArg := proofArgs[i]!
+          let proofTy ← instantiateMVars (← Meta.inferType proofArg)
+          let sameType ← goalId.withContext do
+            let goalTy ← instantiateMVars (← goalId.getType)
+            Meta.isDefEq goalTy proofTy
+          if !sameType then
+            ok := false
+        pure ok
 
 /-- Flatten nested arrays of tactics -/
 private def flattenTactics (tacss : List (Array (TSyntax `tactic))) : Array (TSyntax `tactic) :=
   tacss.foldl (· ++ ·) #[]
-
-private partial def containsConstName (e : Expr) (target : Name) : Bool :=
-  Expr.find? (fun sub => sub.getAppFn.constName? == some target) e |>.isSome
 
 private partial def containsCastLike (e : Expr) : Bool :=
   Expr.find? (fun sub =>
@@ -726,17 +664,6 @@ mutual
       let refineTac ← `(tactic| refine $refineTerm)
       let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts used decompileExpr
       return some result
-
-  /-- Return `true` if `e` (or any subterm) contains a `@eagerReduce _ _` application.
-      Grind emits these as kernel-eager-reduction gadgets inside arithmetic
-      certificates. When present, the delab/re-elab roundtrip cannot recover
-      the necessary reducibility with a plain `exact`, so we emit the term
-      inside `with_unfolding_all` instead. -/
-  private partial def containsEagerReduce (e : Expr) : Bool :=
-    Expr.find? (fun sub =>
-      match sub.getAppFn.constName? with
-      | some n => n == ``eagerReduce
-      | none => false) e |>.isSome
 
   /-- The final exact fallback. When the term carries grind's `eagerReduce`
       gadgets, wrap the `exact` in `with_unfolding_all` so the elaborator runs

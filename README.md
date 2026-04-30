@@ -30,8 +30,50 @@ Readability is secondary to correctness. When the structural decompiler cannot s
 
 ## Top TODO
 
-1. **Snapshot tests for the decompiler output.** Tests 14/15 lock down the `Eq.mp (Eq.symm? (propext (Iff.intro f g))) ev → f/g ev` simplifier collapse; **Tests 16/17/18** (added 2026-04-30) now lock down the new `tryDecompEqMpForallCongr` (instantiated + universal) and `tryDecompEqMpImpliesCongr` (premise-applied) peelers. Still missing: snapshots for the actual Sum/Int *output shape* (not the simplifier inputs), since those depend on grind's emitted certificates and are version-sensitive.
-2. **Document the supported envelope.** The decompiler ships with a stable list of structural handlers (see *What Is Working* below) and a list of grind-specific specializations (see `Specialized/Grind.lean`). A short "what shapes do we handle" table near the top of the README would make it easier to predict whether a new failure is in scope.
+1. **Stage-3 tactic simplifier (the speed regression).** Benchmarking 2026-04-30 (see "Performance Snapshot" below) showed every decompiled proof is **slower** than the original `grind` — by 0.07× (Int L91) to 0.88× (Sum). The dominant cost is the `have hOr : φ ∨ ¬φ := by lia; cases hOr with | inl => lia | inr => lia` boilerplate emitted by `tryDecompAbsCaseSplitContradiction`-style handlers. Each `lia` setup costs ~50–150ms; Int L91 makes 4+ of them. A tactic-level simplifier that **shares `lia` calls** across branches — collapsing `have hOr := by lia; cases hOr with | inl => lia | inr => lia` to a single bare `lia` over the compound goal — is the highest-leverage fix and the prerequisite for any "decompile is faster" claim in the paper.
+2. **Find the cases where decompile WINS.** Mine mathlib for `grind` calls that took >1s historically (`scripts/mine_grind_history.py` is the entry point). Decompile each. Hypothesis: when grind's polynomial+ematching does heavy search that decompiles to a small structural script, the script skips the search and is much faster. Expect both qualitative wins (grind times out, decompile closes) and quantitative wins (>10× speedup).
+3. **Robustness experiment.** The implicit pitch of the project is "decompiled proofs survive grind regressions". Test it: pick a grind-heavy mathlib file, decompile every grind site, then bump grind/Lean toolchain and count how many decompiled proofs still elaborate vs how many grind sites still close.
+4. **Snapshot tests for the decompiler output.** Tests 14/15 lock down the `Eq.mp (Eq.symm? (propext (Iff.intro f g))) ev → f/g ev` simplifier collapse; **Tests 16/17/18** (added 2026-04-30) now lock down the `tryDecompEqMpForallCongr` (instantiated + universal) and `tryDecompEqMpImpliesCongr` (premise-applied) peelers. Still missing: snapshots for the actual Sum/Int *output shape* (not the simplifier inputs), since those depend on grind's emitted certificates and are version-sensitive.
+5. **Document the supported envelope.** The decompiler ships with a stable list of structural handlers (see *What Is Working* below) and grind-specific specializations (see `Specialized/Grind.lean`). A short "what shapes do we handle" table near the top of the README would make it easier to predict whether a new failure is in scope.
+
+## Long-term plan / Paper framing
+
+Goal: a paper on decompiling Lean proofs as a way to get **simpler, more stable, and (ideally) faster** proofs out of opaque automation tactics. Phased to land each artifact a paper would need.
+
+- **Phase 1 — close the speed gap (next ~2 weeks).** Ship the stage-3 tactic simplifier. Target: Int L91 from 0.640s to under 0.1s. Goal threshold: decompile within 2× of grind on grind-success cases on both nightly slices. Without this we cannot say "comparable on success, much better elsewhere" — the comparison story has to start with parity.
+- **Phase 2 — find the wins (~4 weeks).** Expand `mine_grind_history.py` to surface grind sites that historically took >1s or timed out. Decompile each. Bin results into qualitative wins (grind fails, decompile closes) and quantitative wins (≥10× speedup). These are the paper's empirical anchors.
+- **Phase 3 — robustness experiment (~6 weeks).** Cross-version stability comparison: pin a mathlib file, decompile every grind, bump grind / Lean toolchain, count survivors on each side. If decompiled proofs are more stable than grind invocations across versions, that's the paper's headline. Lock the methodology before running the experiment so we don't p-hack.
+- **Phase 4 — generality (~8 weeks, parallel with refactors).** Extend coverage beyond grind: `omega`, `polyrith`, `linarith`, `norm_num`. Each tactic has its own certificate shape; one paper subsection each. The structural handlers (`Eq.mp`, `casesOn`, `propext`, etc.) are general — most of the work is per-tactic specializer modules under `Specialized/`.
+- **Phase 5 — paper writing.** Outline: motivation (opaque automation, broken-after-grind-bumps proofs); approach (3-stage pipeline: term simplify → term-to-tactic → tactic simplify); specialization (per-tactic certificate handlers); evaluation (mathlib coverage %, head-to-head speed, cross-version stability); limitations (heartbeat-bounded recursion, generalized cases motives, etc.).
+
+## Performance Snapshot (2026-04-30)
+
+Benchmarks via `scripts/nightly.py --runs 3 --warmup 1 --treatment {original,grindonly,decompile}`. Times are cumulative `tactic execution` seconds at default heartbeat budget; "speedup" is (original / decompile).
+
+| File / line | grind (orig) | grindonly | decompile | speedup |
+|-|-|-|-|-|
+| Sum L36 | 0.110 | 0.119 | 0.134 | 0.82× |
+| Sum L55 | 0.116 | 0.107 | 0.136 | 0.85× |
+| Sum L70 | 0.111 | 0.113 | 0.127 | 0.88× |
+| Sum L81 | 0.109 | 0.119 | 0.124 | 0.88× |
+| Int L47 | 0.034 | 0.041 | 0.109 | 0.31× |
+| Int L69 | 0.034 | 0.041 | 0.035 | 0.98× |
+| Int L76 | 0.035 | 0.039 | 0.062 | 0.57× |
+| Int L79 | 0.035 | 0.034 | 0.084 | 0.42× |
+| Int L91 | 0.044 | 0.044 | **0.640** | **0.07×** |
+
+**Decompile is 1.1× to 14× *slower* than grind on grind-success cases.** The dominant overhead is the `have hOr : φ ∨ ¬φ := by lia; cases hOr with | inl => lia | inr => lia` pattern: each `lia` setup is ~50–150ms; Int L91 makes 4+ of them. A stage-3 tactic simplifier that shares `lia` calls across branches (Top TODO #1) is the highest-leverage perf fix.
+
+### Done: utility consolidation pass (2026-04-30)
+
+Code-review punch list found three utility duplicates and several dead files. Cleaned up in one pass with no behavior change (`Sum.lean` still 4/4, `Int.lean` still 5/5, all 18 snapshot tests still pass). Net: −410 lines.
+- **Deleted dead files**: `BenchGrind.lean`, `casesonterm.lean`, `casesOnType.lean`, `IndentTest.lean`, `simpleterm` — orphan dump-output and unreferenced experiments.
+- **Consolidated `peelArgs`** (was duplicated in `EqDecomp.lean` as `peelApps`, `CasesOn.lean`, and `Specialized/Grind.lean`) into the single `LeanDecomp.peelArgs` in `Helpers.lean`.
+- **Consolidated `containsConstName` / `containsEagerReduce`** (3 copies each across `Decompiler.lean`, `EqDecomp.lean`, `Helpers.lean`) into the public `Helpers.lean` versions.
+- **Consolidated `anonymizeSyntheticMVars` / `ppExprToTermSyntax` / `ppExprToTermSyntaxWith`** (duplicated between `Decompiler.lean` and `Helpers.lean`) into single public `Helpers.lean` versions.
+- **Modernized `isBoolEqTrue`** in `Helpers.lean` to use `Expr.eq?` instead of an inline app-peeler.
+- **Extracted `silentTry` helper** in `Helpers.lean` for the save-messages / suppress / try `withoutModifyingState` / catch / restore pattern shared by `subproofTacticsCloseGoal`, `refineTacProducesGoals`, and `refineTacMatchesProofArgs`.
+- **Factored `tryDecompEqMpForallCongr` / `tryDecompEqMpImpliesCongr` clones**: extracted `emitHavePeel` in `EqDecomp.lean` for the shared `<introTacs>; have h := <ev>; <fast-path lia | recurse on Eq.mp eqProof h>` tail. Universal sub-cases pass `tryFastPath := false` (post-intro goal is still a `∀`, fast-path lia is a guaranteed miss); instantiated sub-cases pass `tryFastPath := true`. Cut ~80 lines and put the four sub-cases on equal footing.
 
 ### Done: lctx-based mem-rewrite scan in `collectFinsetMemRewrites` (2026-04-30)
 
