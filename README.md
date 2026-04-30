@@ -30,9 +30,21 @@ Readability is secondary to correctness. When the structural decompiler cannot s
 
 ## Top TODO
 
-1. **Sum L36 elaboration timeout.** The only remaining failure on `Mathlib/Algebra/Order/Group/Int/Sum.lean`. Same shape family as L70 (which now passes — see "Done" below): `apply sum_le_card_nsmul; grind` against a `∀ x ∈ s \ Ioc (c - #s) c, x ≤ c - #s` goal. Unlike L70 the user didn't pre-introduce the bound variable (`fun x mx ↦ ?_`), so grind emits the universal binder via `forall_congr` *inside* the proof term instead of relying on an outer lambda; the new `tryDecompEqMpForallCongr` should fire here but doesn't drop the proof under the 200k-heartbeat budget. Likely next step: inspect the partial decomp from `dump-nightly-sum/Mathlib/Algebra/Order/Group/Int/Sum/L36.decompile.query.lean` with `maxHeartbeats` cranked, then narrow the slow handler.
-2. **Snapshot tests for the decompiler output.** Tests 14/15 lock down the `Eq.mp (Eq.symm? (propext (Iff.intro f g))) ev → f/g ev` simplifier collapse; **Tests 16/17/18** (added 2026-04-30) now lock down the new `tryDecompEqMpForallCongr` (instantiated + universal) and `tryDecompEqMpImpliesCongr` (premise-applied) peelers. Still missing: snapshots for the actual Sum/Int *output shape* (not the simplifier inputs), since those depend on grind's emitted certificates and are version-sensitive.
-3. **Document the supported envelope.** The decompiler ships with a stable list of structural handlers (see *What Is Working* below) and a list of grind-specific specializations (see `Specialized/Grind.lean`). A short "what shapes do we handle" table near the top of the README would make it easier to predict whether a new failure is in scope.
+1. **Snapshot tests for the decompiler output.** Tests 14/15 lock down the `Eq.mp (Eq.symm? (propext (Iff.intro f g))) ev → f/g ev` simplifier collapse; **Tests 16/17/18** (added 2026-04-30) now lock down the new `tryDecompEqMpForallCongr` (instantiated + universal) and `tryDecompEqMpImpliesCongr` (premise-applied) peelers. Still missing: snapshots for the actual Sum/Int *output shape* (not the simplifier inputs), since those depend on grind's emitted certificates and are version-sensitive.
+2. **Document the supported envelope.** The decompiler ships with a stable list of structural handlers (see *What Is Working* below) and a list of grind-specific specializations (see `Specialized/Grind.lean`). A short "what shapes do we handle" table near the top of the README would make it easier to predict whether a new failure is in scope.
+
+### Done: lctx-based mem-rewrite scan in `collectFinsetMemRewrites` (2026-04-30)
+
+Sum L36 was the last remaining nightly failure on `Sum.lean`. Investigation (instrumented `decompile` to dump the simplified proof term and per-phase markers to `/tmp`) showed the macro was running out of heartbeats inside `buildDecompiledTactics` rather than at validation time, with a single Eq.mp `refine` taking ~6.6s on the default 200k budget. Even 8M heartbeats wasn't enough.
+
+Root cause was a coverage gap, not a perf problem: `collectFinsetMemRewrites` only emitted rewrites when the proof contained `Iff.mp Finset.mem_<X> <fvar>` directly. L36's proof references `mem_sdiff.mp (Eq.mp <transport> hp)` — the third arg is an Eq.mp expr, not a direct fvar — so Pass 1 missed it, and Pass 2's lemma-only set had no `targetFvars` to pair with. The `tryHavesPlusLia` candidate ended up being just `have h_fact := hs x …; lia`, which can't close False without the membership rewrites of `hp`.
+
+Fix:
+- Added a Pass 3 to `collectFinsetMemRewrites` (in `Specialized/Grind.lean`) that scans the **lctx** for hypotheses whose type matches a known Finset interval / sdiff constructor and emits `rw [Finset.mem_<X>] at <hyp>` (and `rw [Finset.mem_sdiff]` first when the set is `s \ Finset.<X> a b`). Resolves `set r := …` opaque fvars by looking through the let-binding.
+- Made Pass 2 also insert into `foundPairs` so Pass 3 can dedupe against it — the duplicate `rw` on an already-rewritten hypothesis fails (LHS no longer matches), tanking the whole candidate. This was the bug that broke L70 in the first iteration.
+- Added a defensive heartbeat bound on `candidateTacticsCloseGoal` (Helpers.lean) — speculative validation attempts now run with `maxHeartbeats := 100000` so a single pathological refine candidate cannot consume the entire ambient budget. `validateOrExact` / `subproofTacticsCloseGoal` directly remain unbounded (they're the workhorse final check).
+
+**Result**: Sum.lean is now 4/4 (L36 was 3/4 before); Int.lean stays at 5/5. Sum L36 collapses to 8 lines: `intro x hp; apply Classical.byContradiction; intro hp_1; have h_fact := hs x …; have h_fact_1 : … := Int.not_le_eq …; rw [Finset.mem_sdiff] at hp; rw [Finset.mem_Ioc] at hp; lia`. Same shape as L70's working output, with the outer `intro x hp` reflecting that the user didn't pre-bind the loop variable.
 
 ### Done: `forall_congr` / `implies_congr` peelers in `EqDecomp.lean`
 
@@ -143,14 +155,14 @@ python scripts/nightly.py \
 
 Results (2026-04-30):
 - `Mathlib/Algebra/Order/Group/Unbundled/Int.lean`: 5/5 (lines 47, 69, 76, 79, 91).
-- `Mathlib/Algebra/Order/Group/Int/Sum.lean`: 3/4 (55, 70, 81 succeed; 36 timeout).
+- `Mathlib/Algebra/Order/Group/Int/Sum.lean`: 4/4 (lines 36, 55, 70, 81).
 
-Int L69 simplifies to `apply Classical.byContradiction; intro hp; lia`. L47/L76/L79/L91 decompile via byContradiction → outer `cases` over an `of_eq_eq_true`-shaped disjunction → inner `cases` of the resulting `And` → `tryDecompAbsCaseSplitContradiction` at each leaf. Sum L70 collapses to a 7-line byContradiction + `have` + `rw` + `lia` block via the new `tryDecompEqMpForallCongr` lia fast path (see "Done" above).
+Int L69 simplifies to `apply Classical.byContradiction; intro hp; lia`. L47/L76/L79/L91 decompile via byContradiction → outer `cases` over an `of_eq_eq_true`-shaped disjunction → inner `cases` of the resulting `And` → `tryDecompAbsCaseSplitContradiction` at each leaf. Sum L70 and L36 both collapse to byContradiction + `have h_fact := hs x …` + `rw [Finset.mem_sdiff, Finset.mem_<Ico|Ioc>] at hp` + `lia` via the lctx-based mem-rewrite scan + `tryDecompEqMpForallCongr` peeler (see "Done" above).
 
 ### Main Open Blockers
 
-- **Sum L36 elaboration timeout.** Sole remaining failure on Sum.lean. Same `apply sum_le_card_nsmul; grind` family as L70 but the user didn't pre-bind the loop variable, so grind emits the universal binder inside the proof term. Despite the `forall_congr` peeler the candidate tactics still exceed the default 200k heartbeat budget. See Top TODO.
 - **No stage-3 tactic simplifier.** Successful decompiles still contain `have hOr : ... := by lia; cases hOr with | inl ⟨..⟩ => ...` boilerplate.
+- **Coverage of grind sites is still narrow.** Both nightly slices are deliberately small. Broader sweeps will surface new shapes the structural handlers don't cover yet.
 
 ## Lessons Learned (selected)
 

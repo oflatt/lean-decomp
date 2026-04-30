@@ -143,6 +143,76 @@ private partial def collectFinsetMemRewrites (proof : Expr) : MetaM (Array (TSyn
         let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
         let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
         rwTacs := rwTacs.push (← `(tactic| rw [$rwRule] $loc))
+        foundPairs := foundPairs.insert (lemma, hypName)
+  -- Pass 3: lctx-based scan.  Sum L36's proof references `mem_sdiff` only as
+  -- `mem_sdiff.mp (Eq.mp <transport> hp)` — the third arg is an Eq.mp expr,
+  -- not a direct fvar — so Pass 1 misses it.  Pass 2 finds the const but has
+  -- no `targetFvars` to pair it with.  Recover by scanning the lctx for any
+  -- hypothesis whose type matches a known Finset interval / sdiff constructor
+  -- and emitting a rewrite at that hypothesis directly.
+  let setShapeToMemLemma : List (String × Name) := [
+    ("Finset.Ico", Name.mkStr2 "Finset" "mem_Ico"),
+    ("Finset.Ioc", Name.mkStr2 "Finset" "mem_Ioc"),
+    ("Finset.Icc", Name.mkStr2 "Finset" "mem_Icc"),
+    ("Finset.Ioo", Name.mkStr2 "Finset" "mem_Ioo"),
+    ("Finset.Iic", Name.mkStr2 "Finset" "mem_Iic"),
+    ("Finset.Iio", Name.mkStr2 "Finset" "mem_Iio"),
+    ("Finset.Ici", Name.mkStr2 "Finset" "mem_Ici"),
+    ("Finset.Ioi", Name.mkStr2 "Finset" "mem_Ioi"),
+    ("Finset.range", Name.mkStr2 "Finset" "mem_range")
+  ]
+  let lctx ← getLCtx
+  for decl in lctx do
+    if decl.isImplementationDetail then continue
+    let ty ← instantiateMVars decl.type
+    let tyArgs := ty.getAppArgs
+    unless ty.getAppFn.isConstOf ``Membership.mem && tyArgs.size >= 5 do continue
+    let setArg := tyArgs[tyArgs.size - 2]!
+    -- Resolve `set r := …` — when the goal references an opaque fvar, look
+    -- through the let-binding to its definition.
+    let setExpr ← match setArg.fvarId? with
+      | some fid =>
+        match (← fid.getDecl).value? with
+        | some v => pure v
+        | none => pure setArg
+      | none => pure setArg
+    let setFnName? := setExpr.getAppFn.constName?.map (·.toString)
+    let hypIdent : Ident := mkIdent decl.userName
+    -- Skip if Pass 1 / Pass 2 already emitted a rewrite for this fvar — running
+    -- the same `rw [mem_X] at hp` twice fails on the second call (the LHS no
+    -- longer matches), tanking the whole candidate.
+    let hypUserName := decl.userName
+    let alreadyEmittedFor : Name → Bool := fun lemmaN =>
+      foundPairs.contains (lemmaN, hypUserName)
+    -- Direct interval: `_ ∈ Finset.<X> a b`.
+    if let some shape := setFnName? then
+      if let some (_, memLemma) := setShapeToMemLemma.find? (·.1 == shape) then
+        unless alreadyEmittedFor memLemma do
+          let lemmaIdent : Ident := mkIdent memLemma
+          let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
+          let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
+          rwTacs := rwTacs.push (← `(tactic| rw [$rwRule] $loc))
+          foundPairs := foundPairs.insert (memLemma, hypUserName)
+    -- sdiff with interval rhs: `_ ∈ s \ Finset.<X> a b` — rewrite both layers.
+    let setSubArgs := setExpr.getAppArgs
+    if setExpr.getAppFn.isConstOf ``SDiff.sdiff && setSubArgs.size >= 4 then
+      let inner := setSubArgs[setSubArgs.size - 1]!
+      let innerFnName? := inner.getAppFn.constName?.map (·.toString)
+      let memSdiffName := Name.mkStr2 "Finset" "mem_sdiff"
+      unless alreadyEmittedFor memSdiffName do
+        let memSdiffIdent : Ident := mkIdent memSdiffName
+        let memSdiffRule ← `(Parser.Tactic.rwRule| $memSdiffIdent:ident)
+        let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
+        rwTacs := rwTacs.push (← `(tactic| rw [$memSdiffRule] $loc))
+        foundPairs := foundPairs.insert (memSdiffName, hypUserName)
+      if let some shape := innerFnName? then
+        if let some (_, memLemma) := setShapeToMemLemma.find? (·.1 == shape) then
+          unless foundPairs.contains (memLemma, hypUserName) do
+            let innerLemmaIdent : Ident := mkIdent memLemma
+            let innerRule ← `(Parser.Tactic.rwRule| $innerLemmaIdent:ident)
+            let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
+            rwTacs := rwTacs.push (← `(tactic| rw [$innerRule] $loc))
+            foundPairs := foundPairs.insert (memLemma, hypUserName)
   return rwTacs
 
 /-- Check whether a type is arithmetic-shaped (LE/LT/Eq of integer/natural

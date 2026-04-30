@@ -145,10 +145,30 @@ private def subproofTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedT
 
   /-- Check whether a candidate tactic block closes a fresh goal of the given type.
     This is useful for speculative terminal tactics where failure should simply
-    let the decompiler continue trying other handlers. -/
+    let the decompiler continue trying other handlers.
+
+    Each speculative attempt is bounded to `candidateMaxHeartbeats` so that a
+    single pathological candidate (e.g. a `refine @Eq.mp` over natCast-heavy
+    propext+Iff.intro chains, or a `lia` over the wrong polynomial form) cannot
+    consume the entire ambient heartbeat budget and starve every subsequent
+    handler attempt. The bound is intentionally generous (well above what a
+    fast-path `lia` needs in practice) but tight enough that a single Eq.mp
+    refine that times out at 6+s on the default 200k file budget can no longer
+    block downstream handlers in the same recursion. Validation in
+    `validateOrExact` / `subproofTacticsCloseGoal` directly is *not* bounded
+    — that is the workhorse final check and must reflect the real elaborator.
+
+    The value here is in user-visible units (Lean multiplies internally by 1000
+    to get the actual heartbeat counter threshold), so 100000 corresponds to
+    `set_option maxHeartbeats 100000` — half of Lean's default per-command
+    budget of 200000. -/
+  private def candidateMaxHeartbeats : Nat := 100000
+
   def candidateTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedType : Expr)
-    (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool :=
-    subproofTacticsCloseGoal tacs expectedType lctx localInsts
+    (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool := do
+    withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := candidateMaxHeartbeats * 1000 }) do
+      Core.withCurrHeartbeats <|
+        subproofTacticsCloseGoal tacs expectedType lctx localInsts
 
 /-- True iff the type has shape `(_ : Bool) = (Bool.true : Bool)`.  This is the
     type of eagerReduce certificates emitted by grind's polynomial normalizers
