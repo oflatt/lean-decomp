@@ -86,30 +86,11 @@ partial def exprNodeCount (e : Expr) : Nat :=
   | .proj _ _ body => exprNodeCount body + 1
 
 private def throwIfFallbackProofTooLarge (proof : Expr) : MetaM Unit := do
-  let maxNodes := 5000
+  let maxNodes := 500000
   let nodeCount := exprNodeCount proof
   if nodeCount > maxNodes then
     throwError
       "exact fallback proof too large ({nodeCount} nodes, max {maxNodes}); refusing to emit a giant exact term"
-
-/-- Build a robust exact fallback for a subproof. Prefer direct delaboration when
-    possible, but fall back to fully pretty-printed syntax for low-level proofs. -/
-private def mkExactFallbackTactics (proof : Expr) : MetaM (Array (TSyntax `tactic)) := do
-  throwIfFallbackProofTooLarge proof
-  let usePrettyPrintedTerm :=
-    containsEagerReduce proof || containsConstName proof ``propext || containsConstName proof ``Iff.intro
-  let termStx ← if usePrettyPrintedTerm then
-      try ppExprToTermSyntaxWith proof true
-      catch _ => delabToRefinableSyntax proof
-    else
-      try delabToRefinableSyntax proof
-      catch _ => ppExprToTermSyntaxWith proof true
-  if containsEagerReduce proof then
-    let tac ← `(tactic| with_unfolding_all exact $termStx)
-    return #[tac]
-  else
-    let tac ← `(tactic| exact $termStx)
-    return #[tac]
 
 /-! **Decompiler invariant**: when any decomp action runs, the main TacticM goal
     must equal the type of the proof term being decompiled, with a lctx that
@@ -169,6 +150,55 @@ private def subproofTacticsCloseGoal (tacs : Array (TSyntax `tactic)) (expectedT
     (lctx : LocalContext) (localInsts : LocalInstances) : TacticM Bool :=
     subproofTacticsCloseGoal tacs expectedType lctx localInsts
 
+/-- True iff the type has shape `(_ : Bool) = (Bool.true : Bool)`.  This is the
+    type of eagerReduce certificates emitted by grind's polynomial normalizers
+    (`Int.Linear.norm_le`, etc.) — a Bool equality whose RHS is `true`.  Always
+    decidable, so `decide` is a safe candidate. -/
+private def isBoolEqTrue (ty : Expr) : Bool :=
+  let rec peel (e : Expr) (acc : List Expr) : Expr × List Expr :=
+    match e with
+    | .app f a => peel f (a :: acc)
+    | _ => (e, acc)
+  let (fn, args) := peel ty []
+  match fn, args with
+  | .const ``Eq _, [α, _, rhs] => α.isConstOf ``Bool && rhs.isConstOf ``Bool.true
+  | _, _ => false
+
+/-- Build a robust exact fallback for a subproof. Prefer direct delaboration when
+    possible, but fall back to fully pretty-printed syntax for low-level proofs.
+
+    For proofs that ARE an eagerReduce certificate (type shape `_ = true` over
+    Bool), try `decide` first: it does the same kernel reduction as
+    `with_unfolding_all exact` but produces a much smaller residual term —
+    sometimes cutting heartbeat cost enough to fit the default budget.  We
+    gate on the type shape rather than just `containsEagerReduce` because
+    transport-wrapped forms (e.g. `Eq.mp transport (eagerReduce ...)`) have a
+    non-decidable outer type; `decide` would fail there, and the validation
+    attempt itself is expensive.  Falls back to `with_unfolding_all exact`
+    when `decide` doesn't close the goal. -/
+private def mkExactFallbackTactics (proof : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) : TacticM (Array (TSyntax `tactic)) := do
+  throwIfFallbackProofTooLarge proof
+  let usePrettyPrintedTerm :=
+    containsEagerReduce proof || containsConstName proof ``propext || containsConstName proof ``Iff.intro
+  let termStx ← if usePrettyPrintedTerm then
+      try ppExprToTermSyntaxWith proof true
+      catch _ => delabToRefinableSyntax proof
+    else
+      try delabToRefinableSyntax proof
+      catch _ => ppExprToTermSyntaxWith proof true
+  if containsEagerReduce proof then
+    let proofTy ← instantiateMVars (← Meta.inferType proof)
+    if isBoolEqTrue proofTy then
+      let decideTac ← `(tactic| decide)
+      if ← subproofTacticsCloseGoal #[decideTac] proofTy lctx localInsts then
+        return #[decideTac]
+    let tac ← `(tactic| with_unfolding_all exact $termStx)
+    return #[tac]
+  else
+    let tac ← `(tactic| exact $termStx)
+    return #[tac]
+
 /-- Validate a candidate tactic block against the full proof goal and fall back
     to an exact proof term if validation fails. -/
 def validateOrExact (proof : Expr) (lctx : LocalContext) (localInsts : LocalInstances)
@@ -180,10 +210,10 @@ def validateOrExact (proof : Expr) (lctx : LocalContext) (localInsts : LocalInst
     if ← subproofTacticsCloseGoal candidateTacs proofTy lctx localInsts then
       return (candidateTacs, used')
     else
-      let fallbackTacs ← mkExactFallbackTactics proof
+      let fallbackTacs ← mkExactFallbackTactics proof lctx localInsts
       return (fallbackTacs, used')
   catch _ =>
-    let fallbackTacs ← mkExactFallbackTactics proof
+    let fallbackTacs ← mkExactFallbackTactics proof lctx localInsts
     return (fallbackTacs, used)
 
 def decompileOrExact (proof : Expr) (lctx : LocalContext) (localInsts : LocalInstances)

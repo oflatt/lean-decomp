@@ -420,4 +420,179 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
     let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[eqProofNorm, sourceProofArg] lctx localInsts used decompileExpr
     return some result
 
+/-- Handle `Eq.mp (forall_congr <body>) <evidence>` (with optional trailing
+    applications) where `evidence : ∀ a, p a` transports to `∀ a, q a`.
+
+    Two cases based on whether the proof has trailing args after `evidence`:
+
+    - **Universal** (no trailing args, goal is `∀ a, q a`): emit `intro x; have
+      h_user := <evidence> x; <recurse>` where the recursion target is
+      `Eq.mp (<body> x) h_user` of type `q x`.  The `have` puts the user-form
+      hypothesis in the lctx so downstream `lia` can find it.
+
+    - **Instantiated** (trailing args `x_spec, …`, goal is `q x_spec …`):
+      construct the inner term directly with the specific instantiation —
+      `Eq.mp (<body> x_spec) (<evidence> x_spec)` then apply remaining args.
+      No intro needed; the recursion runs in the existing lctx.
+
+    `forall_congr` is a stdlib lemma used by any tactic that transports a
+    `∀`-typed value through pointwise equalities — not grind-specific.  The
+    grind-specific leaf certificates inside `<body>` (e.g. `Int.Linear.norm_le`)
+    are handled by `Specialized/Grind.lean` after this peel exposes them. -/
+def tryDecompEqMpForallCongr (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let (fn, args) := peelApps expr
+    if !fn.isConstOf ``Eq.mp then return none
+    if args.length < 4 then return none
+    let eqProof := args[2]!
+    let evidence := args[3]!
+    let trailingArgs := args.drop 4
+    let (eqFn, eqArgs) := peelApps eqProof
+    if !eqFn.isConstOf ``forall_congr then return none
+    if eqArgs.length < 4 then return none
+    let body := eqArgs[3]!
+    if h : trailingArgs.length > 0 then
+      -- Instantiated case: trailingArgs[0] specializes the universal binder.
+      -- Emit a `have` for the evidence-at-x so downstream `lia` can find the
+      -- user-form hypothesis in the lctx.
+      let xSpec := trailingArgs[0]
+      let remaining := trailingArgs.drop 1
+      let bodyAtX ← Meta.whnf (mkApp body xSpec)
+      let evidenceAtX := mkApp evidence xSpec
+      let evidenceAtXTy ← Meta.inferType evidenceAtX
+      let (hName, used1) := LeanDecomp.chooseIntroName used.length `h used
+      let hFvarId := FVarId.mk (← mkFreshId)
+      let lctxWithH := lctx.mkLocalDecl hFvarId (Name.mkSimple hName) evidenceAtXTy
+      let hInsts ← withLCtx lctxWithH localInsts getLocalInstances
+      let evidenceAtXStx ← delabToRefinableSyntax evidenceAtX
+      let hIdent := mkIdent (Name.mkSimple hName)
+      let haveTac ← `(tactic| have $hIdent:ident := $evidenceAtXStx)
+      -- Fast path: if `lia` (or `with_unfolding_all lia`) closes the outer
+      -- goal directly with the just-introduced have in the lctx, skip the
+      -- recursive decomp.  This is the L70 win: avoids emitting the slow
+      -- `refine @Eq.mp <denote> <denote> ?_ ?_` chain when the user-form
+      -- hypothesis is enough to close the polynomial goal.
+      let exprTy ← Meta.inferType expr
+      let liaTac ← `(tactic| lia)
+      if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] exprTy lctxWithH hInsts then
+        return some (#[haveTac, liaTac], used1)
+      let unfoldLiaTac ← `(tactic| with_unfolding_all lia)
+      if ← LeanDecomp.candidateTacticsCloseGoal #[unfoldLiaTac] exprTy lctxWithH hInsts then
+        return some (#[haveTac, unfoldLiaTac], used1)
+      -- Slow path: recurse on `Eq.mp (body x_spec) h_user` with remaining args.
+      let innerCore ← withLCtx lctxWithH hInsts do
+        Meta.mkAppM ``Eq.mp #[bodyAtX, Expr.fvar hFvarId]
+      let innerTerm := remaining.foldl (init := innerCore) fun acc a => mkApp acc a
+      let (innerTactics, used2) ← decompileExpr innerTerm lctxWithH hInsts used1
+      return some (#[haveTac] ++ innerTactics, used2)
+    -- Universal case: telescope the body lambda, intro a fresh fvar, have the evidence.
+    Meta.lambdaTelescope body fun bodyXs bodyResult => do
+      if bodyXs.size != 1 then return none
+      let xFvar := bodyXs[0]!
+      let some xFvarId := xFvar.fvarId? | return none
+      let xDecl ← xFvarId.getDecl
+      let (xName, used1) := LeanDecomp.chooseIntroName used.length xDecl.userName used
+      let lctxWithX := (← getLCtx).setUserName xFvarId (Name.mkSimple xName)
+      let xInsts ← getLocalInstances
+      let evidenceAtX := mkApp evidence xFvar
+      let evidenceAtXTy ← withLCtx lctxWithX xInsts (Meta.inferType evidenceAtX)
+      let (hName, used2) := LeanDecomp.chooseIntroName used1.length `h used1
+      let hFvarId := FVarId.mk (← mkFreshId)
+      let lctxWithH := lctxWithX.mkLocalDecl hFvarId (Name.mkSimple hName) evidenceAtXTy
+      let hInsts ← withLCtx lctxWithH xInsts getLocalInstances
+      let innerTerm ← withLCtx lctxWithH hInsts do
+        Meta.mkAppM ``Eq.mp #[bodyResult, Expr.fvar hFvarId]
+      let evidenceAtXStx ← withLCtx lctxWithX xInsts (delabToRefinableSyntax evidenceAtX)
+      let xIdent := mkIdent (Name.mkSimple xName)
+      let hIdent := mkIdent (Name.mkSimple hName)
+      let introTac ← `(tactic| intro $xIdent:ident)
+      let haveTac ← `(tactic| have $hIdent:ident := $evidenceAtXStx)
+      let (innerTactics, used3) ← decompileExpr innerTerm lctxWithH hInsts used2
+      return some (#[introTac, haveTac] ++ innerTactics, used3)
+
+/-- Handle `Eq.mp (implies_congr p_eq q_eq) <evidence>` (with optional trailing
+    applications) where `evidence : p → q` transports to `p' → q'`.
+
+    Only the case `p_eq = Eq.refl _` (so `p = p'`) is handled — the common
+    shape grind emits, e.g. `implies_congr Eq.refl (Int.Linear.norm_le ...)`
+    to rewrite the conclusion of an implication while the premise stays fixed.
+
+    Two sub-cases:
+    - **Premise applied** (one trailing arg `hp_spec : p`): construct
+      `Eq.mp q_eq (<evidence> hp_spec)` and recurse.
+    - **No trailing arg** (goal is `p' → q'`): emit `intro hp; have h_user :=
+      <evidence> hp; <recurse>` with target `Eq.mp q_eq h_user`.
+
+    The harder case `p_eq ≠ Eq.refl` would need to additionally transport
+    `hp` backward (`Eq.mpr p_eq hp`) before applying the evidence — deferred. -/
+def tryDecompEqMpImpliesCongr (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
+  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  withLCtx lctx localInsts do
+    let (fn, args) := peelApps expr
+    if !fn.isConstOf ``Eq.mp then return none
+    if args.length < 4 then return none
+    let eqProof := args[2]!
+    let evidence := args[3]!
+    let trailingArgs := args.drop 4
+    let (eqFn, eqArgs) := peelApps eqProof
+    if !eqFn.isConstOf ``implies_congr then return none
+    if eqArgs.length < 6 then return none
+    let pEq := eqArgs[4]!
+    let qEq := eqArgs[5]!
+    let (pEqFn, _) := peelApps pEq
+    if !pEqFn.isConstOf ``Eq.refl then return none
+    if h : trailingArgs.length > 0 then
+      -- Premise-applied case: trailingArgs[0] is the premise proof.
+      -- Emit a `have` for the evidence-at-premise so downstream `lia` can
+      -- find the user-form hypothesis in the lctx.
+      let hpSpec := trailingArgs[0]
+      let remaining := trailingArgs.drop 1
+      let evidenceAtHp := mkApp evidence hpSpec
+      let evidenceAtHpTy ← Meta.inferType evidenceAtHp
+      let (hName, used1) := LeanDecomp.chooseIntroName used.length `h used
+      let hFvarId := FVarId.mk (← mkFreshId)
+      let lctxWithH := lctx.mkLocalDecl hFvarId (Name.mkSimple hName) evidenceAtHpTy
+      let hInsts ← withLCtx lctxWithH localInsts getLocalInstances
+      let evidenceAtHpStx ← delabToRefinableSyntax evidenceAtHp
+      let hIdent := mkIdent (Name.mkSimple hName)
+      let haveTac ← `(tactic| have $hIdent:ident := $evidenceAtHpStx)
+      -- Fast path: try `lia` / `with_unfolding_all lia` against the outer
+      -- goal with the just-introduced have in the lctx. See the matching
+      -- comment in `tryDecompEqMpForallCongr` above.
+      let exprTy ← Meta.inferType expr
+      let liaTac ← `(tactic| lia)
+      if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] exprTy lctxWithH hInsts then
+        return some (#[haveTac, liaTac], used1)
+      let unfoldLiaTac ← `(tactic| with_unfolding_all lia)
+      if ← LeanDecomp.candidateTacticsCloseGoal #[unfoldLiaTac] exprTy lctxWithH hInsts then
+        return some (#[haveTac, unfoldLiaTac], used1)
+      let innerCore ← withLCtx lctxWithH hInsts do
+        Meta.mkAppM ``Eq.mp #[qEq, Expr.fvar hFvarId]
+      let innerTerm := remaining.foldl (init := innerCore) fun acc a => mkApp acc a
+      let (innerTactics, used2) ← decompileExpr innerTerm lctxWithH hInsts used1
+      return some (#[haveTac] ++ innerTactics, used2)
+    let p2 := eqArgs[1]!
+    let (hpName, used1) := LeanDecomp.chooseIntroName used.length `hp used
+    let hpFvarId := FVarId.mk (← mkFreshId)
+    let lctxWithHp := lctx.mkLocalDecl hpFvarId (Name.mkSimple hpName) p2
+    let hpInsts ← withLCtx lctxWithHp localInsts getLocalInstances
+    let evidenceAtHp := mkApp evidence (Expr.fvar hpFvarId)
+    let evidenceAtHpTy ← withLCtx lctxWithHp hpInsts (Meta.inferType evidenceAtHp)
+    let (hUserName, used2) := LeanDecomp.chooseIntroName used1.length `h used1
+    let hUserFvarId := FVarId.mk (← mkFreshId)
+    let lctxWithUser := lctxWithHp.mkLocalDecl hUserFvarId (Name.mkSimple hUserName) evidenceAtHpTy
+    let userInsts ← withLCtx lctxWithUser hpInsts getLocalInstances
+    let innerTerm ← withLCtx lctxWithUser userInsts do
+      Meta.mkAppM ``Eq.mp #[qEq, Expr.fvar hUserFvarId]
+    let evidenceAtHpStx ← withLCtx lctxWithHp hpInsts (delabToRefinableSyntax evidenceAtHp)
+    let hpIdent := mkIdent (Name.mkSimple hpName)
+    let hUserIdent := mkIdent (Name.mkSimple hUserName)
+    let introTac ← `(tactic| intro $hpIdent:ident)
+    let haveTac ← `(tactic| have $hUserIdent:ident := $evidenceAtHpStx)
+    let (innerTactics, used3) ← decompileExpr innerTerm lctxWithUser userInsts used2
+    return some (#[introTac, haveTac] ++ innerTactics, used3)
+
 end LeanDecomp

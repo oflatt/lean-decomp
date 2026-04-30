@@ -71,21 +71,36 @@ private def tryDecompEqMpKnownGrindCast (castName : Name) (expr : Expr)
     We walk the proof term (rather than the lctx) because `set r := Finset.Ico …`
     leaves an opaque fvar `r` in the lctx, but the proof itself uses
     `Finset.mem_Ico.mp h` against the destructured form, telling us exactly
-    which `mem_*` lemma applies. -/
+    which `mem_*` lemma applies.
+
+    Pass 2: for each Pass-1-target fvar, also emit rewrites for **other**
+    `mem_<X>` lemmas referenced anywhere in the proof (not just at fvar
+    arguments).  Rationale: in Sum L70 the proof contains `mem_Ico.mp h`
+    inside a lambda body — `h` there is bound, not a free fvar — so Pass 1
+    wouldn't see it.  But after Pass 1 rewrites `mx : x ∈ s \ r` to
+    `mx : x ∈ s ∧ x ∉ r`, a follow-up `rw [Finset.mem_Ico] at mx` fires on
+    the `x ∈ Ico …` pattern hidden inside `r` and exposes the arithmetic
+    bounds to `lia`.  Without the second pass, `lia` only sees `x ∉ r` as
+    an opaque membership and the contradiction can't close. -/
 private partial def collectFinsetMemRewrites (proof : Expr) : MetaM (Array (TSyntax `tactic)) := do
   let memLemmas : List String := [
     "Finset.mem_Ico", "Finset.mem_Ioc", "Finset.mem_Icc", "Finset.mem_Ioo",
     "Finset.mem_Iic", "Finset.mem_Iio", "Finset.mem_Ici", "Finset.mem_Ioi",
     "Finset.mem_range", "Finset.mem_sdiff", "Finset.mem_inter", "Finset.mem_union"
   ]
-  let mut found : Std.HashSet (Name × Name) := {}
+  let mut foundPairs : Std.HashSet (Name × Name) := {}
+  let mut foundLemmas : Std.HashSet Name := {}
+  let mut targetFvars : Std.HashSet Name := {}
   let mut stack : List Expr := [proof]
   let mut iters := 0
-  while !stack.isEmpty && iters < 5000 do
+  -- Higher than the 5000 used elsewhere because L70's proof has `mem_Ico`
+  -- references buried deep inside the propext/Iff.intro lambda bodies, past
+  -- where the 5000 budget runs out.
+  while !stack.isEmpty && iters < 50000 do
     iters := iters + 1
     let cur := stack.head!
     stack := stack.tail!
-    -- Look for `Iff.mp <memLemma> <fvar>` patterns.
+    -- Pass 1: `Iff.mp <memLemma> <fvar>` patterns — produce a (lemma, fvar) pair.
     let (fn, args) := peelArgs cur
     if fn.isConstOf ``Iff.mp && args.length >= 4 then
       let iffArg := args[2]!
@@ -95,7 +110,12 @@ private partial def collectFinsetMemRewrites (proof : Expr) : MetaM (Array (TSyn
         if memLemmas.contains iffName.toString then
           if let some fid := hypArg.fvarId? then
             let hypDecl ← fid.getDecl
-            found := found.insert (iffName, hypDecl.userName)
+            foundPairs := foundPairs.insert (iffName, hypDecl.userName)
+            targetFvars := targetFvars.insert hypDecl.userName
+    -- Pass 2: any `Finset.mem_<X>` const reference, regardless of arg position.
+    if let some cname := fn.constName? then
+      if memLemmas.contains cname.toString then
+        foundLemmas := foundLemmas.insert cname
     match cur with
     | .app f a => stack := f :: a :: stack
     | .lam _ t b _ => stack := t :: b :: stack
@@ -105,12 +125,24 @@ private partial def collectFinsetMemRewrites (proof : Expr) : MetaM (Array (TSyn
     | .proj _ _ b => stack := b :: stack
     | _ => pure ()
   let mut rwTacs : Array (TSyntax `tactic) := #[]
-  for (lemmaName, hypName) in found do
+  for (lemmaName, hypName) in foundPairs do
     let lemmaIdent : Ident := mkIdent lemmaName
     let hypIdent : Ident := mkIdent hypName
     let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
     let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
     rwTacs := rwTacs.push (← `(tactic| rw [$rwRule] $loc))
+  -- Pass 2 rewrites: for each (lemma, fvar) with lemma not already in Pass 1
+  -- for that fvar, emit `rw [lemma] at fvar`.  The `rw` may not fire (no
+  -- pattern match) — that's caught by the surrounding `candidateTacticsCloseGoal`
+  -- check, which discards a non-firing block.
+  for lemma in foundLemmas do
+    for hypName in targetFvars do
+      unless foundPairs.contains (lemma, hypName) do
+        let lemmaIdent : Ident := mkIdent lemma
+        let hypIdent : Ident := mkIdent hypName
+        let rwRule ← `(Parser.Tactic.rwRule| $lemmaIdent:ident)
+        let loc ← `(Lean.Parser.Tactic.location| at $hypIdent:term)
+        rwTacs := rwTacs.push (← `(tactic| rw [$rwRule] $loc))
   return rwTacs
 
 /-- Check whether a type is arithmetic-shaped (LE/LT/Eq of integer/natural
@@ -119,6 +151,73 @@ private def isArithLeafGoal (ty : Expr) : MetaM Bool := do
   let (fn, _) := peelArgs ty
   let some n := fn.constName? | return false
   return n == ``LE.le || n == ``LT.lt || n == ``GE.ge || n == ``GT.gt || n == ``Eq
+
+private def synthesizeForallMembershipHaves
+    (used : List String) : TacticM (Array (TSyntax `tactic) × List String) := do
+  let lctx ← getLCtx
+  let mut foralls : Array (FVarId × Expr) := #[]
+  for decl in lctx do
+    if decl.isImplementationDetail then continue
+    let ty ← instantiateMVars decl.type
+    let sArg? ← Meta.forallTelescope ty fun xs _body => do
+        if xs.size != 2 then return (none : Option Expr)
+        let yMem := xs[1]!
+        let yMemTy ← Meta.inferType yMem
+        let memArgs := yMemTy.getAppArgs
+        if !yMemTy.getAppFn.isConstOf ``Membership.mem || memArgs.size < 5 then
+          return none
+        let setArg := memArgs[memArgs.size - 2]!
+        if setArg.containsFVar (xs[0]!.fvarId!) || setArg.containsFVar (xs[1]!.fvarId!) then
+          return none
+        return some setArg
+    if let some sArg := sArg? then
+      foralls := foralls.push (decl.fvarId, sArg)
+  let mut tacs : Array (TSyntax `tactic) := #[]
+  let mut used := used
+  for (hsFvarId, hsSet) in foralls do
+    let hsName := (← hsFvarId.getDecl).userName
+    let hsIdent : Ident := mkIdent hsName
+    for decl in lctx do
+      if decl.isImplementationDetail then continue
+      if decl.fvarId == hsFvarId then continue
+      let ty ← instantiateMVars decl.type
+      let tyArgs := ty.getAppArgs
+      unless ty.getAppFn.isConstOf ``Membership.mem && tyArgs.size >= 5 do continue
+      let setArg := tyArgs[tyArgs.size - 2]!
+      let elem := tyArgs[tyArgs.size - 1]!
+      let elemFvarId? := elem.fvarId?
+      -- We need the element to be a concrete fvar in the lctx so we can
+      -- form `hs <elem> <proof>` syntactically with its userName.
+      let some elemFvarId := elemFvarId? | continue
+      let elemName := (← elemFvarId.getDecl).userName
+      let elemIdent : Ident := mkIdent elemName
+      let mxIdent : Ident := mkIdent decl.userName
+      let hName := LeanDecomp.mkUniqueName "h_fact" used
+      let hIdent : Ident := mkIdent (Name.mkSimple hName)
+      -- Direct match: `mx : elem ∈ s` with s defeq hsSet.
+      if (← Meta.isDefEq setArg hsSet) then
+        let tac ← `(tactic| have $hIdent:ident := $hsIdent:ident $elemIdent:ident $mxIdent:ident)
+        tacs := tacs.push tac
+        used := hName :: used
+        continue
+      -- sdiff match: `mx : elem ∈ <s> \ <T>` with s defeq hsSet.
+      let setSubArgs := setArg.getAppArgs
+      if setArg.getAppFn.isConstOf ``SDiff.sdiff && setSubArgs.size >= 4 then
+        let s := setSubArgs[setSubArgs.size - 2]!
+        if (← Meta.isDefEq s hsSet) then
+          -- Emit: `have h_fact := hs <elem> (And.left (Finset.mem_sdiff.mp <mx>))`.
+          -- Use explicit `And.left` rather than `.left` dot-notation: the dot
+          -- form picks up a hygiene mark (`.left✝`) that isn't valid syntax
+          -- after `addSuggestion` writes it back to the source file.
+          let memSdiffMpIdent : Ident := mkIdent (Name.mkStr3 "Finset" "mem_sdiff" "mp")
+          let andLeftIdent : Ident := mkIdent ``And.left
+          let tac ← `(tactic|
+            have $hIdent:ident :=
+              $hsIdent:ident $elemIdent:ident
+                ($andLeftIdent:ident ($memSdiffMpIdent:ident $mxIdent:ident)))
+          tacs := tacs.push tac
+          used := hName :: used
+  return (tacs, used)
 
 /-- Try `lia` after introducing each extracted "interesting" sub-fact of the
     proof as a `have`. This handles leaves whose proof applies a forall hyp
@@ -132,9 +231,19 @@ private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
   -- subterms of giant proofs is itself expensive; the handler is intended for
   -- arithmetic leaves where `lia` failed but a small set of forall-membership
   -- applications would close.
-  if LeanDecomp.exprNodeCount expr > 1500 then return none
+  -- The proof can be large (Sum L70's contradiction body is ~9000 nodes),
+  -- but `extractGrindFacts` has its own internal walk budget so we don't
+  -- need to gate that tightly here.  Keep a generous cap to avoid the
+  -- pathological case.
+  if LeanDecomp.exprNodeCount expr > 50000 then return none
+  -- Lctx-synthesized `hs y H` `have` tactics: the proof tree doesn't expose
+  -- these (grind splits them across multiple App nodes, e.g.
+  -- `Eq.mp <forall_congr ...> hs y mem_arg`), but they're often the
+  -- highest-leverage user-form bound for `lia`.
+  let (synthHaves, used) ← withLCtx lctx localInsts <|
+    synthesizeForallMembershipHaves used
   let facts ← LeanDecomp.extractGrindFacts expr
-  if facts.isEmpty then return none
+  if facts.isEmpty && synthHaves.isEmpty then return none
   -- Only keep facts that:
   --   * are application proofs of an arithmetic statement (LE/LT/Eq), so
   --     adding them to lctx actually helps `lia`,
@@ -152,7 +261,11 @@ private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
   let mut count := 0
   for fact in facts do
     if count >= 4 then break
-    if LeanDecomp.exprNodeCount fact > 80 then continue
+    -- Skip facts referring to bound variables — their lambda context is gone
+    -- by the time the `have` re-elaborates.  Common case: facts inside the
+    -- propext-iff lambdas (`(mem_Ico.mp h).left` etc.) where `h` is bound.
+    if fact.hasLooseBVars then continue
+    if LeanDecomp.exprNodeCount fact > 400 then continue
     if Lean.Expr.find? (fun sub => sub.getAppFn.isConstOf ``eagerReduce) fact |>.isSome then
       continue
     let factTy ← Meta.inferType fact
@@ -173,9 +286,14 @@ private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
     let haveTac ← `(tactic| have $hIdent:ident : $factTyStx := $factStx)
     haveTacs := haveTacs.push haveTac
     count := count + 1
-  if haveTacs.isEmpty then return none
+  if haveTacs.isEmpty && synthHaves.isEmpty then return none
   let liaTac ← `(tactic| lia)
-  let candidate := memRws ++ haveTacs ++ #[liaTac]
+  -- Order matters: emit haves BEFORE memRws.  The `have` bodies often refer to
+  -- the original (un-rewritten) form of an lctx hypothesis (e.g.
+  -- `(mem_sdiff.mp mx).left` for L70's `c ≤ x` fact).  If memRws ran first,
+  -- mx would already be an And and `mem_sdiff.mp mx` wouldn't typecheck — the
+  -- whole block would silently fail validation.
+  let candidate := synthHaves ++ haveTacs ++ memRws ++ #[liaTac]
   if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
     return some (candidate, used)
   return none
@@ -207,11 +325,21 @@ def tryDecompEqMpIntLinearNormLe (expr : Expr) (lctx : LocalContext)
     let liaTac ← `(tactic| lia)
     if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] exprTy lctx localInsts then
       return some (#[liaTac], used)
+    -- Polynomial-denote form goals (`Int.Linear.Poly.denote' … ≤ 0`) come up
+    -- when this handler fires inside another peel (e.g. forall_congr +
+    -- implies_congr).  `lia` doesn't unfold the denote machinery on its own,
+    -- but `with_unfolding_all lia` reduces them to user form.
+    let unfoldLiaTac ← `(tactic| with_unfolding_all lia)
+    if ← LeanDecomp.candidateTacticsCloseGoal #[unfoldLiaTac] exprTy lctx localInsts then
+      return some (#[unfoldLiaTac], used)
     let memRws ← collectFinsetMemRewrites expr
     if memRws.isEmpty then return none
     let candidate := memRws ++ #[liaTac]
     if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
       return some (candidate, used)
+    let candidateUnfold := memRws ++ #[unfoldLiaTac]
+    if ← LeanDecomp.candidateTacticsCloseGoal candidateUnfold exprTy lctx localInsts then
+      return some (candidateUnfold, used)
     return none
 
 /-- `Eq.mp (Lean.Grind.iff_eq p q) (h : p ↔ q) : p = q`. -/
@@ -565,7 +693,15 @@ def tryDecompFinsetIntervalMembership (expr : Expr) (lctx : LocalContext)
     contradiction is via the arithmetic engine), preprocess Finset interval
     memberships in the lctx via `rw [Finset.mem_*] at <hyp>` and try `lia`.
     A single `lia` call after the rewrites avoids the per-leaf elaboration
-    cost of decomposing the structural contradiction. -/
+    cost of decomposing the structural contradiction.
+
+    Three escalating fallbacks:
+    1. bare `lia` — for when `lia` already sees enough.
+    2. `<memRws>; lia` — when Finset memberships need unfolding first.
+    3. `<memRws>; <haves from tryHavesPlusLia>; lia` — when the proof
+       additionally applies a forall hypothesis (`hs : ∀ x ∈ s, c ≤ x`) to
+       a membership witness; `lia` cannot specialise such hypotheses on its
+       own, so we precompute the specialisation as a `have` first. -/
 def tryDecompFalseFromLia (expr : Expr) (lctx : LocalContext)
     (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
   : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
@@ -577,10 +713,12 @@ def tryDecompFalseFromLia (expr : Expr) (lctx : LocalContext)
     if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] exprTy lctx localInsts then
       return some (#[liaTac], used)
     let memRws ← collectFinsetMemRewrites expr
-    if memRws.isEmpty then return none
-    let candidate := memRws ++ #[liaTac]
-    if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
-      return some (candidate, used)
+    if !memRws.isEmpty then
+      let candidate := memRws ++ #[liaTac]
+      if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
+        return some (candidate, used)
+    if let some r ← tryHavesPlusLia expr exprTy lctx localInsts used memRws then
+      return some r
     return none
 
 def handlers : List (Expr → LocalContext → LocalInstances → List String → DecompileCallback →

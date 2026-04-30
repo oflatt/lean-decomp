@@ -438,6 +438,8 @@ mutual
             LeanDecomp.tryDecompEqSymm body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqTrans body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqRecPropTransport body lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompEqMpForallCongr body lctx localInsts used decompileExpr,
+            LeanDecomp.tryDecompEqMpImpliesCongr body lctx localInsts used decompileExpr,
             LeanDecomp.tryDecompEqMp body lctx localInsts used decompileExpr,
             tryDecompFalseRec body lctx localInsts used,
             tryDecompFalseType body lctx localInsts used,

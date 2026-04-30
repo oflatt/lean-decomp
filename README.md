@@ -30,18 +30,34 @@ Readability is secondary to correctness. When the structural decompiler cannot s
 
 ## Top TODO
 
-1. **Try `decide` in `mkExactFallbackTactics` before `with_unfolding_all exact`** when the proof term contains `eagerReduce`.
-   - Background: `eagerReduce.{u} : {α} → α → α := fun a => a` is grind's identity-function kernel marker that forces eager unfolding under `with_unfolding_all`. It typically wraps a `(Eq.refl true : c.toBool = true)` certificate inside `Int.Linear.norm_le` (and similar) reflective normalizers.
-   - The current fallback emits `with_unfolding_all exact <giant>`. That re-runs the kernel reduction at re-elaboration time and is the dominant cost in Sum L70's `forall_congr` block.
-   - When the goal is decidable (which it is whenever an `eagerReduce`-wrapped certificate is the witness — those certificates are exactly `Decidable.decide ... = true`), `decide` runs the same reduction once and produces a much smaller residual term. Try `decide` first; fall back to `with_unfolding_all exact` only when `decide` does not validate.
-   - Implementation: `LeanDecomp/Helpers.lean`, in `mkExactFallbackTactics`, in the `containsEagerReduce` branch. Use `validateOrExact`-style validation rather than committing the tactic eagerly.
-2. **Snapshot tests for the decompiler output.** Today regressions on Sum L70 / Int L91 surface only as nightly elaboration timeouts. Locking down the generated tactic shape (line counts, presence/absence of `with_unfolding_all` blocks) in `LeanDecomp/Test.lean`-style `#guard_msgs` blocks would catch silent regressions before they hit nightly.
+1. **Sum L36 elaboration timeout.** The only remaining failure on `Mathlib/Algebra/Order/Group/Int/Sum.lean`. Same shape family as L70 (which now passes — see "Done" below): `apply sum_le_card_nsmul; grind` against a `∀ x ∈ s \ Ioc (c - #s) c, x ≤ c - #s` goal. Unlike L70 the user didn't pre-introduce the bound variable (`fun x mx ↦ ?_`), so grind emits the universal binder via `forall_congr` *inside* the proof term instead of relying on an outer lambda; the new `tryDecompEqMpForallCongr` should fire here but doesn't drop the proof under the 200k-heartbeat budget. Likely next step: inspect the partial decomp from `dump-nightly-sum/Mathlib/Algebra/Order/Group/Int/Sum/L36.decompile.query.lean` with `maxHeartbeats` cranked, then narrow the slow handler.
+2. **Snapshot tests for the decompiler output.** Tests 14/15 lock down the `Eq.mp (Eq.symm? (propext (Iff.intro f g))) ev → f/g ev` simplifier collapse; **Tests 16/17/18** (added 2026-04-30) now lock down the new `tryDecompEqMpForallCongr` (instantiated + universal) and `tryDecompEqMpImpliesCongr` (premise-applied) peelers. Still missing: snapshots for the actual Sum/Int *output shape* (not the simplifier inputs), since those depend on grind's emitted certificates and are version-sensitive.
 3. **Document the supported envelope.** The decompiler ships with a stable list of structural handlers (see *What Is Working* below) and a list of grind-specific specializations (see `Specialized/Grind.lean`). A short "what shapes do we handle" table near the top of the README would make it easier to predict whether a new failure is in scope.
+
+### Done: `forall_congr` / `implies_congr` peelers in `EqDecomp.lean`
+
+Two general (non-grind-specific) handlers that compose with the existing grind-specific leaf handler:
+
+- **`tryDecompEqMpForallCongr`** matches `Eq.mp (forall_congr <body>) <evidence>` (with optional trailing applications). Two cases:
+  - **Instantiated** (trailing args present, e.g. `… <ev> x mx`): emit `have h := <ev> x` and recurse on `Eq.mp (<body> x) h <remaining args>`. Fast path: if `lia` (or `with_unfolding_all lia`) closes the outer goal with the new `have` in the lctx, emit `have h := <ev> x; lia` directly — skipping the inner refine chain.
+  - **Universal** (no trailing args, goal is `∀ a, q a`): emit `intro x; have h := <ev> x; <recurse>`.
+- **`tryDecompEqMpImpliesCongr`** matches `Eq.mp (implies_congr p_eq q_eq) <evidence>` when `p_eq = Eq.refl`. Symmetric structure: instantiated case (trailing premise) emits `have h := <ev> hp; <recurse-or-lia>`; universal case emits `intro hp; have h := <ev> hp; <recurse>`.
+
+Both handlers also added a `have` step so downstream `lia` sees the user-form hypothesis in the lctx — without it, the application is just an expression invisible to lia.
+
+`tryDecompEqMpIntLinearNormLe` (in `Specialized/Grind.lean`) was extended with a `with_unfolding_all lia` fallback for cases where the goal is in polynomial-denote form (`Int.Linear.Poly.denote' … ≤ 0`) — happens when the leaf fires inside another peel.
+
+**Result on Sum L70**: now passes inside the default 200k-heartbeat budget. The decompile collapses to 7 lines: `apply Classical.byContradiction; intro hp; have h_fact := hs x (And.left (Finset.mem_sdiff.mp mx)); have h_fact_1 : (¬c + ↑(#s) ≤ x) = (x + (1 : ℤ) ≤ c + ↑(#s)) := Int.not_le_eq …; rw [Finset.mem_sdiff] at mx; rw [Finset.mem_Ico] at mx; lia`. The peeler's `lia` fast path closes the contradiction body directly with `h_fact` in the lctx — no outer `refine @Eq.mp <prop1> <prop2> ?_ ?_` chain on `propext (Iff.intro …)` shapes is generated, so the per-refine ~6.5s unification cost the previous bottleneck depended on never fires.
+
+### Done: `decide` swap in `mkExactFallbackTactics`
+
+Implemented in `LeanDecomp/Helpers.lean`. When the proof contains `eagerReduce` AND its inferred type is `(_ : Bool) = (true : Bool)` (the certificate shape), try `decide` before `with_unfolding_all exact`. Validates with `subproofTacticsCloseGoal`; falls back if `decide` doesn't close. Defensive: doesn't fire on the L70 forall_congr block (whose outer type is `∀ ...`, not `Bool = true`), so it didn't directly unblock L70/L36 — the L70 win came from the `forall_congr`/`implies_congr` peelers rerouting through `lia` instead of through the certificate fallback at all. Kept as a defensive change for future grind proofs that emit literal certificate-shaped fallbacks.
 
 ## Recommended Next Steps (after the top TODO)
 
 - **Extend the `MVarId.cases`-based per-branch decomp to generalized motives.** The current implementation falls back to a synthesized lctx when the casesOn motive carries a trailing `heq : disc = ctor xs` (i.e., proofs from `cases h : disc with`). The naive approach — `MVarId.generalize` with `hName?` to introduce both the abstracted fvar and the eq hyp, then `MVarId.cases`, then substitute `heq → real_eq_fvar` in the body — was tried and breaks `LeanDecomp.simple`: the old body's `Eq.rec` cleanup (substituting `heq → Eq.refl s` and stripping the resulting transport) turns out to be load-bearing for downstream handlers like `contradiction` and `noConfusion`, which consume the type-incorrect intermediate the cleanup produces. The right fix probably needs to either (a) keep the old cleanup but run the recursion in the new substituted lctx, or (b) drive the per-branch recursion through `evalTactic` of `cases h : disc with` syntax (using a synthetic outer mvar) so Lean's elaborator handles the transport natively. Multi-eq generalized motives (indexed inductive types) are a further extension.
-- **Add a function-leaf handler for `Eq.mp <forall_congr ...> <evidence>` patterns.** The single remaining `with_unfolding_all exact` block in Sum L70 has shape `Eq.mp.{0} (∀ x : T, P x → Q_user x) (∀ x : T, P x → Q_poly x) (forall_congr (fun x => implies_congr ...)) <evidence>` — a Pi-typed value transported through grind's polynomial-normalization `forall_congr` cast. A handler that detects this shape and emits `intro x hx; have h_user := <evidence> x hx; lia` would replace the whole leaf with ~3 lines of clean tactic. Estimated <60 LOC in `Specialized/Grind.lean`.
+<!-- forall_congr handler promoted to Top TODO. -->
+
 - **Apply the "single lia call" pattern wherever multiple sub-goals close arithmetically.** `tryDecompFinsetIntervalMembership` and `tryDecompFalseFromLia` are the current users. Any handler that currently emits per-branch `lia` is a candidate.
 - **Generalize `simplifyEqRecOfIdMotive` past the `a = True ∧ base = True.intro` restriction.** Rule was renamed in preparation but body is still narrow. Lifting the restriction caused `maximum recursion depth has been reached` errors before; retry with a more conservative generalization.
 - **Audit other `Lean.Grind.*` simplifier rewrites for type-correctness bugs** (the `of_eq_eq_true` precedent — the rewrite returned a proof of `a = b` for a lemma whose actual conclusion was `a ∧ b ∨ ¬a ∧ ¬b`).
@@ -71,9 +87,7 @@ For handler decisions that need a quick test of the goal but where validation wo
 
 The decompiler currently has two responses:
 - `tryDecompEagerReduce` (`Decompiler.lean`): when `eagerReduce` is the literal proof-term head, emit `decide`.
-- `mkExactFallbackTactics` (`Helpers.lean`): when an `eagerReduce` appears anywhere inside a fallback exact, wrap the whole fallback in `with_unfolding_all exact <term>` so re-elaboration triggers the same unfolding.
-
-The "top TODO" above is to try `decide` before `with_unfolding_all exact` in the second case — same kernel work, much smaller residual term.
+- `mkExactFallbackTactics` (`Helpers.lean`): when an `eagerReduce` appears anywhere inside a fallback exact, try `decide` first if the inferred type is `(_ : Bool) = (true : Bool)` (the certificate shape); otherwise wrap the fallback in `with_unfolding_all exact <term>` so re-elaboration triggers the same unfolding. See "Done: `decide` swap in `mkExactFallbackTactics`" above.
 
 ## Current Status
 
@@ -127,15 +141,15 @@ python scripts/nightly.py \
   --dump dump-nightly-sum --output results-nightly-sum.json
 ```
 
-Results:
+Results (2026-04-30):
 - `Mathlib/Algebra/Order/Group/Unbundled/Int.lean`: 5/5 (lines 47, 69, 76, 79, 91).
-- `Mathlib/Algebra/Order/Group/Int/Sum.lean`: 2/4 (55, 81 succeed; 36, 70 timeout).
+- `Mathlib/Algebra/Order/Group/Int/Sum.lean`: 3/4 (55, 70, 81 succeed; 36 timeout).
 
-Int L69 simplifies to `apply Classical.byContradiction; intro hp; lia`. L47/L76/L79/L91 decompile via byContradiction → outer `cases` over an `of_eq_eq_true`-shaped disjunction → inner `cases` of the resulting `And` → `tryDecompAbsCaseSplitContradiction` at each leaf.
+Int L69 simplifies to `apply Classical.byContradiction; intro hp; lia`. L47/L76/L79/L91 decompile via byContradiction → outer `cases` over an `of_eq_eq_true`-shaped disjunction → inner `cases` of the resulting `And` → `tryDecompAbsCaseSplitContradiction` at each leaf. Sum L70 collapses to a 7-line byContradiction + `have` + `rw` + `lia` block via the new `tryDecompEqMpForallCongr` lia fast path (see "Done" above).
 
 ### Main Open Blockers
 
-- **Sum L36 / L70 elaboration timeouts.** Decomposition produces structurally valid tactics (~140 lines for L70), but elaboration of the generated tactic exceeds the default 200k heartbeat budget. After the `MVarId.cases` refactor, wall time at 8M heartbeats dropped from ~25s to ~12s (substituted lctxs are smaller and faster to elaborate), but the heartbeat budget is still bounded by kernel `isDefEq`/`whnf` work in the **single remaining** `with_unfolding_all exact` block — an `Eq.mp.{0} (∀ x ∈ s, c ≤ x) (∀ x ∈ s, c + -1·x ≤ 0) (forall_congr ...) <evidence>` transport. The "top TODO" `decide` swap targets this block; the longer-term fix is the `forall_congr` handler listed under Recommended Next Steps.
+- **Sum L36 elaboration timeout.** Sole remaining failure on Sum.lean. Same `apply sum_le_card_nsmul; grind` family as L70 but the user didn't pre-bind the loop variable, so grind emits the universal binder inside the proof term. Despite the `forall_congr` peeler the candidate tactics still exceed the default 200k heartbeat budget. See Top TODO.
 - **No stage-3 tactic simplifier.** Successful decompiles still contain `have hOr : ... := by lia; cases hOr with | inl ⟨..⟩ => ...` boilerplate.
 
 ## Lessons Learned (selected)
@@ -159,6 +173,8 @@ These are the lessons most likely to bite future work; the full chronological lo
 - adding `simp` to generated proof output to close arithmetic subgoals
 - the previous `Lean.Grind.of_eq_eq_true` simplifier rewrite (returned a proof of the wrong type)
 - using `subproofTacticsCloseGoal` to validate `contradiction`-style tactics inside a handler — validation does not reproduce `cases`-introduced unification
+- **Decompiler-side beta-reduction of `Eq.mp (Eq.symm? (propext (Iff.intro fwd bwd))) base → fwd/bwd base`, intended to skip the slow `refine @Eq.mp <T1> <T2> ?_ ?_` block on Sum L70.** Implemented as `tryDecompPropExtIffTransport` between `tryDecompEqSymm` and `tryDecompEqRecPropTransport`. The handler fired correctly on the OUTER propext-Iff transport, but the substituted body still contained an inner non-propext transport (a `Eq.symm (congr (congrArg And eq1) eq2)` chain over polynomial-form ANDs). The recursion's eventual `lia` calls couldn't close their goals from the substituted-form hypotheses, validation failed, and the entire block fell back to `with_unfolding_all exact <giant>` — strictly worse than the unsimplified path's structural `refine @Eq.mp + Eq.symm + propext + constructor + intro + ⟨_,_⟩ + rw + lia` chain. Lesson: collapsing a transport at decompile time breaks `lia`'s view of the hypotheses unless the *entire* transport chain (including non-propext congr links) collapses too. Reverted; the slow refine on L70 stands.
+- **Generalizing `simplifyEqRecOfIdMotive` past `True`/`True.intro`** still hits `maximum recursion depth` on `LeanDecomp.Test` (test 7, the `n < 5 → n < 10` byContradiction shape). Gating by eq-proof head (`propext`/`Eq.symm`/`Eq.trans`/etc.) didn't help — the recursion-depth comes from somewhere downstream in the simplifier, not from a missing termination check on the new rule itself. Still on the Recommended Next Steps list as a target for a more careful generalization.
 
 ## Architecture Notes
 
