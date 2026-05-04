@@ -30,6 +30,31 @@ def run(cmd, **kwargs):
         sys.exit(proc.returncode)
 
 
+def _all_oleans_fresh(workspace: Path, mathlib: Path, lean_files: list[Path]) -> bool:
+    """Return True iff every target module's .olean is newer than its own
+    source .lean.
+
+    We DON'T include lean-decomp source mtimes here — mathlib modules don't
+    import lean-decomp, so editing `LeanDecomp/*.lean` doesn't invalidate
+    mathlib oleans.  (lean-decomp's own oleans are built by an earlier
+    `lake build LeanDecomp` step that always runs and is incremental.)
+
+    Skipping `lake build <Mathlib.X>` when this holds saves ~5–8s of lake
+    startup + manifest-parsing overhead per nightly invocation, which
+    dominates the per-run cost when the only edit is to lean-decomp.
+    Conservative: if anything is missing or any source is fresher than its
+    olean, return False and let lake do its incremental check. -/
+    """
+    olean_root = mathlib / ".lake" / "build" / "lib" / "lean"
+    for f in lean_files:
+        olean = olean_root / f.relative_to(mathlib).with_suffix(".olean")
+        if not olean.exists():
+            return False
+        if olean.stat().st_mtime < f.stat().st_mtime:
+            return False
+    return True
+
+
 def ensure_mathlib(workspace: Path):
     mathlib = workspace / MATHLIB_DIR
     if not mathlib.exists():
@@ -228,8 +253,11 @@ def main():
         str(f.relative_to(mathlib)).removesuffix(".lean").replace("/", ".")
         for f in lean_files
     ]
-    print(f"\nBuilding {len(modules)} module(s)...")
-    run(["lake", "build"] + modules, cwd=mathlib)
+    if _all_oleans_fresh(workspace, mathlib, lean_files):
+        print(f"\nBuilding {len(modules)} module(s)... [cached, skipping lake build]")
+    else:
+        print(f"\nBuilding {len(modules)} module(s)...")
+        run(["lake", "build"] + modules, cwd=mathlib)
 
     # Benchmark each file
     db = BenchDB()

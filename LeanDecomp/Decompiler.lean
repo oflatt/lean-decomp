@@ -121,36 +121,36 @@ private def isArithmeticLikeGoal (expr : Expr) : MetaM Bool := do
       containsArithmeticAutomationConst expr
 
 private def tryValidatedTerminalTactic (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (tac : TSyntax `tactic)
-    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (tac : TSyntax `tactic)
+    : DecompM (Option (Array (TSyntax `tactic))) := do
   let expectedType ← instantiateMVars (← Meta.inferType expr)
   if ← LeanDecomp.candidateTacticsCloseGoal #[tac] expectedType lctx localInsts then
-    return some (#[tac], used)
+    return some #[tac]
   return none
 
 private def tryDecompExactLocalHyp (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String)
-    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances)
+    : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let some fvarId := expr.fvarId? | return none
     let decl ← fvarId.getDecl
     let tac ← `(tactic| exact $(mkIdent decl.userName):ident)
-    return some (#[tac], used)
+    return some #[tac]
 
 private def tryDecompArithmeticTerminalPasses (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String)
-    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances)
+    : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     if !(← isArithmeticLikeGoal expr) then
       return none
     let liaTac ← `(tactic| lia)
-    if let some result ← tryValidatedTerminalTactic expr lctx localInsts used liaTac then
+    if let some result ← tryValidatedTerminalTactic expr lctx localInsts liaTac then
         return some result
     let orderTac ← `(tactic| grind_order)
-    if let some result ← tryValidatedTerminalTactic expr lctx localInsts used orderTac then
+    if let some result ← tryValidatedTerminalTactic expr lctx localInsts orderTac then
       return some result
     let linarithTac ← `(tactic| grind_linarith)
-    tryValidatedTerminalTactic expr lctx localInsts used linarithTac
+    tryValidatedTerminalTactic expr lctx localInsts linarithTac
 
 /-- Return `true` when the head of the application looks like a theorem-level
     proof constructor rather than data construction. This is intentionally broad:
@@ -183,20 +183,36 @@ private def firstSomeM [Monad m] (xs : List (m (Option α))) : m (Option α) := 
       return some res
   return none
 
+/-- Traced variant of `firstSomeM`: takes `(handlerName, action)` pairs, logs
+    a `trace[leanDecomp]` line per attempt with `✓` (matched) or `·` (skipped)
+    so the InfoView shows exactly which handlers fired at each recursion
+    point.  Cheap when `trace.leanDecomp` is off — Lean's trace machinery
+    short-circuits on the class flag.  Use as the dispatcher in
+    `decompileExpr` so the trace is one entry per handler at one indent
+    level per recursive call. -/
+private def tracedFirstSomeM (head : Expr)
+    (xs : List (String × DecompM (Option (Array (TSyntax `tactic)))))
+    : DecompM (Option (Array (TSyntax `tactic))) := do
+  for (name, x) in xs do
+    let r ← x
+    trace[leanDecomp] "{name}: {if r.isSome then "✓" else "·"}  head={head.getAppFn}"
+    if r.isSome then return r
+  return none
+
 private partial def tryDecompIffIntro (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+    : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let some args := matchConstApp? expr ``Iff.intro 4 | return none
     let fwd := args[2]!
     let bwd := args[3]!
     let constructorTac ← `(tactic| constructor)
-    let result ← LeanDecomp.emitTacticWithSubgoals constructorTac #[fwd, bwd] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals constructorTac #[fwd, bwd] lctx localInsts decompileExpr
     return some result
 
 private partial def tryDecompIffMpMpr (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+    : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     -- Iff.mp / Iff.mpr both take 4 args; try each.
     let (constName, args) ←
@@ -210,7 +226,7 @@ private partial def tryDecompIffMpMpr (expr : Expr) (lctx : LocalContext)
     let premiseProof := args[3]!
     let headIdent : Ident := ⟨mkIdent constName |>.raw.setInfo .none⟩
     let refineTac ← `(tactic| refine $headIdent:ident ?_ ?_)
-    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[iffProof, premiseProof] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[iffProof, premiseProof] lctx localInsts decompileExpr
     return some result
 
 /-- Handle `And.intro a b <pfA> <pfB>` by emitting `refine ⟨?_, ?_⟩` with the
@@ -223,8 +239,8 @@ private partial def tryDecompIffMpMpr (expr : Expr) (lctx : LocalContext)
     `And.intro a b ha hb` the natural decomp is `exact ⟨ha, hb⟩`, which the
     theorem-app fallback handles directly. Splitting those is just churn. -/
 private partial def tryDecompAndIntro (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+    : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     -- @And.intro takes {a b : Prop} (left : a) (right : b), so exactly 4 args.
     let some args := matchConstApp? expr ``And.intro 4 | return none
@@ -233,12 +249,12 @@ private partial def tryDecompAndIntro (expr : Expr) (lctx : LocalContext)
     let rightProof := args[3]!
     if leftProof.isFVar && rightProof.isFVar then return none
     let refineTac ← `(tactic| refine ⟨?_, ?_⟩)
-    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[leftProof, rightProof] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[leftProof, rightProof] lctx localInsts decompileExpr
     return some result
 
 private partial def tryDecompAndProj (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+    : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     -- @And.left/right takes {a b : Prop} (h : a ∧ b), so exactly 3 args.
     -- Let the applied case (extra args) fall through to the theorem-app fallback
@@ -254,18 +270,18 @@ private partial def tryDecompAndProj (expr : Expr) (lctx : LocalContext)
     let andProof := args[2]!
     let headIdent : Ident := ⟨mkIdent constName |>.raw.setInfo .none⟩
     let applyTac ← `(tactic| apply $headIdent:ident)
-    let result ← LeanDecomp.emitTacticWithSubgoals applyTac #[andProof] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals applyTac #[andProof] lctx localInsts decompileExpr
     return some result
 
 private partial def tryDecompPropext (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+    : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let some args := matchConstApp? expr ``propext 1 | return none
     let some iffProof := args.getLast? | return none
     let propextIdent : Ident := ⟨mkIdent ``propext |>.raw.setInfo .none⟩
     let applyTac ← `(tactic| apply $propextIdent:ident)
-    let result ← LeanDecomp.emitTacticWithSubgoals applyTac #[iffProof] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals applyTac #[iffProof] lctx localInsts decompileExpr
     return some result
 
 mutual
@@ -299,14 +315,14 @@ mutual
     a synthesized lctx.  Validation false-negatives are still possible there;
     `decompileOrExact` will silently degrade to `exact` when they bite. -/
   partial def decompileExpr (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Array (TSyntax `tactic) × List String) := do
+      (localInsts : LocalInstances) : DecompM (Array (TSyntax `tactic)) := do
     withLCtx lctx localInsts do
       Meta.lambdaTelescope expr fun xs body => do
         if xs.size > 0 then
           -- Use the current local context from inside lambdaTelescope
           let telescopeLctx ← getLCtx
           let telescopeInsts ← getLocalInstances
-          tryDecompIntro xs body telescopeLctx telescopeInsts used
+          tryDecompIntro xs body telescopeLctx telescopeInsts
         else
           -- Pure beta reduction for lambda-headed applications.
           -- lambdaTelescope's whnfD also does delta reduction (unfolding casesOn to rec),
@@ -362,63 +378,63 @@ mutual
           --     rather than blowing up to `apply h; · exact x`.
           -- If all handlers return `none`, dispatch falls through to
           -- `decompExact body used` (raw `exact` term emission).
-          let specialized? ← firstSomeM [
+          let specialized? ← tracedFirstSomeM body [
             -- Phase 1 — Pre
-            tryDecompExactLocalHyp body lctx localInsts used,
+            ("tryDecompExactLocalHyp", tryDecompExactLocalHyp body lctx localInsts),
             -- Phase 2 — Binder-introducing
-            tryDecompByContradiction body lctx localInsts used,
-            tryDecompCasesOn body lctx localInsts used decompileExpr assignIntroNames,
+            ("tryDecompByContradiction", tryDecompByContradiction body lctx localInsts),
+            ("tryDecompCasesOn", tryDecompCasesOn body lctx localInsts decompileExpr assignIntroNames),
             -- Phase 3 — Specialized
-            trySpecializedDecompHandlers body lctx localInsts used decompileExpr,
+            ("trySpecializedDecompHandlers", trySpecializedDecompHandlers body lctx localInsts decompileExpr),
             -- Phase 4 — Structural (propositional)
-            tryDecompPropext body lctx localInsts used decompileExpr,
-            tryDecompIffIntro body lctx localInsts used decompileExpr,
-            tryDecompIffMpMpr body lctx localInsts used decompileExpr,
-            tryDecompAndIntro body lctx localInsts used decompileExpr,
-            tryDecompAndProj body lctx localInsts used decompileExpr,
+            ("tryDecompPropext", tryDecompPropext body lctx localInsts decompileExpr),
+            ("tryDecompIffIntro", tryDecompIffIntro body lctx localInsts decompileExpr),
+            ("tryDecompIffMpMpr", tryDecompIffMpMpr body lctx localInsts decompileExpr),
+            ("tryDecompAndIntro", tryDecompAndIntro body lctx localInsts decompileExpr),
+            ("tryDecompAndProj", tryDecompAndProj body lctx localInsts decompileExpr),
             -- Phase 4 — Structural (equality / congruence)
-            LeanDecomp.tryDecompCongr body lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompCongrArg body lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompEqSymm body lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompEqTrans body lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompEqRecPropTransport body lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompEqMpForallCongr body lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompEqMpImpliesCongr body lctx localInsts used decompileExpr,
-            LeanDecomp.tryDecompEqMp body lctx localInsts used decompileExpr,
+            ("tryDecompCongr", LeanDecomp.tryDecompCongr body lctx localInsts decompileExpr),
+            ("tryDecompCongrArg", LeanDecomp.tryDecompCongrArg body lctx localInsts decompileExpr),
+            ("tryDecompEqSymm", LeanDecomp.tryDecompEqSymm body lctx localInsts decompileExpr),
+            ("tryDecompEqTrans", LeanDecomp.tryDecompEqTrans body lctx localInsts decompileExpr),
+            ("tryDecompEqRecPropTransport", LeanDecomp.tryDecompEqRecPropTransport body lctx localInsts decompileExpr),
+            ("tryDecompEqMpForallCongr", LeanDecomp.tryDecompEqMpForallCongr body lctx localInsts decompileExpr),
+            ("tryDecompEqMpImpliesCongr", LeanDecomp.tryDecompEqMpImpliesCongr body lctx localInsts decompileExpr),
+            ("tryDecompEqMp", LeanDecomp.tryDecompEqMp body lctx localInsts decompileExpr),
             -- Phase 5 — False / contradiction
-            tryDecompFalseRec body lctx localInsts used,
-            tryDecompFalseType body lctx localInsts used,
+            ("tryDecompFalseRec", tryDecompFalseRec body lctx localInsts),
+            ("tryDecompFalseType", tryDecompFalseType body lctx localInsts),
             -- Phase 6 — Term-shape
-            tryDecompLet body lctx localInsts used,
-            tryDecompBetaRedex body lctx localInsts used,
-            tryDecompEagerReduce body lctx localInsts used,
-            tryDecompEqRefl body lctx localInsts used,
-            tryDecompDecide body lctx localInsts used,
+            ("tryDecompLet", tryDecompLet body lctx localInsts),
+            ("tryDecompBetaRedex", tryDecompBetaRedex body lctx localInsts),
+            ("tryDecompEagerReduce", tryDecompEagerReduce body lctx localInsts),
+            ("tryDecompEqRefl", tryDecompEqRefl body lctx localInsts),
+            ("tryDecompDecide", tryDecompDecide body lctx localInsts),
             -- Phase 7 — Terminal arithmetic
-            tryDecompArithmeticTerminalPasses body lctx localInsts used,
+            ("tryDecompArithmeticTerminalPasses", tryDecompArithmeticTerminalPasses body lctx localInsts),
             -- Phase 8 — Theorem-app fallback
-            tryDecompTheoremAppFallback body lctx localInsts used
+            ("tryDecompTheoremAppFallback", tryDecompTheoremAppFallback body lctx localInsts)
           ]
           match specialized? with
           | some res => pure res
-          | none => decompExact body used
+          | none => decompExact body
 
   private partial def tryDecompIntro (xs : Array Expr) (body : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Array (TSyntax `tactic) × List String) := do
+      (localInsts : LocalInstances) : DecompM (Array (TSyntax `tactic)) := do
     withLCtx lctx localInsts do
-      let (introNames, newLctx, used') ← assignIntroNames xs used
+      let (introNames, newLctx) ← assignIntroNames xs
       let newLocalInsts ← getLocalInstances
-      let (bodyTactics, used'') ← decompileExpr body newLctx newLocalInsts used'
+      let bodyTactics ← decompileExpr body newLctx newLocalInsts
       let introTac ← if introNames.isEmpty then
           pure #[]
         else
           let idents := namesToIdents introNames
           let tac ← `(tactic| intro $[$idents]*)
           pure #[tac]
-      return (introTac ++ bodyTactics, used'')
+      return introTac ++ bodyTactics
 
   private partial def tryDecompByContradiction (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) : DecompM (Option (Array (TSyntax `tactic))) := do
     withLCtx lctx localInsts do
       let (fn, args) := peelArgs expr
       let some constName := Expr.constName? fn
@@ -435,7 +451,7 @@ mutual
           let some fvarId := binder.fvarId?
             | throwError "Unexpected non-fvar binder in byContradiction handler"
           let decl ← fvarId.getDecl
-          let (binderName, used') := chooseIntroName used.length decl.userName used
+          let binderName ← chooseIntroName (← getUsed).length decl.userName
           let renamedBinderLctx := lctxWithBinder.setUserName fvarId (Name.mkSimple binderName)
           let binderLocalInsts ← getLocalInstances
           let applied := Expr.app handler binder
@@ -444,25 +460,45 @@ mutual
           let byContradictionIdent : Ident := ⟨mkIdent ``Classical.byContradiction |>.raw.setInfo .none⟩
           let applyTac ← `(tactic| apply $byContradictionIdent:ident)
           let introTac ← `(tactic| intro $binderIdent:ident)
-          -- Prefer structural decompilation of the contradiction body before
-          -- trying arithmetic terminals like `lia`. This keeps contradiction-
-          -- shaped proofs stable and avoids collapsing non-arithmetic branches
-          -- into `lia` when the recursive handlers already know how to emit a
-          -- more faithful script.
-          try
-            let (bodyTactics, used'') ← decompileExpr applied renamedBinderLctx binderLocalInsts used'
-            let candidate := #[applyTac, introTac] ++ bodyTactics
-            let exprTy ← instantiateMVars (← Meta.inferType expr)
+          let exprTy ← instantiateMVars (← Meta.inferType expr)
+          let savedUsed ← getUsed
+          -- Phase A — specialized handler short-circuit.  When grind's
+          -- contradiction body is something like a deeply-nested `Or.casesOn`
+          -- tree that ultimately resolves to an `abs`-case-split or a single
+          -- `lia` (think Int L47 — `natAbs |a| = natAbs a`), the structural
+          -- recursion below would emit ~50 lines of nested `cases hOr_N`
+          -- with 6+ inner `lia` calls.  But our specialized handlers
+          -- (`tryDecompAbsCaseSplitContradiction`, `tryDecompFalseFromLia`,
+          -- etc.) can recognize the OUTER shape and emit a flat 5-line
+          -- equivalent.  Try them first — if the candidate validates,
+          -- skip the structural recursion entirely.  Big wins on
+          -- arithmetic-leaf contradictions where grind's case-split tree
+          -- is decoration over a single decidable predicate.
+          if let some branchTactics ←
+              trySpecializedDecompHandlers applied renamedBinderLctx binderLocalInsts decompileExpr then
+            let candidate := #[applyTac, introTac] ++ branchTactics
             if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
-              return some (candidate, used'')
+              return some candidate
+            set savedUsed
+          -- Phase B — structural decompilation of the contradiction body.
+          -- Keeps contradiction-shaped proofs stable when no specialized
+          -- handler matches the outer shape.
+          try
+            let bodyTactics ← decompileExpr applied renamedBinderLctx binderLocalInsts
+            let candidate := #[applyTac, introTac] ++ bodyTactics
+            if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
+              return some candidate
           catch _ =>
-            pure ()
-          if let some (branchTactics, used'') ←
-              tryDecompArithmeticTerminalPasses applied renamedBinderLctx binderLocalInsts used' then
-            return some (#[applyTac, introTac] ++ branchTactics, used'')
-          let result ← LeanDecomp.validateOrExact expr lctx localInsts used do
-            let (bodyTactics, used'') ← decompileExpr applied renamedBinderLctx binderLocalInsts used'
-            return (#[applyTac, introTac] ++ bodyTactics, used'')
+            set savedUsed
+          set savedUsed
+          -- Phase C — arithmetic terminal fallback (`lia` / `grind_order` / etc).
+          if let some branchTactics ←
+              tryDecompArithmeticTerminalPasses applied renamedBinderLctx binderLocalInsts then
+            return some (#[applyTac, introTac] ++ branchTactics)
+          -- Phase D — final fallback through validateOrExact.
+          let result ← LeanDecomp.validateOrExact expr lctx localInsts do
+            let bodyTactics ← decompileExpr applied renamedBinderLctx binderLocalInsts
+            return #[applyTac, introTac] ++ bodyTactics
           return some result
         else
           return none
@@ -471,52 +507,52 @@ mutual
       For fvar arguments, emit a let binding for readability.
       For non-fvar arguments, beta-reduce and recurse. -/
   private partial def tryDecompBetaRedex (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) : DecompM (Option (Array (TSyntax `tactic))) := do
     withLCtx lctx localInsts do
       let .app fn arg := expr | return none
       let .lam binderName binderType body _binderInfo := fn | return none
       if let some argFvarId := arg.fvarId? then
         let argDecl ← argFvarId.getDecl
         let argName := argDecl.userName
-        let letBinderName := binderBaseName used.length binderName
+        let letBinderName := binderBaseName (← getUsed).length binderName
         let letBinderId := FVarId.mk (← mkFreshId)
         let newLctx := lctx.mkLetDecl letBinderId (Name.mkSimple letBinderName) binderType arg
         let newLocalInsts ← getLocalInstances
-        let used' := letBinderName :: used
+        addUsed letBinderName
         let newBody := body.instantiate1 (Expr.fvar letBinderId)
-        let (bodyTactics, used'') ← decompileExpr newBody newLctx newLocalInsts used'
+        let bodyTactics ← decompileExpr newBody newLctx newLocalInsts
         let letBinderIdent := mkIdent (Name.mkSimple letBinderName)
         let argIdent := mkIdent argName
         let letTac ← `(tactic| let $letBinderIdent := $argIdent)
-        return some (#[letTac] ++ bodyTactics, used'')
+        return some (#[letTac] ++ bodyTactics)
       else
         let reduced := body.instantiate1 arg
-        let (tactics, used') ← decompileExpr reduced lctx localInsts used
-        return some (tactics, used')
+        let tactics ← decompileExpr reduced lctx localInsts
+        return some tactics
 
   /-- Handle let-expressions by introducing tactic-level `let` bindings, then
       recursively decompiling the body in the extended local context. This keeps
       low-level proof terms readable and exposes theorem applications hidden at
       the end of let-heavy generated terms. -/
   private partial def tryDecompLet (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) : DecompM (Option (Array (TSyntax `tactic))) := do
     withLCtx lctx localInsts do
       let .letE binderName _binderType value body _ := expr | return none
-      let (letName, used') := chooseIntroName used.length binderName used
+      let letName ← chooseIntroName (← getUsed).length binderName
       let letFVarId := FVarId.mk (← mkFreshId)
       let letDeclName := Name.mkSimple letName
       let newLctx := lctx.mkLetDecl letFVarId letDeclName (← Meta.inferType value) value
       let newBody := body.instantiate1 (Expr.fvar letFVarId)
       let valueStx ← delabToRefinableSyntax value
       let letTac ← `(tactic| let $(mkIdent letDeclName):ident := $valueStx)
-      let (bodyTactics, used'') ← withLCtx newLctx localInsts do
+      let bodyTactics ← withLCtx newLctx localInsts do
         let newLocalInsts ← getLocalInstances
-        decompileExpr newBody newLctx newLocalInsts used'
-      return some (#[letTac] ++ bodyTactics, used'')
+        decompileExpr newBody newLctx newLocalInsts
+      return some (#[letTac] ++ bodyTactics)
 
   /-- Handle `False.rec`, `False.elim`, and `False.casesOn` terms. -/
   private partial def tryDecompFalseRec (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) : DecompM (Option (Array (TSyntax `tactic))) := do
     withLCtx lctx localInsts do
       let (fn, args) := peelArgs expr
       let some constName := Expr.constName? fn
@@ -546,7 +582,7 @@ mutual
         let h'Stx ← delabToRefinableSyntax h'
         let absurdId := mkIdent ``absurd
         let tac ← `(tactic| exact $absurdId $hStx $h'Stx)
-        return some (#[tac], used)
+        return some #[tac]
 
       -- Best case: contradiction hypothesis is already a local variable.
       if let some falseFVarId := falseArg.fvarId? then
@@ -554,7 +590,7 @@ mutual
         let hFalseTarget : TSyntax `Lean.Parser.Tactic.elimTarget ←
           `(Lean.Parser.Tactic.elimTarget| $(mkIdent decl.userName):ident)
         let casesTac ← `(tactic| cases $hFalseTarget)
-        return some (#[casesTac], used)
+        return some #[casesTac]
 
       -- `contradiction` only meaningfully closes a `False` goal; for any other
       -- goal type (typically when `False.elim` is being used polymorphically
@@ -565,41 +601,41 @@ mutual
       let exprTy ← Meta.inferType expr
       unless exprTy.isConstOf ``False do return none
       let contradictionTac ← `(tactic| contradiction)
-      return some (#[contradictionTac], used)
+      return some #[contradictionTac]
 
   /-- Handle `of_decide_eq_true` — emit `decide`.
       `decide` elaborates to `of_decide_eq_true <proof>`, so we recognize
       this pattern and replace the entire term with the `decide` tactic. -/
   private partial def tryDecompDecide (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) : DecompM (Option (Array (TSyntax `tactic))) := do
     withLCtx lctx localInsts do
       let (fn, _) := peelArgs expr
       let some constName := fn.constName? | return none
       if constName != ``of_decide_eq_true then return none
       let tac ← `(tactic| decide)
-      return some (#[tac], used)
+      return some #[tac]
 
   /-- `eagerReduce` is a proof-producing reduction wrapper used in low-level
       Grind certificates. At tactic level, `decide` is a much smaller proof of
       the resulting reducible proposition. -/
   private partial def tryDecompEagerReduce (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) : DecompM (Option (Array (TSyntax `tactic))) := do
     withLCtx lctx localInsts do
       let (fn, _) := peelArgs expr
       let some constName := fn.constName? | return none
       if constName != ``eagerReduce then return none
       let tac ← `(tactic| decide)
-      return some (#[tac], used)
+      return some #[tac]
 
   /-- `Eq.refl` proof terms are better rendered as `rfl`. -/
   private partial def tryDecompEqRefl (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) : DecompM (Option (Array (TSyntax `tactic))) := do
     withLCtx lctx localInsts do
       let (fn, _) := peelArgs expr
       let some constName := fn.constName? | return none
       if constName != ``Eq.refl then return none
       let tac ← `(tactic| rfl)
-      return some (#[tac], used)
+      return some #[tac]
 
   /-- Late fallback for theorem applications (Phase 8): refine with holes for
       proof arguments, then solve each generated subgoal recursively. Keeps
@@ -620,7 +656,7 @@ mutual
       `Int.Linear.*` fire the refine-with-subgoals shape so each subgoal
       can be tried individually. -/
   private partial def tryDecompTheoremAppFallback (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) : DecompM (Option (Array (TSyntax `tactic))) := do
     withLCtx lctx localInsts do
       let (fn, args) := peelArgs expr
       if args.isEmpty then
@@ -676,14 +712,14 @@ mutual
             `(tactic| apply $headTerm)
           else
             `(tactic| refine $delabTerm)
-        let result ← LeanDecomp.emitTacticWithSubgoals headTac proofArgs lctx localInsts used decompileExpr
+        let result ← LeanDecomp.emitTacticWithSubgoals headTac proofArgs lctx localInsts decompileExpr
         return some result
 
       if let some headName := headName? then
         let notationTerm ← theoremAppToNotationTermSyntax headName args proofLikeMask
         if ← refineTacMatchesProofArgs notationTerm exprTy proofArgs lctx localInsts then
           let refineTac ← `(tactic| refine $notationTerm)
-          let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts used decompileExpr
+          let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts decompileExpr
           return some result
 
       let compactTerm ←
@@ -696,7 +732,7 @@ mutual
         else
           pure compactTerm
       let refineTac ← `(tactic| refine $refineTerm)
-      let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts used decompileExpr
+      let result ← LeanDecomp.emitTacticWithSubgoals refineTac proofArgs lctx localInsts decompileExpr
       return some result
 
   /-- The final exact fallback. When the term carries grind's `eagerReduce`
@@ -706,21 +742,20 @@ mutual
       because `propext` / `Iff.intro` bodies elaborate fine with regular
       delab and pp.all makes them dramatically slower to re-check (they fully
       expand instances).  See `ExactStrategyConfig`. -/
-  private partial def decompExact (body : Expr) (used : List String) :
-      TacticM (Array (TSyntax `tactic) × List String) := do
-    let tacs ← LeanDecomp.chooseExactStrategy body (← getLCtx) (← getLocalInstances) {
+  private partial def decompExact (body : Expr) :
+      DecompM (Array (TSyntax `tactic)) := do
+    LeanDecomp.chooseExactStrategy body (← getLCtx) (← getLocalInstances) {
       enforceMaxSize := false
       tryDecideFirst := false
       forcePrettyPrint := fun _ => false
     }
-    return (tacs, used)
 
   /-- Handle any expression whose type is `False` — emit `contradiction`.
       Only fires when the local context contains an obvious contradiction
       (a `False` hypothesis, or `h : P` and `h' : ¬P`). This avoids emitting
       `contradiction` for complex proof terms where it can't close the goal. -/
   private partial def tryDecompFalseType (expr : Expr) (lctx : LocalContext)
-      (localInsts : LocalInstances) (used : List String) : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+      (localInsts : LocalInstances) : DecompM (Option (Array (TSyntax `tactic))) := do
     withLCtx lctx localInsts do
       let exprTy ← Meta.inferType expr
       if !exprTy.isConstOf ``False then return none
@@ -750,13 +785,13 @@ mutual
           posHyps := posHyps.push ty
       if hasFalse then
         let contradictionTac ← `(tactic| contradiction)
-        return some (#[contradictionTac], used)
+        return some #[contradictionTac]
       -- Check for P/¬P pair
       for neg in negHyps do
         for pos in posHyps do
           if (← Meta.isDefEq pos neg) then
             let contradictionTac ← `(tactic| contradiction)
-            return some (#[contradictionTac], used)
+            return some #[contradictionTac]
       return none
 
 end

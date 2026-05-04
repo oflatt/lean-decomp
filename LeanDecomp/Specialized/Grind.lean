@@ -12,8 +12,8 @@ open LeanDecomp (peelArgs)
     the inner proof already has the goal type. This is grind-specific today, so
     it lives in the grind specialization package rather than the core decompiler. -/
 def tryDecompEqMpAutomationCast (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   let some args := LeanDecomp.matchConstApp? expr ``Eq.mp 4 | return none
   let eqProof := args[2]!
   let inner := args[3]!
@@ -25,8 +25,8 @@ def tryDecompEqMpAutomationCast (expr : Expr) (lctx : LocalContext)
     let goalType ← Meta.inferType expr
     let innerType ← Meta.inferType innerWithArgs
     if ← Meta.isDefEq goalType innerType then
-      let (tactics, used') ← LeanDecomp.decompileOrExact innerWithArgs lctx localInsts used decompileExpr
-      return some (tactics, used')
+      let tactics ← LeanDecomp.decompileOrExact innerWithArgs lctx localInsts decompileExpr
+      return some tactics
     return none
 
 /-- Peel `Eq.mp <named-grind-cast> inner`: when the cast is a fully-applied
@@ -35,9 +35,9 @@ def tryDecompEqMpAutomationCast (expr : Expr) (lctx : LocalContext)
     delabbing it inline avoids a recursive descent into a structural cast that
     the generic `tryDecompEqMp` would otherwise do. -/
 private def tryDecompEqMpKnownGrindCast (castName : Name) (expr : Expr)
-    (lctx : LocalContext) (localInsts : LocalInstances) (used : List String)
+    (lctx : LocalContext) (localInsts : LocalInstances)
     (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   let some args := LeanDecomp.matchConstApp? expr ``Eq.mp 4 | return none
   let castProof := args[2]!
   let inner := args[3]!
@@ -46,7 +46,7 @@ private def tryDecompEqMpKnownGrindCast (castName : Name) (expr : Expr)
     let castStx ← delabToRefinableSyntax castProof
     let eqMpIdent : Ident := ⟨mkIdent ``Eq.mp |>.raw.setInfo .none⟩
     let headTac ← `(tactic| refine $eqMpIdent:ident $castStx ?_)
-    let result ← LeanDecomp.emitTacticWithSubgoals headTac #[inner] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals headTac #[inner] lctx localInsts decompileExpr
     return some result
 
 /-- Walk a proof term for occurrences of `Finset.mem_<Shape>.mp <fvar>` (which
@@ -203,8 +203,7 @@ private def isArithLeafGoal (ty : Expr) : MetaM Bool := do
   let some n := fn.constName? | return false
   return n == ``LE.le || n == ``LT.lt || n == ``GE.ge || n == ``GT.gt || n == ``Eq
 
-private def synthesizeForallMembershipHaves
-    (used : List String) : TacticM (Array (TSyntax `tactic) × List String) := do
+private def synthesizeForallMembershipHaves : DecompM (Array (TSyntax `tactic)) := do
   let lctx ← getLCtx
   let mut foralls : Array (FVarId × Expr) := #[]
   for decl in lctx do
@@ -224,7 +223,6 @@ private def synthesizeForallMembershipHaves
     if let some sArg := sArg? then
       foralls := foralls.push (decl.fvarId, sArg)
   let mut tacs : Array (TSyntax `tactic) := #[]
-  let mut used := used
   for (hsFvarId, hsSet) in foralls do
     let hsName := (← hsFvarId.getDecl).userName
     let hsIdent : Ident := mkIdent hsName
@@ -243,13 +241,13 @@ private def synthesizeForallMembershipHaves
       let elemName := (← elemFvarId.getDecl).userName
       let elemIdent : Ident := mkIdent elemName
       let mxIdent : Ident := mkIdent decl.userName
-      let hName := LeanDecomp.mkUniqueName "h_fact" used
+      let hName := LeanDecomp.mkUniqueName "h_fact" (← LeanDecomp.getUsed)
       let hIdent : Ident := mkIdent (Name.mkSimple hName)
       -- Direct match: `mx : elem ∈ s` with s defeq hsSet.
       if (← Meta.isDefEq setArg hsSet) then
         let tac ← `(tactic| have $hIdent:ident := $hsIdent:ident $elemIdent:ident $mxIdent:ident)
         tacs := tacs.push tac
-        used := hName :: used
+        LeanDecomp.addUsed hName
         continue
       -- sdiff match: `mx : elem ∈ <s> \ <T>` with s defeq hsSet.
       let setSubArgs := setArg.getAppArgs
@@ -267,8 +265,8 @@ private def synthesizeForallMembershipHaves
               $hsIdent:ident $elemIdent:ident
                 ($andLeftIdent:ident ($memSdiffMpIdent:ident $mxIdent:ident)))
           tacs := tacs.push tac
-          used := hName :: used
-  return (tacs, used)
+          LeanDecomp.addUsed hName
+  return tacs
 
 /-- Try `lia` after introducing each extracted "interesting" sub-fact of the
     proof as a `have`. This handles leaves whose proof applies a forall hyp
@@ -276,8 +274,8 @@ private def synthesizeForallMembershipHaves
     hypotheses on its own, so we precompute the result via `have` before
     handing the goal to `lia`. -/
 private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (memRws : Array (TSyntax `tactic))
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (memRws : Array (TSyntax `tactic))
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   -- Only attempt this for moderately-sized proofs. Walking and delabbing all
   -- subterms of giant proofs is itself expensive; the handler is intended for
   -- arithmetic leaves where `lia` failed but a small set of forall-membership
@@ -291,8 +289,7 @@ private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
   -- these (grind splits them across multiple App nodes, e.g.
   -- `Eq.mp <forall_congr ...> hs y mem_arg`), but they're often the
   -- highest-leverage user-form bound for `lia`.
-  let (synthHaves, used) ← withLCtx lctx localInsts <|
-    synthesizeForallMembershipHaves used
+  let synthHaves ← withLCtx lctx localInsts synthesizeForallMembershipHaves
   let facts ← LeanDecomp.extractGrindFacts expr
   if facts.isEmpty && synthHaves.isEmpty then return none
   -- Only keep facts that:
@@ -308,7 +305,6 @@ private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
     | some n => n == ``LE.le || n == ``LT.lt || n == ``GE.ge || n == ``GT.gt || n == ``Eq
     | none => false
   let mut haveTacs : Array (TSyntax `tactic) := #[]
-  let mut used := used
   let mut count := 0
   for fact in facts do
     if count >= 4 then break
@@ -331,8 +327,8 @@ private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
         (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
         Lean.Meta.Tactic.TryThis.delabToRefinableSyntax factTy
     catch _ => continue
-    let hName := LeanDecomp.mkUniqueName "h_fact" used
-    used := hName :: used
+    let hName := LeanDecomp.mkUniqueName "h_fact" (← LeanDecomp.getUsed)
+    LeanDecomp.addUsed hName
     let hIdent : Ident := mkIdent (Name.mkSimple hName)
     let haveTac ← `(tactic| have $hIdent:ident : $factTyStx := $factStx)
     haveTacs := haveTacs.push haveTac
@@ -346,7 +342,7 @@ private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
   -- whole block would silently fail validation.
   let candidate := synthHaves ++ haveTacs ++ memRws ++ #[liaTac]
   if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
-    return some (candidate, used)
+    return some candidate
   return none
 
 /-- `Eq.mp (Int.Linear.norm_le ...) <ev>` produces a user-form arithmetic
@@ -361,8 +357,8 @@ private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
     `rw [Finset.mem_*] at <hyp>` before retrying — `lia` does not unfold
     Finset membership lemmas. -/
 def tryDecompEqMpIntLinearNormLe (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (_decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   let some args := LeanDecomp.matchConstApp? expr ``Eq.mp 4 | return none
   let castProof := args[2]!
   let some _ := LeanDecomp.matchConstApp? castProof ``Int.Linear.norm_le 0 | return none
@@ -370,49 +366,49 @@ def tryDecompEqMpIntLinearNormLe (expr : Expr) (lctx : LocalContext)
     let exprTy ← Meta.inferType expr
     let liaTac ← `(tactic| lia)
     if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] exprTy lctx localInsts then
-      return some (#[liaTac], used)
+      return some #[liaTac]
     -- Polynomial-denote form goals (`Int.Linear.Poly.denote' … ≤ 0`) come up
     -- when this handler fires inside another peel (e.g. forall_congr +
     -- implies_congr).  `lia` doesn't unfold the denote machinery on its own,
     -- but `with_unfolding_all lia` reduces them to user form.
     let unfoldLiaTac ← `(tactic| with_unfolding_all lia)
     if ← LeanDecomp.candidateTacticsCloseGoal #[unfoldLiaTac] exprTy lctx localInsts then
-      return some (#[unfoldLiaTac], used)
+      return some #[unfoldLiaTac]
     let memRws ← collectFinsetMemRewrites expr
     if memRws.isEmpty then return none
     let candidate := memRws ++ #[liaTac]
     if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
-      return some (candidate, used)
+      return some candidate
     let candidateUnfold := memRws ++ #[unfoldLiaTac]
     if ← LeanDecomp.candidateTacticsCloseGoal candidateUnfold exprTy lctx localInsts then
-      return some (candidateUnfold, used)
+      return some candidateUnfold
     return none
 
 /-- `Eq.mp (Lean.Grind.iff_eq p q) (h : p ↔ q) : p = q`. -/
 def tryDecompEqMpIffEq (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) :=
-  tryDecompEqMpKnownGrindCast ``Lean.Grind.iff_eq expr lctx localInsts used decompileExpr
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) :=
+  tryDecompEqMpKnownGrindCast ``Lean.Grind.iff_eq expr lctx localInsts decompileExpr
 
 /-- `Eq.mp (Lean.Grind.not_eq_prop p q) (h : ¬p = q) : p = ¬q`. -/
 def tryDecompEqMpNotEqProp (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) :=
-  tryDecompEqMpKnownGrindCast ``Lean.Grind.not_eq_prop expr lctx localInsts used decompileExpr
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) :=
+  tryDecompEqMpKnownGrindCast ``Lean.Grind.not_eq_prop expr lctx localInsts decompileExpr
 
 /-- `mt` takes an implication proof as a function-typed argument, so the generic
     theorem-app fallback treats it as an ordinary term and embeds it raw. Expose
     both arguments as subgoals instead so the decompiler can recurse into the
     implication proof structurally. -/
 def tryDecompMt (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   let some args := LeanDecomp.matchConstApp? expr ``mt 4 | return none
   let impProof := args[2]!
   let negProof := args[3]!
   let mtIdent : Ident := ⟨mkIdent ``mt |>.raw.setInfo .none⟩
   let headTac ← `(tactic| apply $mtIdent:ident)
-  let result ← LeanDecomp.emitTacticWithSubgoals headTac #[impProof, negProof] lctx localInsts used decompileExpr
+  let result ← LeanDecomp.emitTacticWithSubgoals headTac #[impProof, negProof] lctx localInsts decompileExpr
   return some result
 
 /-- Collect arguments of `abs.eq_1 x` subterms. grind's proof terms use
@@ -545,8 +541,8 @@ private def findHypsWithAbsOf (x : Expr) : MetaM (List Name) := do
     `rw [abs_of_<sign> h] at <hyps>; lia`. This turns grind's opaque `abs`
     unfolding chain into a clean rewrite that `lia` can close. -/
 def tryDecompAbsLeaf (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (_decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let absArgs := collectAbsEq1Args expr
     if absArgs.isEmpty then return none
@@ -574,10 +570,10 @@ def tryDecompAbsLeaf (expr : Expr) (lctx : LocalContext)
     let exprTy ← Meta.inferType expr
     let cand1 := rwTacs ++ #[liaTac]
     if ← LeanDecomp.candidateTacticsCloseGoal cand1 exprTy lctx localInsts then
-      return some (cand1, used)
+      return some cand1
     let cand2 := rwTacs ++ #[rwGoalTac, liaTac]
     if ← LeanDecomp.candidateTacticsCloseGoal cand2 exprTy lctx localInsts then
-      return some (cand2, used)
+      return some cand2
     return none
 
 /-- When the goal is `False` and the local context contains a hypothesis whose
@@ -587,8 +583,8 @@ def tryDecompAbsLeaf (expr : Expr) (lctx : LocalContext)
     proof term, which lets it discharge `Int.Linear.*` arithmetic certificates
     whose end result is False but which never explicitly unfold abs. -/
 def tryDecompAbsCaseSplitContradiction (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (_decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let exprTy ← Meta.inferType expr
     unless exprTy.isConstOf ``False do return none
@@ -614,7 +610,7 @@ def tryDecompAbsCaseSplitContradiction (expr : Expr) (lctx : LocalContext)
     let xStx ← delabToRefinableSyntax x
     let xTy ← Meta.inferType x
     let xTyStx ← delabToRefinableSyntax xTy
-    let hName := LeanDecomp.mkUniqueName "h_abs" used
+    let hName := LeanDecomp.mkUniqueName "h_abs" (← LeanDecomp.getUsed)
     let hIdent : Ident := mkIdent (Name.mkSimple hName)
     let nonposLemma : Ident := mkIdent `abs_of_nonpos
     let posLemma : Ident := mkIdent `abs_of_pos
@@ -638,7 +634,8 @@ def tryDecompAbsCaseSplitContradiction (expr : Expr) (lctx : LocalContext)
     let byCasesTac ← `(tactic| by_cases $hIdent:ident : ($xStx : $xTyStx) ≤ 0)
     let cand : Array (TSyntax `tactic) := #[byCasesTac, nonposBlock, posBlock]
     if ← LeanDecomp.candidateTacticsCloseGoal cand exprTy lctx localInsts then
-      return some (cand, hName :: used)
+      LeanDecomp.addUsed hName
+      return some cand
     return none
 
 /-- When the goal is `x ∈ Finset.<Interval> a b` for an arithmetic interval
@@ -653,8 +650,8 @@ def tryDecompAbsCaseSplitContradiction (expr : Expr) (lctx : LocalContext)
     discharge the resulting arithmetic from the local hypotheses, the handler
     returns `none` and dispatch falls through. -/
 def tryDecompFinsetIntervalMembership (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (_decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let exprTy ← Meta.inferType expr
     let (fn, args) := peelArgs exprTy
@@ -729,7 +726,7 @@ def tryDecompFinsetIntervalMembership (expr : Expr) (lctx : LocalContext)
     let memRws ← collectFinsetMemRewrites expr
     let cand := memRws.push rwTac |>.push liaTac
     if ← LeanDecomp.candidateTacticsCloseGoal cand exprTy lctx localInsts then
-      return some (cand, used)
+      return some cand
     return none
 
 /-- When the goal is `False` and the proof carries grind automation (so the
@@ -746,26 +743,26 @@ def tryDecompFinsetIntervalMembership (expr : Expr) (lctx : LocalContext)
        a membership witness; `lia` cannot specialise such hypotheses on its
        own, so we precompute the specialisation as a `have` first. -/
 def tryDecompFalseFromLia (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (_decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (_decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let exprTy ← Meta.inferType expr
     unless exprTy.isConstOf ``False do return none
     unless LeanDecomp.containsAutomationInternals expr do return none
     let liaTac ← `(tactic| lia)
     if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] exprTy lctx localInsts then
-      return some (#[liaTac], used)
+      return some #[liaTac]
     let memRws ← collectFinsetMemRewrites expr
     if !memRws.isEmpty then
       let candidate := memRws ++ #[liaTac]
       if ← LeanDecomp.candidateTacticsCloseGoal candidate exprTy lctx localInsts then
-        return some (candidate, used)
-    if let some r ← tryHavesPlusLia expr exprTy lctx localInsts used memRws then
+        return some candidate
+    if let some r ← tryHavesPlusLia expr exprTy lctx localInsts memRws then
       return some r
     return none
 
-def handlers : List (Expr → LocalContext → LocalInstances → List String → DecompileCallback →
-    TacticM (Option (Array (TSyntax `tactic) × List String))) := [
+def handlers : List (Expr → LocalContext → LocalInstances → DecompileCallback →
+    DecompM (Option (Array (TSyntax `tactic)))) := [
   tryDecompFinsetIntervalMembership,
   tryDecompFalseFromLia,
   tryDecompEqMpIntLinearNormLe,

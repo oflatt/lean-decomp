@@ -9,18 +9,18 @@ open Lean Elab Meta Tactic
     decompiler and are intended for package-specific logic such as grind-only
     proof-term cleanup. -/
 abbrev SpecializedDecompHandler :=
-  Expr → LocalContext → LocalInstances → List String → DecompileCallback →
-    TacticM (Option (Array (TSyntax `tactic) × List String))
+  Expr → LocalContext → LocalInstances → DecompileCallback →
+    DecompM (Option (Array (TSyntax `tactic)))
 
 def specializedDecompHandlers : List SpecializedDecompHandler :=
   LeanDecomp.Specialized.Grind.handlers
 
 /-- Run specialized handlers in order, returning the first successful result. -/
 def trySpecializedDecompHandlers (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   for handler in specializedDecompHandlers do
-    if let some result ← handler expr lctx localInsts used decompileExpr then
+    if let some result ← handler expr lctx localInsts decompileExpr then
       return some result
   return none
 

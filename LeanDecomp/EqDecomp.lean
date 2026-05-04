@@ -146,8 +146,8 @@ where
 
 /-- Handle `congr` by naming function/argument equalities and recombining them. -/
 def tryDecompCongr (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let some args := matchConstApp? expr ``congr 2 | return none
     let hEqFn := args[args.length - 2]!
@@ -155,13 +155,13 @@ def tryDecompCongr (expr : Expr) (lctx : LocalContext)
     let some _ ← inferEqType? hEqFn | return none
     let some _ ← inferEqType? hEqArg | return none
     let refineTac ← `(tactic| refine $(mkIdent ``congr) ?_ ?_)
-    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[hEqFn, hEqArg] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[hEqFn, hEqArg] lctx localInsts decompileExpr
     return some result
 
 /-- Handle `congrArg` by naming the input equality and applying `congrArg`. -/
 def tryDecompCongrArg (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let some args := matchConstApp? expr ``congrArg 2 | return none
     let f := args[args.length - 2]!
@@ -169,7 +169,7 @@ def tryDecompCongrArg (expr : Expr) (lctx : LocalContext)
     let some _ ← inferEqType? hEq | return none
     let fStx ← delabToRefinableSyntax f
     let refineTac ← `(tactic| refine $(mkIdent ``congrArg) $fStx ?_)
-    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[hEq] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[hEq] lctx localInsts decompileExpr
     return some result
 
 /-- Render a single calc step proof as a term (calcify-style).
@@ -179,58 +179,58 @@ def tryDecompCongrArg (expr : Expr) (lctx : LocalContext)
     This avoids brittle `eagerReduce` certificates and anonymous `Iff`
     structure literals that do not survive a plain delab/re-elab roundtrip. -/
 private partial def getCalcProof (proof : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-    : TacticM (Term × List String) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+    : DecompM Term := do
   match_expr proof with
   | Eq.symm _ _ _ h => do
-    let (h, used') ← getCalcProof h lctx localInsts used decompileExpr
-    return ((← `(term| ($(h)).$(mkIdent `symm))), used')
+    let h ← getCalcProof h lctx localInsts decompileExpr
+    `(term| ($(h)).$(mkIdent `symm))
   | _ => do
     if shouldRecursivelyDecompileCalcProof proof then
-      let (proofTactics, used') ← LeanDecomp.decompileOrExact proof lctx localInsts used decompileExpr
-      let term ← `(term| by $proofTactics:tactic*)
-      return (term, used')
-    let termStx ← delabToRefinableSyntax proof
-    return (termStx, used)
+      let proofTactics ← LeanDecomp.decompileOrExact proof lctx localInsts decompileExpr
+      `(term| by $proofTactics:tactic*)
+    else
+      let termStx ← delabToRefinableSyntax proof
+      pure termStx
 
 /-- Walk a normalized `Eq.trans` chain collecting `calcStep` syntax nodes.
     Skips `Eq.refl` steps since they are no-ops. -/
 private partial def getCalcSteps (proof : Expr) (acc : Array (TSyntax ``calcStep))
-    (lctx : LocalContext) (localInsts : LocalInstances) (used : List String)
-    (decompileExpr : DecompileCallback) : TacticM (Array (TSyntax ``calcStep) × List String) :=
+    (lctx : LocalContext) (localInsts : LocalInstances)
+    (decompileExpr : DecompileCallback) : DecompM (Array (TSyntax ``calcStep)) :=
   match_expr proof with
   | Eq.trans _ _ rhs _ p1 p2 => do
     match_expr p1 with
-    | Eq.refl _ _ => getCalcSteps p2 acc lctx localInsts used decompileExpr  -- skip refl steps
+    | Eq.refl _ _ => getCalcSteps p2 acc lctx localInsts decompileExpr  -- skip refl steps
     | _ =>
-      let (proofStx, used') ← getCalcProof p1 lctx localInsts used decompileExpr
+      let proofStx ← getCalcProof p1 lctx localInsts decompileExpr
       let step ← `(calcStep| _ = $(← delabToRefinableSyntax rhs) := $proofStx)
-      getCalcSteps p2 (acc.push step) lctx localInsts used' decompileExpr
-  | Eq.refl _ _ => return (acc, used)  -- skip trailing refl
+      getCalcSteps p2 (acc.push step) lctx localInsts decompileExpr
+  | Eq.refl _ _ => return acc  -- skip trailing refl
   | _ => do
     let type ← whnf (← Meta.inferType proof)
     let some (_, _, rhs) := type.eq?
       | throwError "Expected proof of equality, got {type}"
-    let (proofStx, used') ← getCalcProof proof lctx localInsts used decompileExpr
+    let proofStx ← getCalcProof proof lctx localInsts decompileExpr
     let step ← `(calcStep| _ = $(← delabToRefinableSyntax rhs) := $proofStx)
-    return (acc.push step, used')
+    return acc.push step
 
 /-- Handle `Eq.symm` by naming the input equality and reusing `Eq.symm`. -/
 def tryDecompEqSymm (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let some args := matchConstApp? expr ``Eq.symm 1 | return none
     let some inEq := args.getLast? | return none
     let some (_α, _lhs, _rhs) ← inferEqType? inEq | return none
     let refineTac ← `(tactic| refine $(mkIdent ``Eq.symm) ?_)
-    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[inEq] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[inEq] lctx localInsts decompileExpr
     return some result
 
 /-- Handle `Eq.trans` by normalizing (calcify-style) and emitting a `calc` block. -/
 def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
-  (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let some _args := matchConstApp? expr ``Eq.trans 2 | return none
 
@@ -243,26 +243,26 @@ def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
     match_expr exprNorm with
     | Eq.refl _ _ => do
       let tac ← `(tactic| rfl)
-      return some (#[tac], used)
+      return some #[tac]
     | Eq.trans _ _ _ _ _ _ => do
-      let (stepStx, used') ← getCalcSteps exprNorm #[] lctx localInsts used decompileExpr
+      let stepStx ← getCalcSteps exprNorm #[] lctx localInsts decompileExpr
       let calcTac ← `(tactic| calc
             $(← delabToRefinableSyntax lhs):term
             $stepStx*)
-      return some (#[calcTac], used')
+      return some #[calcTac]
     | _ => do
       -- Single-step result after normalization; just delaborate it
       let proofStx ← delabToRefinableSyntax exprNorm
       let tac ← `(tactic| exact $proofStx)
-      return some (#[tac], used)
+      return some #[tac]
 
 /-- Handle proposition-valued `Eq.rec`/`Eq.ndrec` transports by converting them
     back into an explicit `Eq.mp` step. `convert` often leaves these wrappers
     around a large theorem application; exposing the transport and base proof as
     separate subgoals gives the decompiler a chance to recurse structurally. -/
 def tryDecompEqRecPropTransport (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let (fn, args) := peelArgs expr
     let some constName := Expr.constName? fn | return none
@@ -302,7 +302,7 @@ def tryDecompEqRecPropTransport (expr : Expr) (lctx : LocalContext)
       let targetTyStx ← delabToRefinableSyntax targetTy
       let eqMpIdent := mkCleanIdent ``Eq.mp
       let refineTac ← `(tactic| refine @$eqMpIdent:ident $sourceTyStx $targetTyStx ?_ ?_)
-      let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[transportEq, baseWithArgs] lctx localInsts used decompileExpr
+      let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[transportEq, baseWithArgs] lctx localInsts decompileExpr
       return some result
 
     -- Only handle the ordinary nondependent transport case where the motive is
@@ -319,15 +319,15 @@ def tryDecompEqRecPropTransport (expr : Expr) (lctx : LocalContext)
     let targetTyStx ← delabToRefinableSyntax targetTy
     let eqMpIdent := mkCleanIdent ``Eq.mp
     let refineTac ← `(tactic| refine @$eqMpIdent:ident $sourceTyStx $targetTyStx ?_ ?_)
-    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[transportEq, baseWithArgs] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[transportEq, baseWithArgs] lctx localInsts decompileExpr
     return some result
 
 /-- Handle `Eq.mp` casts structurally by refining with holes for the transport
   equality and transported proof, then recursively decompiling both sides.
   This avoids raw delab/re-elab of arithmetic certificate terms. -/
 def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let (fn, args) := peelArgs expr
     let some constName := Expr.constName? fn
@@ -369,7 +369,7 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
     let targetTyStx ← delabToRefinableSyntax targetTy
     let eqMpIdent := mkCleanIdent ``Eq.mp
     let refineTac ← `(tactic| refine @$eqMpIdent:ident $sourceTyStx $targetTyStx ?_ ?_)
-    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[eqProofNorm, sourceProofArg] lctx localInsts used decompileExpr
+    let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[eqProofNorm, sourceProofArg] lctx localInsts decompileExpr
     return some result
 
 /-- Common tail for the `forall_congr` / `implies_congr` peelers.  Given a
@@ -390,8 +390,8 @@ private def emitHavePeel
     (witness : Expr) (hName : String)
     (innerEqProof : Expr) (remainingArgs : List Expr)
     (outerExprTy : Expr) (tryFastPath : Bool)
-    (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Array (TSyntax `tactic) × List String) := do
+    (decompileExpr : DecompileCallback)
+  : DecompM (Array (TSyntax `tactic)) := do
   let witnessTy ← withLCtx postIntroLctx postIntroInsts (Meta.inferType witness)
   let hFvarId := FVarId.mk (← mkFreshId)
   let lctxWithH := postIntroLctx.mkLocalDecl hFvarId (Name.mkSimple hName) witnessTy
@@ -403,15 +403,15 @@ private def emitHavePeel
   if tryFastPath then
     let liaTac ← `(tactic| lia)
     if ← LeanDecomp.candidateTacticsCloseGoal #[liaTac] outerExprTy lctxWithH hInsts then
-      return (prefixTacs.push liaTac, used)
+      return prefixTacs.push liaTac
     let unfoldLiaTac ← `(tactic| with_unfolding_all lia)
     if ← LeanDecomp.candidateTacticsCloseGoal #[unfoldLiaTac] outerExprTy lctxWithH hInsts then
-      return (prefixTacs.push unfoldLiaTac, used)
+      return prefixTacs.push unfoldLiaTac
   let innerCore ← withLCtx lctxWithH hInsts do
     Meta.mkAppM ``Eq.mp #[innerEqProof, Expr.fvar hFvarId]
   let innerTerm := remainingArgs.foldl (init := innerCore) fun acc a => mkApp acc a
-  let (innerTactics, used') ← decompileExpr innerTerm lctxWithH hInsts used
-  return (prefixTacs ++ innerTactics, used')
+  let innerTactics ← decompileExpr innerTerm lctxWithH hInsts
+  return prefixTacs ++ innerTactics
 
 /-- Handle `Eq.mp (forall_congr <body>) <evidence>` (with optional trailing
     applications) where `evidence : ∀ a, p a` transports to `∀ a, q a`.
@@ -433,8 +433,8 @@ private def emitHavePeel
     grind-specific leaf certificates inside `<body>` (e.g. `Int.Linear.norm_le`)
     are handled by `Specialized/Grind.lean` after this peel exposes them. -/
 def tryDecompEqMpForallCongr (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let some args := matchConstApp? expr ``Eq.mp 4 | return none
     let eqProof := args[2]!
@@ -449,9 +449,9 @@ def tryDecompEqMpForallCongr (expr : Expr) (lctx : LocalContext)
       let remaining := trailingArgs.drop 1
       let bodyAtX ← Meta.whnf (mkApp body xSpec)
       let evidenceAtX := mkApp evidence xSpec
-      let (hName, used1) := LeanDecomp.chooseIntroName used.length `h used
+      let hName ← LeanDecomp.chooseIntroName (← LeanDecomp.getUsed).length `h
       let result ← emitHavePeel #[] lctx localInsts evidenceAtX hName
-        bodyAtX remaining outerExprTy true used1 decompileExpr
+        bodyAtX remaining outerExprTy true decompileExpr
       return some result
     -- Universal case: telescope the body lambda, intro a fresh fvar, have the evidence.
     Meta.lambdaTelescope body fun bodyXs bodyResult => do
@@ -459,15 +459,15 @@ def tryDecompEqMpForallCongr (expr : Expr) (lctx : LocalContext)
       let xFvar := bodyXs[0]!
       let some xFvarId := xFvar.fvarId? | return none
       let xDecl ← xFvarId.getDecl
-      let (xName, used1) := LeanDecomp.chooseIntroName used.length xDecl.userName used
+      let xName ← LeanDecomp.chooseIntroName (← LeanDecomp.getUsed).length xDecl.userName
       let lctxWithX := (← getLCtx).setUserName xFvarId (Name.mkSimple xName)
       let xInsts ← getLocalInstances
       let evidenceAtX := mkApp evidence xFvar
-      let (hName, used2) := LeanDecomp.chooseIntroName used1.length `h used1
+      let hName ← LeanDecomp.chooseIntroName (← LeanDecomp.getUsed).length `h
       let xIdent := mkIdent (Name.mkSimple xName)
       let introTac ← `(tactic| intro $xIdent:ident)
       let result ← emitHavePeel #[introTac] lctxWithX xInsts evidenceAtX hName
-        bodyResult [] outerExprTy false used2 decompileExpr
+        bodyResult [] outerExprTy false decompileExpr
       return some result
 
 /-- Handle `Eq.mp (implies_congr p_eq q_eq) <evidence>` (with optional trailing
@@ -486,8 +486,8 @@ def tryDecompEqMpForallCongr (expr : Expr) (lctx : LocalContext)
     The harder case `p_eq ≠ Eq.refl` would need to additionally transport
     `hp` backward (`Eq.mpr p_eq hp`) before applying the evidence — deferred. -/
 def tryDecompEqMpImpliesCongr (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String) (decompileExpr : DecompileCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+    (localInsts : LocalInstances) (decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let some args := matchConstApp? expr ``Eq.mp 4 | return none
     let eqProof := args[2]!
@@ -503,22 +503,22 @@ def tryDecompEqMpImpliesCongr (expr : Expr) (lctx : LocalContext)
       let hpSpec := trailingArgs[0]
       let remaining := trailingArgs.drop 1
       let evidenceAtHp := mkApp evidence hpSpec
-      let (hName, used1) := LeanDecomp.chooseIntroName used.length `h used
+      let hName ← LeanDecomp.chooseIntroName (← LeanDecomp.getUsed).length `h
       let result ← emitHavePeel #[] lctx localInsts evidenceAtHp hName
-        qEq remaining outerExprTy true used1 decompileExpr
+        qEq remaining outerExprTy true decompileExpr
       return some result
     -- Universal case.
     let p2 := eqArgs[1]!
-    let (hpName, used1) := LeanDecomp.chooseIntroName used.length `hp used
+    let hpName ← LeanDecomp.chooseIntroName (← LeanDecomp.getUsed).length `hp
     let hpFvarId := FVarId.mk (← mkFreshId)
     let lctxWithHp := lctx.mkLocalDecl hpFvarId (Name.mkSimple hpName) p2
     let hpInsts ← withLCtx lctxWithHp localInsts getLocalInstances
     let evidenceAtHp := mkApp evidence (Expr.fvar hpFvarId)
-    let (hUserName, used2) := LeanDecomp.chooseIntroName used1.length `h used1
+    let hUserName ← LeanDecomp.chooseIntroName (← LeanDecomp.getUsed).length `h
     let hpIdent := mkIdent (Name.mkSimple hpName)
     let introTac ← `(tactic| intro $hpIdent:ident)
     let result ← emitHavePeel #[introTac] lctxWithHp hpInsts evidenceAtHp hUserName
-      qEq [] outerExprTy false used2 decompileExpr
+      qEq [] outerExprTy false decompileExpr
     return some result
 
 end LeanDecomp

@@ -6,13 +6,45 @@ namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter Tactic
 open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
 
+/-- Trace class for the decompiler's handler dispatch.  Enable with
+    `set_option trace.leanDecomp true` to see which handler fired at each
+    recursion point in the InfoView.  Hugely useful when investigating
+    "why didn't handler X fire?" or "which handler emitted this tactic?".
+
+    Use `traceFire` at the top of each `tryDecompXxx` body to log a
+    handler-name + whether it returned some/none, plus a one-line summary
+    of the matched expression head.  See examples in
+    `Decompiler.lean` / `EqDecomp.lean`. -/
+initialize Lean.registerTraceClass `leanDecomp
+
+/-- Log a single handler-fire trace event.  Cheap when trace is off
+    (Lean's `trace[]` machinery short-circuits on the trace-class flag). -/
+def traceFire (handler : String) (expr : Expr) (result : Bool) : MetaM Unit := do
+  trace[leanDecomp] "{handler}: {if result then "✓" else "✗"}  head={expr.getAppFn} arity={expr.getAppNumArgs}"
+
+/-- The decompiler's monad: `TacticM` plus a state-ref of names introduced so
+    far (so subsequent `intro` / `have` / `let` choose fresh non-shadowing
+    names).  Replaces the old "thread `used : List String` through every
+    handler signature, return `(tactics, used')` tuples" pattern.
+
+    Handlers are `... → DecompM (Option (Array (TSyntax `tactic)))`; the
+    macro entry point unwraps the state at the top with `(decompileExpr …).run' []`. -/
+abbrev DecompM := StateRefT (List String) TacticM
+
 /-- Type alias for the decompileExpr callback to avoid repetition -/
-abbrev DecompileCallback := Expr → LocalContext → LocalInstances → List String →
-  TacticM (Array (TSyntax `tactic) × List String)
+abbrev DecompileCallback := Expr → LocalContext → LocalInstances →
+  DecompM (Array (TSyntax `tactic))
 
 /-- Type alias for the assignIntroNames callback -/
-abbrev AssignIntroNamesCallback := Array Expr → List String →
-  TacticM (List String × LocalContext × List String)
+abbrev AssignIntroNamesCallback := Array Expr →
+  DecompM (List String × LocalContext)
+
+/-- Read the current used-name list. -/
+def getUsed : DecompM (List String) := get
+
+/-- Push a name onto the used-name list (no-op if already present). -/
+def addUsed (name : String) : DecompM Unit :=
+  modify fun used => if used.contains name then used else name :: used
 
 /-- Build a tactic sequence from an array of tactics. -/
 def mkTacticSeq (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax ``Lean.Parser.Tactic.tacticSeq) := do
@@ -301,42 +333,43 @@ private def mkExactFallbackTactics (proof : Expr) (lctx : LocalContext)
   }
 
 /-- Validate a candidate tactic block against the full proof goal and fall back
-    to an exact proof term if validation fails. -/
+    to an exact proof term if validation fails.  On a `build` failure (either a
+    thrown exception or a candidate that doesn't close the goal), the
+    used-name state is rolled back to its pre-`build` snapshot — names
+    introduced *only* in the failed branch shouldn't constrain subsequent
+    handlers' name choices. -/
 def validateOrExact (proof : Expr) (lctx : LocalContext) (localInsts : LocalInstances)
-    (used : List String) (build : TacticM (Array (TSyntax `tactic) × List String))
-    : TacticM (Array (TSyntax `tactic) × List String) := do
+    (build : DecompM (Array (TSyntax `tactic)))
+    : DecompM (Array (TSyntax `tactic)) := do
   let proofTy ← instantiateMVars (← Meta.inferType proof)
+  let savedUsed ← getUsed
   try
-    let (candidateTacs, used') ← build
+    let candidateTacs ← build
     if ← subproofTacticsCloseGoal candidateTacs proofTy lctx localInsts then
-      return (candidateTacs, used')
+      return candidateTacs
     else
-      let fallbackTacs ← mkExactFallbackTactics proof lctx localInsts
-      return (fallbackTacs, used')
+      set savedUsed
+      mkExactFallbackTactics proof lctx localInsts
   catch _ =>
-    let fallbackTacs ← mkExactFallbackTactics proof lctx localInsts
-    return (fallbackTacs, used)
+    set savedUsed
+    mkExactFallbackTactics proof lctx localInsts
 
 def decompileOrExact (proof : Expr) (lctx : LocalContext) (localInsts : LocalInstances)
-    (used : List String) (decompileExpr : DecompileCallback)
-    : TacticM (Array (TSyntax `tactic) × List String) := do
-  validateOrExact proof lctx localInsts used do
-    decompileExpr proof lctx localInsts used
+    (decompileExpr : DecompileCallback) : DecompM (Array (TSyntax `tactic)) :=
+  validateOrExact proof lctx localInsts <| decompileExpr proof lctx localInsts
 
 /-- Emit a tactic that may create multiple goals, then recursively decompile one
     proof term per generated goal into focused sub-blocks. This is the common
     shape used by theorem-style decompiler passes. -/
 def emitTacticWithSubgoals (headTac : TSyntax `tactic) (subgoalProofs : Array Expr)
-    (lctx : LocalContext) (localInsts : LocalInstances) (used : List String)
-  (decompileExpr : DecompileCallback) : TacticM (Array (TSyntax `tactic) × List String) := do
+    (lctx : LocalContext) (localInsts : LocalInstances)
+  (decompileExpr : DecompileCallback) : DecompM (Array (TSyntax `tactic)) := do
   let mut allTacs : Array (TSyntax `tactic) := #[headTac]
-  let mut used' := used
   for proof in subgoalProofs do
-    let (chosenTacs, used'') ← decompileOrExact proof lctx localInsts used' decompileExpr
+    let chosenTacs ← decompileOrExact proof lctx localInsts decompileExpr
     let blockTac ← mkFocusedBlock chosenTacs
     allTacs := allTacs.push blockTac
-    used' := used''
-  return (allTacs, used')
+  return allTacs
 
 def binderBaseName (idx : Nat) (name : Name) : String :=
   let raw := name.eraseMacroScopes.toString
@@ -358,27 +391,37 @@ def mkUniqueName (base : String) (used : List String) : String :=
             candidate
     loop 1 (used.length + 1)
 
-def chooseIntroName (idx : Nat) (userName : Name) (used : List String) : (String × List String) :=
+/-- Choose a fresh name based on `userName` (or a positional fallback
+    `x{idx+1}` when the user name is empty/`_`) that doesn't collide with any
+    name already in the used-names state, and add it to the state.
+
+    `idx` is the per-binder position used to construct the fallback name.
+    For binders introduced as part of an `assignIntroNames` batch, pass the
+    local position counter (so two consecutive `_` binders get base names
+    `x1` and `x2`).  For singleton binders introduced outside a batch
+    (`tryDecompByContradiction`, `tryDecompLet`, etc.) pass
+    `(← getUsed).length` — preserves the snapshot test naming output. -/
+def chooseIntroName (idx : Nat) (userName : Name) : DecompM String := do
+  let used ← getUsed
   let base := binderBaseName idx userName
   let introName := mkUniqueName base used
-  (introName, introName :: used)
+  addUsed introName
+  return introName
 
-def assignIntroNames (xs : Array Expr) (used0 : List String) : TacticM (List String × LocalContext × List String) := do
-  let mut used : List String := used0
-  let mut idx := 0
+def assignIntroNames (xs : Array Expr) : DecompM (List String × LocalContext) := do
   let mut names : List String := []
   let mut lctx ← getLCtx
+  let mut idx : Nat := 0
   for x in xs do
     let some fvarId := x.fvarId?
       | throwError "Unexpected non-fvar binder in proof term"
     let decl ← fvarId.getDecl
-    let (introName, used') := chooseIntroName idx decl.userName used
-    used := used'
+    let introName ← chooseIntroName idx decl.userName
     names := introName :: names
     let newName := Name.mkSimple introName
     lctx := lctx.setUserName fvarId newName
     idx := idx + 1
-  return (names.reverse, lctx, used)
+  return (names.reverse, lctx)
 
 /-- Convert intro names to identifier syntax -/
 def namesToIdents (names : List String) : Array Ident :=

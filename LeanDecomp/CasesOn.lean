@@ -347,10 +347,10 @@ private def mkCasesWithAltsTactic (discTerm : Term)
        `runMVarIdCases`'s subgoal when available, falling back to the
        synthesized telescope lctx for generalized motives. -/
 def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
-    (localInsts : LocalInstances) (used : List String)
+    (localInsts : LocalInstances)
     (decompileExpr : DecompileCallback)
     (assignIntroNames : AssignIntroNamesCallback)
-  : TacticM (Option (Array (TSyntax `tactic) × List String)) := do
+  : DecompM (Option (Array (TSyntax `tactic))) := do
   withLCtx lctx localInsts do
     let some info ← parseCasesOn expr
       | return none
@@ -366,18 +366,19 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     -- guard on a giant chain), return `none` so dispatch can continue with
     -- another handler instead of propagating the error out.
     let useHaveWrapper := info.discriminant.isApp && info.discriminant.fvarId?.isNone
-    let discBundle? : Option (Array (TSyntax `tactic) × List String) ←
+    let savedUsed ← getUsed
+    let discBundle? : Option (Array (TSyntax `tactic)) ←
       if useHaveWrapper then
         try
-          let (tacs, used') ← LeanDecomp.decompileOrExact info.discriminant lctx localInsts used decompileExpr
-          pure (some (tacs, used'))
+          let tacs ← LeanDecomp.decompileOrExact info.discriminant lctx localInsts decompileExpr
+          pure (some tacs)
         catch _ =>
+          set savedUsed
           pure none
       else
-        pure (some (#[], used))
-    let some (discTacticsEarly, usedAfterDisc) := discBundle?
+        pure (some #[])
+    let some discTacticsEarly := discBundle?
       | return none
-    let mut used := usedAfterDisc
 
     let mut alts : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt) := #[]
 
@@ -401,6 +402,15 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
     let casesSubgoals : Option (Array Meta.CasesSubgoal) ←
       if hasEqMotive then pure none else runMVarIdCases expr info
 
+    -- Track whether every branch's body is exactly the single tactic `lia`.
+    -- When that holds for an `Or` cases-split with a `have hOr := by lia`
+    -- wrapper (the Sum L55/L81 hot pattern), we attempt to collapse the
+    -- entire `have hOr; cases hOr | inl _ => lia | inr _ => lia` to one bare
+    -- `lia` — see the post-loop validation block below.
+    let liaRef : TSyntax `tactic ← `(tactic| lia)
+    let liaKind := liaRef.raw.getKind
+    let mut allBranchesAreLia : Bool := info.indName == ``Or
+
     for (ctorName, caseBranch) in ctorNames.zip info.caseBranches do
       let ctorShortName := ctorName.getString!
       let ctorIdent := mkIdent (Name.mkSimple ctorShortName)
@@ -421,7 +431,7 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
         casesSubgoals.bind fun subs =>
           subs.find? (fun s => s.ctorName == some ctorName)
 
-      let (branchTactics, ctorParamNames, used') ← Meta.lambdaTelescope caseBranch fun xs body => do
+      let (branchTactics, ctorParamNames) ← Meta.lambdaTelescope caseBranch fun xs body => do
         let telescopeLctx ← getLCtx
         let telescopeInsts ← getLocalInstances
 
@@ -457,33 +467,17 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
           trailingEqParams := trailingEqParams.push xs[ctorParamCount + i]!
 
         -- Assign names for constructor params and track them
-        let (ctorParamNames, newLctx, usedAfterCtorParams) ←
+        let (ctorParamNames, newLctx) ←
           if ctorParams.size > 0 then
-            assignIntroNames ctorParams used
+            assignIntroNames ctorParams
           else
-            pure ([], telescopeLctx, used)
-
+            pure ([], telescopeLctx)
 
         let ctorIndexSubsts ← mkCtorIndexSubsts ctorParamsAll body
         let bodyAfterCtorIndex := substFVars body ctorIndexSubsts
 
         -- Handle trailing Eq/HEq params from generalized equation motives.
-        --
-        -- When casesOn has a generalized equation motive (`cases h : disc`),
-        -- each branch has trailing eq params (e.g., `h : s = Stmt.skip`) and
-        -- the body may be wrapped in Eq.ndrec/Eq.rec for transport.
-        --
-        -- We substitute eq params with the corresponding motive args (e.g.,
-        -- `Eq.refl s`), apply remaining motive args, then clean up any
-        -- Eq.rec transport artifacts.
-        --
-        -- The substitution is type-incorrect at the Expr level (Eq.refl s
-        -- has type s = s, not s = Stmt.skip), but downstream handlers
-        -- (contradiction, noConfusion) consume these terms before
-        -- re-elaboration. For cases where Eq.rec remains at the top level,
-        -- we strip it when the base is a lambda (the generalized equation
-        -- transport pattern), as opposed to noConfusion's Eq.rec which has
-        -- a constant-headed base.
+        -- See `cleanupEqMotiveTransport` for the load-bearing details.
         let innerBody ← cleanupEqMotiveTransport bodyAfterCtorIndex
           info.motiveArgs trailingEqParams numTrailingEq
 
@@ -492,7 +486,7 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
         -- maintaining the decompiler invariant.  Otherwise (generalized
         -- motive, or `MVarId.cases` failed) fall back to the synthesized
         -- `newLctx` and let the outer replay catch errors.
-        let (bodyTactics, _usedInBranch) ←
+        let bodyTactics ←
           match matchingSubgoal? with
           | some sub =>
               -- Map the telescope's `xs` to the subgoal's `fields` so the
@@ -516,16 +510,18 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
                       nameIdx := nameIdx + 1
                 pure subLctx
               let subInsts ← sub.mvarId.withContext getLocalInstances
-              LeanDecomp.decompileOrExact innerBodyMapped renamedSubgoal subInsts
-                usedAfterCtorParams decompileExpr
+              LeanDecomp.decompileOrExact innerBodyMapped renamedSubgoal subInsts decompileExpr
           | none =>
               if hasEqMotive then
-                decompileExpr innerBody newLctx telescopeInsts usedAfterCtorParams
+                decompileExpr innerBody newLctx telescopeInsts
               else
-                LeanDecomp.decompileOrExact innerBody newLctx telescopeInsts usedAfterCtorParams decompileExpr
-        return (bodyTactics, ctorParamNames, used)
+                LeanDecomp.decompileOrExact innerBody newLctx telescopeInsts decompileExpr
+        return (bodyTactics, ctorParamNames)
 
-      used := used'
+      if allBranchesAreLia then
+        allBranchesAreLia := branchTactics.size == 1 &&
+          branchTactics[0]!.raw.getKind == liaKind
+
       let branchTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$branchTactics]*)
 
       -- Start with quasi-quote pattern that has no binders
@@ -555,8 +551,8 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
             (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
           delabToRefinableSyntax discType
         let discSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$discTacticsEarly]*)
-        let hOrName := LeanDecomp.mkUniqueName "hOr" used
-        used := hOrName :: used
+        let hOrName := LeanDecomp.mkUniqueName "hOr" (← getUsed)
+        addUsed hOrName
         let hOrIdent : Ident := ⟨mkIdent (Name.mkSimple hOrName) |>.raw.setInfo .none⟩
         let haveTac ← `(tactic| have $hOrIdent:ident : $discTypeStx := by $discSeq)
         preTacs := #[haveTac]
@@ -569,6 +565,18 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
       let discName := getDiscriminantName info.discriminant lctx
       if discName == some eqName then s!"{eqName}_eq" else eqName
     let casesTac ← mkCasesWithAltsTactic discTerm eqBinderName? alts
-    return some (preTacs ++ #[casesTac], used)
+
+    -- Stage-3 collapse: if this is an `Or` cases-split where the discriminant
+    -- needed a `have hOr := by ...` wrapper AND every branch reduced to a
+    -- single `lia`, attempt bare `lia` on the original goal.  `lia` (cutsat)
+    -- can do internal disjunction case splits, so the `have hOr; cases hOr`
+    -- scaffolding is often redundant.  Validation is the safety net: keep the
+    -- cases form whenever bare `lia` does not close the goal.
+    if useHaveWrapper && allBranchesAreLia then
+      let exprTy ← instantiateMVars (← Meta.inferType expr)
+      if ← LeanDecomp.candidateTacticsCloseGoal #[liaRef] exprTy lctx localInsts then
+        return some #[liaRef]
+
+    return some (preTacs ++ #[casesTac])
 
 end LeanDecomp

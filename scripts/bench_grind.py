@@ -30,17 +30,31 @@ from bench_db import BenchDB
 # Subprocess helpers
 # ---------------------------------------------------------------------------
 
-def run_cmd(cmd: list[str], cwd: Path | str) -> tuple[int, float, str]:
-    """Run a command and return (exit_code, elapsed_seconds, stdout_stderr)."""
+# Per-query wall-clock timeout.  When a `decompile` call hangs (e.g. simplifier
+# recursing on a 100k-node grind output without a heartbeat check), the whole
+# nightly stalls.  Bound per call so one hang doesn't block the rest of the
+# corpus; a query exceeding this is treated as a hard failure and recorded as
+# such in the JSON results.  120s is generous — most calls finish in <15s.
+QUERY_TIMEOUT_SECONDS = 120
+
+
+def run_cmd(cmd: list[str], cwd: Path | str, timeout: float | None = None) -> tuple[int, float, str]:
+    """Run a command and return (exit_code, elapsed_seconds, stdout_stderr).
+    On timeout, returns exit code 124 and a `[timeout]` marker in stdout."""
     start = time.perf_counter()
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    elapsed = time.perf_counter() - start
-    return proc.returncode, elapsed, proc.stdout + proc.stderr
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        elapsed = time.perf_counter() - start
+        return proc.returncode, elapsed, proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired as e:
+        elapsed = time.perf_counter() - start
+        partial = (e.stdout or "") + (e.stderr or "") if isinstance(e.stdout, str) else ""
+        return 124, elapsed, partial + f"\n[timeout after {timeout}s]"
 
 
 def lake_env_lean(workspace: Path | str, lean_file: str | Path) -> tuple[int, float, str]:
     """Run a Lean file via 'lake env lean'."""
-    return run_cmd(["lake", "env", "lean", str(lean_file)], workspace)
+    return run_cmd(["lake", "env", "lean", str(lean_file)], workspace, timeout=QUERY_TIMEOUT_SECONDS)
 
 
 def _ensure_import(source: str, module: str) -> str:
