@@ -431,6 +431,16 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
         casesSubgoals.bind fun subs =>
           subs.find? (fun s => s.ctorName == some ctorName)
 
+      -- Save the used-name accumulator across this alt: cases-alts are
+      -- independent lexical scopes, so binders introduced in alt N must NOT
+      -- bias the suffixes chosen in alt N+1.  Without this restore, two alts
+      -- whose constructor params share user-names (e.g. both `if_true` and
+      -- `if_false` introduce `hcond S T hbody` in `bigstep.lean`) emit
+      -- `hcond_1 S_1 T_1 hbody` in alt 1 and `hcond_1_1 S_1_1 T_1_1 hbody_1`
+      -- in alt 2 — readable as completely unrelated names instead of "the
+      -- same shape on both sides".
+      let savedUsed ← getUsed
+
       let (branchTactics, ctorParamNames) ← Meta.lambdaTelescope caseBranch fun xs body => do
         let telescopeLctx ← getLCtx
         let telescopeInsts ← getLocalInstances
@@ -521,6 +531,9 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
       if allBranchesAreLia then
         allBranchesAreLia := branchTactics.size == 1 &&
           branchTactics[0]!.raw.getKind == liaKind
+
+      -- Restore per-alt isolation (see savedUsed comment above).
+      set savedUsed
 
       let branchTacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$branchTactics]*)
 
