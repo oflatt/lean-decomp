@@ -11,14 +11,17 @@ lean-toolchain (v4.28.0-rc1 at time of writing) and may need updates for other
 versions.
 """
 import argparse
+import atexit
 import concurrent.futures
 import glob
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,18 +41,99 @@ from bench_db import BenchDB
 QUERY_TIMEOUT_SECONDS = 120
 
 
+_LIVE_GROUPS: set[int] = set()
+_LIVE_GROUPS_LOCK = threading.Lock()
+
+
+def _kill_group(pgid: int) -> None:
+    """Send SIGTERM to a process group, escalating to SIGKILL after a grace
+    period.  Silently swallows ProcessLookupError / PermissionError — once
+    the group leader has been reaped, macOS signals EPERM instead of ESRCH
+    even though the group is effectively gone.
+
+    `lake env lean` spawns `lean` worker processes that orphan to PID 1
+    when their immediate `lake` parent dies — killing the whole group is
+    the only way to take them down with the orchestrator."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    # Brief grace period for graceful shutdown.
+    for _ in range(20):
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _cleanup_live_groups() -> None:
+    """atexit / signal hook: take down every still-running child group.
+    Guarantees no `lean Mathlib/...` workers survive the script's own exit
+    (e.g. on KeyboardInterrupt or unhandled exception during a benchmark)."""
+    with _LIVE_GROUPS_LOCK:
+        groups = list(_LIVE_GROUPS)
+        _LIVE_GROUPS.clear()
+    for pgid in groups:
+        _kill_group(pgid)
+
+
+atexit.register(_cleanup_live_groups)
+for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    try:
+        _prev = signal.getsignal(_sig)
+        def _handler(signum, frame, _prev=_prev):
+            _cleanup_live_groups()
+            if callable(_prev) and _prev not in (signal.SIG_DFL, signal.SIG_IGN):
+                _prev(signum, frame)
+            else:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+        signal.signal(_sig, _handler)
+    except (ValueError, OSError):
+        pass
+
+
 def run_cmd(cmd: list[str], cwd: Path | str, timeout: float | None = None) -> tuple[int, float, str]:
     """Run a command and return (exit_code, elapsed_seconds, stdout_stderr).
-    On timeout, returns exit code 124 and a `[timeout]` marker in stdout."""
+    On timeout, returns exit code 124 and a `[timeout]` marker in stdout.
+
+    The child is launched in its OWN process group (`start_new_session=True`)
+    and the entire group is killed on timeout — not just the immediate
+    `lake` child.  Without this, a `lake env lean` timeout left orphaned
+    `lean Mathlib/...query.lean` workers running for days at full CPU,
+    re-parented to PID 1.  See `_cleanup_live_groups` for the script-exit
+    hook that handles the same problem on Ctrl-C / crash."""
     start = time.perf_counter()
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    pgid = os.getpgid(proc.pid)
+    with _LIVE_GROUPS_LOCK:
+        _LIVE_GROUPS.add(pgid)
     try:
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-        elapsed = time.perf_counter() - start
-        return proc.returncode, elapsed, proc.stdout + proc.stderr
-    except subprocess.TimeoutExpired as e:
-        elapsed = time.perf_counter() - start
-        partial = (e.stdout or "") + (e.stderr or "") if isinstance(e.stdout, str) else ""
-        return 124, elapsed, partial + f"\n[timeout after {timeout}s]"
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            elapsed = time.perf_counter() - start
+            return proc.returncode, elapsed, stdout + stderr
+        except subprocess.TimeoutExpired:
+            _kill_group(pgid)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            elapsed = time.perf_counter() - start
+            partial = (stdout or "") + (stderr or "")
+            return 124, elapsed, partial + f"\n[timeout after {timeout}s]"
+    finally:
+        with _LIVE_GROUPS_LOCK:
+            _LIVE_GROUPS.discard(pgid)
 
 
 def lake_env_lean(workspace: Path | str, lean_file: str | Path) -> tuple[int, float, str]:

@@ -112,7 +112,18 @@ private def buildDecompiledTactics (proof : Expr) (lctx : LocalContext)
   -- discards the final state since the decompiler doesn't expose used names
   -- back to the macro layer.
   let tactics ← (decompileExpr proof lctx localInstances).run' []
-  simplifyTactics tactics
+  let tactics ← simplifyTactics tactics
+  -- Replace inaccessible-name references that resolve to typeclass
+  -- instances in the surrounding lctx with `_` holes.  Lean's delab emits
+  -- macro-scoped names for `[TypeClass]` binders and PrettyPrinter renders
+  -- them as `inst✝`, `inst✝¹`, … — uninstantiable as source.  Replacing
+  -- with `_` lets typeclass inference fill the slot at re-elab time.
+  -- Narrow gate (instance type only) ensures we don't substitute over
+  -- hygienic-but-accessible refs.  Done before validation so the
+  -- `checkDecompiled` round-trip still catches any case where inference
+  -- can't fill the hole.
+  tactics.mapM fun t =>
+    return ⟨← LeanDecomp.sanitizeInaccessibleIdents lctx t.raw⟩
 
 
 /--

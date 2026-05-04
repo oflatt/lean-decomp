@@ -98,6 +98,63 @@ def ppExprToTermSyntaxWith (e : Expr) (usePpAll : Bool) : MetaM Term :=
     ) do
       ppExprToTermSyntax e
 
+/-- True iff `n` is the Name of an inaccessible binder — one Lean's pretty
+    printer renders with the `✝` marker.  Two stored representations both
+    qualify:
+    1. **Macro scopes attached** (the common case): a hygienic name like
+       `Lean.Name.num "inst" 12345` from `Macro.addMacroScope`.
+       `Name.hasMacroScopes` detects these.
+    2. **Literal `✝` in a component string**: rare, but happens when a name
+       was constructed via the printer's renaming pass and re-fed into the
+       elaborator.  Caught by the component-string check.
+
+    `inst✝`, `inst✝¹`, …, `h✝`, `a✝²` all qualify; ordinary `foo`, `inst_1`
+    don't. -/
+def isInaccessibleName (n : Name) : Bool :=
+  n.hasMacroScopes ||
+    n.components.any fun comp => comp.toString.contains '✝'
+
+/-- Walk `stx` and replace identifier references that resolve to
+    inaccessibly-named typeclass-instance fvars in `lctx` with `_` holes.
+    Cross-file re-elaboration of decompiled scripts fails on `refine @foo
+    R inst✝ ...` and `exact inst✝¹` — the `✝` marks the ident as
+    inaccessible (Lean's hygiene scheme).  Typeclass inference can re-fill
+    these positions, so `_` works.
+
+    Three-condition narrow trigger so we don't over-fire on hygienic but
+    accessible binders (which would substitute `_` for a real reference
+    and fail validation):
+    1. ident has macro scopes OR a literal `✝` component;
+    2. the name resolves to an FVar in `lctx`;
+    3. that FVar's type is a typeclass instance (`Meta.isClass?`).
+
+    Returns the input unchanged when no qualifying idents are present.
+
+    Substitutes `inferInstance` (not bare `_`) because `_` in tactic
+    `exact` position becomes an unfilled term mvar (raises "internal
+    exception #5" under `exact _`).  `inferInstance` works in BOTH term
+    position (`refine @foo R inferInstance …`) and tactic position
+    (`exact inferInstance`) by explicitly invoking typeclass synthesis. -/
+def sanitizeInaccessibleIdents (lctx : LocalContext) (stx : Syntax) : MetaM Syntax := do
+  -- Build via `mkIdent` rather than `\`(inferInstance)` quotation: the
+  -- quotation form attaches a fresh macro scope which PrettyPrinter would
+  -- then sanitize back to `inferInstance✝` — defeating the purpose.
+  let inferInst : Syntax := mkIdent ``inferInstance
+  Meta.withLCtx lctx #[] do
+    stx.replaceM fun s => do
+      match s with
+      | .ident _ _ name _ =>
+        if !name.hasMacroScopes && !name.isInaccessibleUserName then
+          pure none
+        else if let some decl := lctx.findFromUserName? name then
+          if (← Meta.isClass? decl.type).isSome then
+            pure (some inferInst)
+          else
+            pure none
+        else
+          pure none
+      | _ => pure none
+
 /-- Peel off all applications from an expression to get the head and arguments.
     Returns (head, args) where args is in left-to-right order. -/
 def peelArgs (e : Expr) : Expr × List Expr :=

@@ -75,13 +75,13 @@ Speed pitch for the paper now defensible: **comparable to grind on grind-success
 
 Ran nightly across all of `Mathlib/Algebra/Order/` (25 files containing 54 grind sites), with a per-query 120s wall-clock timeout to prevent hangs from blocking the rest.  Results in `results-broader-order.json`, dumps in `dump-broader-order/`.
 
-**Coverage: 18/54 = 33%.**
+**Coverage: 18/54 = 33%** at the time of the sweep.  The dominant failure mode in this snapshot — "suggestion produced but cross-file re-elaboration failed" — was driven by `inst✝` references and is **addressed by the 2026-05-04 `inferInstance` substitution** (see Done section below).  Coverage on a fresh sweep is expected to jump well above 33% but hasn't been re-measured yet (the broader-corpus re-run is the next benchmark task; it's deferred while we're still iterating on individual handlers).
 
-Failure breakdown (36 total):
+Failure breakdown from the original sweep (36 total):
 
 | Failure mode | Count | What it means |
 |-|-|-|
-| "suggestion produced but cross-file re-elaboration failed" | 15 | Macro's local validation passed, but the suggestion file written by `--dump` doesn't re-elaborate.  Usually because the emitted tactics reference `inst✝` (anonymous typeclass instances) or other names that don't survive cross-file emission. |
+| "suggestion produced but cross-file re-elaboration failed" | 15 | Macro's local validation passed, but the suggestion file written by `--dump` doesn't re-elaborate.  Usually because the emitted tactics reference `inst✝` (anonymous typeclass instances) or other names that don't survive cross-file emission.  **Largely fixed 2026-05-04 — see Done section.** |
 | Wall-clock timeout (>120s) | 10 | Macro hangs.  Most are `Antidiag/*` and similar — grind produces a giant proof and our simplifier or recursion gets stuck without yielding to heartbeat checks. |
 | Heartbeat timeout | 5 | Macro's per-call budget exceeded inside one of the speculative-validation calls. |
 | Validation failure → exact fallback | 5 | Decompile produced tactics that didn't close the goal; fell back to `exact <giant>` which also failed. |
@@ -118,6 +118,38 @@ Top representative cases (by replacement size):
 5. `Mathlib/Algebra/ContinuedFractions/Computation/CorrectnessTerminating.lean:150` — explicitly reverted with `#adaptation_note` citing [lean4#9825](https://github.com/leanprover/lean4/issues/9825) — author waiting for upstream grind fix.  **This is the headline stability story:** decompile-once and you don't need to revert when grind's flaky.
 
 These cases are not yet directly testable from our pinned mathlib commit (the mining went back further than the pin), but the paper plan can cite them and rerun against an updated pin once we're ready to run the cross-version stability experiment (Phase 3 of the long-term plan).
+
+### Done: cross-file `inst✝` → `inferInstance` substitution (2026-05-04)
+
+Biggest single broader-corpus failure cluster (15/36 = 42% of all failures, per the 2026-05-01 sweep): decompiled scripts that mention anonymous `[TypeClass]`-instance binders emit references like `inst✝`, `inst✝¹`, `inst✝²` — the `✝` is Lean's pretty-printer marker for hygienic / inaccessible names.  Local validation passed (the macro's lctx still had those FVars), but the dumped suggestion file failed cross-file re-elaboration with no way for the user to spell `inst✝` in source.
+
+Concrete example: `Mathlib/Algebra/Order/Ring/Unbundled/Basic.lean:733` (`pos_of_right_mul_lt_le`) decompiled to a `refine @mul_le_mul_of_nonpos_left R inst✝ ... ?_ ?_ ?_ ?_ ?_ ?_` followed by `· exact inst✝¹ … · exact inst✝⁴` — un-elaborable.
+
+Fix: new `LeanDecomp.sanitizeInaccessibleIdents` (`Helpers.lean`) walks the post-simplify tactic syntax tree and substitutes idents with `inferInstance` when ALL THREE conditions hold:
+1. The ident's name has macro scopes (`Name.hasMacroScopes`) OR a literal `✝` component (`Name.isInaccessibleUserName`).
+2. The name resolves to an FVar in the surrounding lctx (via `LocalContext.findFromUserName?`).
+3. That FVar's type is a typeclass-instance class (`Meta.isClass?` returns `some _`).
+
+Three-condition narrowness avoids over-firing on ordinary hygienic-but-accessible binders (an earlier broader version that fired on any `hasMacroScopes` ident broke validation by replacing `exact h_1` with `exact _`).
+
+**Two non-obvious snags during implementation**:
+- **Substituting `_` doesn't work in `exact` position**: `exact _` raises "internal exception #5" — `_` becomes an unfilled term mvar, not a typeclass synthesis trigger.  Substituting `inferInstance` (which works in BOTH `refine @foo R inferInstance …` term position and `exact inferInstance` tactic position) is the right token.
+- **Build the substitute via `mkIdent`, not `\`(inferInstance)` quotation**: the quotation form attaches a fresh macro scope, which Lean's PrettyPrinter then sanitizes back to `inferInstance✝` — ironically defeating the entire purpose.  `mkIdent ``inferInstance` produces a clean, unscoped, fully-qualified ident.
+
+Applied at `buildDecompiledTactics` in `ProofTermMacro.lean`, just after `simplifyTactics` and before validation — so `checkDecompiled` round-trips the substituted form and catches any case where typeclass inference can't fill the hole (none observed so far).
+
+**Validation**:
+- `Mathlib/Algebra/Order/Ring/Unbundled/Basic.lean` L733 + L741: previously both failed cross-file (`inst✝`/`inst✝¹–⁴` references); now both pass.
+- Sum.lean still 4/4, Int.lean still 5/5, all 19 snapshot tests pass — narrow gate didn't disturb the slices that didn't have inaccessible-instance refs to begin with.
+- Full broader-corpus re-run not yet done; expected to lift coverage well above 33% since the inaccessible-instance failure mode is the dominant one.
+
+### Done: process-group cleanup in `bench_grind.run_cmd` (2026-05-04)
+
+`scripts/bench_grind.py`'s `run_cmd` previously called `subprocess.run(cmd, timeout=…)` on `lake env lean …` queries.  When a query timed out, `subprocess.run` killed only the immediate `lake` child — its `lean` worker (`lean Mathlib/...decompile_query.lean`) was re-parented to PID 1 and continued running at full CPU.  Friday's broader-corpus run left **18 orphaned `lean` workers** running for 30+ hours each before they were noticed; they contaminated the next benchmark by stealing CPU.
+
+Fix: `run_cmd` now spawns the child with `start_new_session=True` (its own process group) and on timeout calls `os.killpg(pgid, SIGTERM)` followed by a 1s grace period and `SIGKILL` if needed.  An `atexit` hook + `SIGINT`/`SIGTERM`/`SIGHUP` handlers also walk a `_LIVE_GROUPS` registry on script exit, so Ctrl-C or an unhandled exception during a benchmark also takes down every still-running query.  `nightly.py` inherits this for free since it imports `bench_grind`.
+
+Smoke-tested: `run_cmd(['sh', '-c', 'sleep 30 & wait'], …, timeout=1)` returns rc=124 in ~1s and no `sleep` process survives.  Macros / EPERM (returned on macOS once the group leader is reaped) are treated the same as ESRCH so the cleanup never raises during a normal exit.
 
 ### Done: collapse trivial `Or.casesOn → lia | lia` to bare `lia` (2026-05-04)
 
