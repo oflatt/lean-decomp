@@ -553,6 +553,12 @@ private def withTypeCheckPure (ruleName : String) (input : Expr)
 /-- Pre-step: cheap pure rewrites applied before recursing into children.
     Returns `.visit` to re-traverse after rewriting, `.continue` to recurse normally. -/
 private def simplifyPre (e : Expr) : MetaM TransformStep := do
+  -- Yield to the runtime so `maxHeartbeats` and external cancellation are
+  -- honoured during the recursive walk.  Without this, a huge grind output
+  -- (Antidiag/Nat.lean L94 etc.) hangs the macro silently — `Meta.transform`
+  -- doesn't itself check heartbeats, so the walker can run for >120s with
+  -- no error, no profile output, no opportunity to bail out.
+  Core.checkSystem "LeanDecomp.simplify"
   -- Beta reduction (all beta redexes, not just fvar args)
   if e.isHeadBetaTarget then return .visit e.headBeta
   -- Strip `@id T body`

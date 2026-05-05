@@ -137,22 +137,45 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   -- query the clock but don't emit any messages — IO.monoMsNow is cheap.
   let t0 ← IO.monoMsNow
 
+  -- When profile is on, emit per-phase markers via IO.eprintln (unbuffered
+  -- stderr) so a hanging phase is identifiable WITHOUT waiting for the
+  -- end-of-call summary that would never print.  Discovered while
+  -- investigating Antidiag/Nat.lean L94 (a wall-clock hang inside
+  -- `expandAuxiliaryProofs` on a giant grind output — `simplifyProofTerm`'s
+  -- `Core.checkSystem` never gets a chance to fire if a prior phase is the
+  -- one looping).
+  let mark (msg : String) : MetaM Unit :=
+    if profileOn then do
+      IO.eprintln s!"[leanDecomp.profile] {msg}"
+      -- Explicit flush: stderr is fully-buffered when redirected, and a
+      -- hung phase that gets SIGKILL'd would lose the marker that
+      -- identifies WHICH phase was hanging.  `timeout 60 lake env lean …`
+      -- wraps every nightly query.
+      (← IO.getStderr).flush
+    else pure ()
+
   let goalMVar ← getMainGoal
   let stateBefore ← saveState
 
+  mark "phase: inner-tactic (evalTactic)"
   evalTactic t
   let tInner ← IO.monoMsNow
 
+  mark s!"phase: instantiateMVars (after inner {tInner - t0}ms)"
   let proof ← instantiateMVars (mkMVar goalMVar)
+  mark "phase: expandAuxiliaryProofs"
   let expandedProof ← expandAuxiliaryProofs proof
+  mark "phase: simplifyProofTerm"
   let simplifiedProof ← simplifyProofTerm expandedProof
   let tSimplify ← IO.monoMsNow
 
+  mark s!"phase: buildDecompiledTactics (after simplify {tSimplify - tInner}ms)"
   let lctx ← getLCtx
   let localInstances ← getLocalInstances
   let tactics ← buildDecompiledTactics simplifiedProof lctx localInstances
   let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
   let tDecomp ← IO.monoMsNow
+  mark s!"phase: validate (decomp {tDecomp - tSimplify}ms)"
 
   -- restore the original state with the original goal before validating
   stateBefore.restore

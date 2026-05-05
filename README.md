@@ -119,6 +119,25 @@ Top representative cases (by replacement size):
 
 These cases are not yet directly testable from our pinned mathlib commit (the mining went back further than the pin), but the paper plan can cite them and rerun against an updated pin once we're ready to run the cross-version stability experiment (Phase 3 of the long-term plan).
 
+### Done: per-phase profile markers + `Core.checkSystem` in simplifier (2026-05-04)
+
+Two related fixes for "macro hangs silently with no output" pathology surfaced during the wall-clock-timeout cluster investigation:
+
+1. **`Core.checkSystem "LeanDecomp.simplify"` at the entry of `simplifyPre`** (`Simplify.lean`): `Meta.transform`'s recursive walk doesn't itself check heartbeats, so a giant grind output (millions of nodes) ran the simplifier for >120s with no opportunity to bail out, no error, no profile output. The check now fires once per visited node, so `maxHeartbeats` and external SIGTERM are honoured during the walk.
+2. **`leanDecomp.profile` mode now emits per-phase markers via `IO.eprintln` + explicit `(← IO.getStderr).flush`** (`ProofTermMacro.lean`). Previously the per-phase profile only logged at the END of `decompileTac`; if any phase hung, the summary never printed. Now each of `evalTactic`, `instantiateMVars`, `expandAuxiliaryProofs`, `simplifyProofTerm`, `buildDecompiledTactics`, and `validate` writes a marker like `[leanDecomp.profile] phase: simplifyProofTerm` to stderr the moment it starts. Explicit `flush` is required because stderr is fully-buffered when redirected (without it, SIGKILL'd processes lose the markers).
+
+Antidiag/Nat.lean L94's hang turned out to be NOT in our decompile macro: probing showed the eprintln never fires because earlier theorems in the file run for >120s at default heartbeats (the script wraps the whole file in one `lake env lean` invocation). Decompile itself completes in 126ms when reached. So the L94 timeout is "the file is slow to load," not a decompile bug; the diagnostic infrastructure here is for future cases where the simplifier IS the bottleneck (cluster of 10 wall-clock-timeout failures in the 2026-05-01 broader-corpus run).
+
+### Done: cross-file projection-chain inaccessible refs (2026-05-04)
+
+Follow-up to the `inferInstance` substitution earlier today: extended `sanitizeInaccessibleIdents` to handle `Lean.Parser.Term.proj` nodes whose root receiver is an inaccessible-instance ident.
+
+The earlier fix only matched bare `Syntax.ident`, so `inst✝.toLE` got rewritten to `inferInstance.toLE` — which fails with "type class instance expected ?m" because Lean tries to synthesize `inferInstance : ?m` (no type annotation) before descending into `.toLE`. The chain's RESULT type is also a class (`(inst : LinearOrder M).toLE : LE M`), so replacing the WHOLE projection chain with a single `inferInstance` lets typeclass synthesis target the chain's result type directly.
+
+Implementation: a small recursive helper `projRoot` walks down through nested `.proj` nodes to find the bottom ident, and the outer `replaceM` matches both `Term.proj` and `Syntax.ident` cases. Top-down match-and-stop semantics ensure we replace the whole projection before descending into its receiver.
+
+**Validation**: `Mathlib/Algebra/Order/BigOperators/Group/List.lean:234` (uses `inst✝.toLE inst✝.toLT` from `Lean.Grind.Order.lt_le_trans`) previously failed with "type class instance expected"; now passes both local validation and cross-file re-elab (`Suggestion run finished: exit=0`). Sum 4/4 + Int 5/5 + Ring/Basic L733/L741 still pass — proj match doesn't disturb non-instance projections (`projRoot` only fires when the root resolves to an inaccessible class fvar).
+
 ### Done: cross-file `inst✝` → `inferInstance` substitution (2026-05-04)
 
 Biggest single broader-corpus failure cluster (15/36 = 42% of all failures, per the 2026-05-01 sweep): decompiled scripts that mention anonymous `[TypeClass]`-instance binders emit references like `inst✝`, `inst✝¹`, `inst✝²` — the `✝` is Lean's pretty-printer marker for hygienic / inaccessible names.  Local validation passed (the macro's lctx still had those FVars), but the dumped suggestion file failed cross-file re-elaboration with no way for the user to spell `inst✝` in source.

@@ -140,19 +140,36 @@ def sanitizeInaccessibleIdents (lctx : LocalContext) (stx : Syntax) : MetaM Synt
   -- quotation form attaches a fresh macro scope which PrettyPrinter would
   -- then sanitize back to `inferInstance✝` — defeating the purpose.
   let inferInst : Syntax := mkIdent ``inferInstance
+  let isInaccessibleClassRef (name : Name) : MetaM Bool := do
+    if !name.hasMacroScopes && !name.isInaccessibleUserName then return false
+    let some decl := lctx.findFromUserName? name | return false
+    return (← Meta.isClass? decl.type).isSome
+  -- Walk down chained projections (`inst✝.foo.bar`) to find the receiver
+  -- ident at the bottom.  Returns the bottom ident's name iff the chain
+  -- is purely `.proj` nodes terminating in an ident.
+  let rec projRoot : Syntax → Option Name
+    | .node _ ``Lean.Parser.Term.proj #[receiver, _, _] => projRoot receiver
+    | .ident _ _ name _ => some name
+    | _ => none
   Meta.withLCtx lctx #[] do
     stx.replaceM fun s => do
       match s with
+      -- Whole-projection replacement: `inst✝.toLE` → `inferInstance`.
+      -- Without this, the inner ident swap would produce `inferInstance.toLE`,
+      -- which fails with "type class instance expected ?m" because Lean
+      -- can't infer the type to synthesize for the bare `inferInstance`
+      -- before descending into `.toLE`.  Replacing the whole projection
+      -- works because the projection's RESULT type is also a class
+      -- (e.g. `(inst : LinearOrder M).toLE : LE M`).
+      | .node _ ``Lean.Parser.Term.proj _ =>
+        match projRoot s with
+        | some name =>
+          if (← isInaccessibleClassRef name) then pure (some inferInst)
+          else pure none
+        | none => pure none
       | .ident _ _ name _ =>
-        if !name.hasMacroScopes && !name.isInaccessibleUserName then
-          pure none
-        else if let some decl := lctx.findFromUserName? name then
-          if (← Meta.isClass? decl.type).isSome then
-            pure (some inferInst)
-          else
-            pure none
-        else
-          pure none
+        if (← isInaccessibleClassRef name) then pure (some inferInst)
+        else pure none
       | _ => pure none
 
 /-- Peel off all applications from an expression to get the head and arguments.
