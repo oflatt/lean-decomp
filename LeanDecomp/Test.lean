@@ -289,4 +289,49 @@ info: Try this:
 example (P Q : Nat → Prop) (h_eq : ∀ x, P x = Q x) (h_uni : ∀ x, P x) : ∀ x, Q x := by
   decompile exact Eq.mp (forall_congr (fun x => h_eq x)) h_uni
 
+-- ╔══════════════════════════════════════════════════════════════════════╗
+-- ║ §7  sanitizeInaccessibleIdents (regression locks)                    ║
+-- ╚══════════════════════════════════════════════════════════════════════╝
+--
+-- The 2026-05-04 cross-file fix: anonymous typeclass binders (`[Foo α]`
+-- with no explicit name) get hygienic / inaccessible userNames in the
+-- lctx, and `tryDecompTheoremAppFallback`'s `refine @theorem α inst✝ …`
+-- form would then emit those `inst✝` refs literally.  The `✝` marker
+-- makes them unparseable as source, so the dumped suggestion fails
+-- cross-file re-elaboration.  `sanitizeInaccessibleIdents` (Helpers.lean)
+-- runs at `buildDecompiledTactics` and replaces those refs with
+-- `inferInstance` — typeclass synthesis re-fills the position at re-elab.
+--
+-- Narrow gate: macro-scoped or `✝`-bearing name + lctx hit + class type.
+-- A previous broader version that fired on any `hasMacroScopes` ident
+-- broke validation by replacing accessible hygienic binders.
+
+namespace Sanitize
+
+class FooBar (α : Type) where
+  rel : α → α → Prop
+
+axiom foo_trans {α : Type} [FooBar α] {a b c : α}
+  (h1 : FooBar.rel a b) (h2 : FooBar.rel b c) : FooBar.rel a c
+
+end Sanitize
+
+open Sanitize
+
+-- Test 19: bare `inst✝` ref → `inferInstance`.
+-- Trigger: a theorem app with multiple proof args forces
+-- `tryDecompTheoremAppFallback` to emit `refine @foo_trans α inst✝ a b c ?_ ?_`.
+-- The anonymous `[FooBar α]` binder gives the instance fvar a hygienic
+-- userName; the sanitizer rewrites the `inst✝` slot to `inferInstance`.
+/--
+info: Try this:
+  [apply] refine @LeanDecomp.Test.Sanitize.foo_trans α inferInstance a b c ?_ ?_
+    · exact h1
+    · exact h2
+-/
+#guard_msgs (whitespace := lax) in
+example {α : Type} [FooBar α] (a b c : α)
+    (h1 : FooBar.rel a b) (h2 : FooBar.rel b c) : FooBar.rel a c := by
+  decompile exact foo_trans h1 h2
+
 end LeanDecomp.Test

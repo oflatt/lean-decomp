@@ -255,10 +255,30 @@ def _skip_indented(lines, start):
 # Matches: `grind`, `grind `, `grind[`, end-of-line `grind`
 GRIND_RE = re.compile(r'(?<!\w)grind(?=\s|\[|$)')
 
+# Lines that look like attribute declarations (e.g. `@[simp, grind =]`) — the
+# `grind` here is the `@[grind]` attribute, NOT a tactic call.  Substituting
+# `decompile grind` produces invalid syntax (`@[simp, decompile grind =]`).
+# Skip these lines entirely.  Detected by `@[` followed eventually by `]`
+# in the same line; defensive-only — multi-line attribute blocks (rare)
+# would still slip through but produce a parse error caught downstream.
+ATTR_RE = re.compile(r'@\[[^\]]*\]')
+# Also skip `grind =` / `grind :=` patterns: these are attribute-equality
+# syntax (`@[grind =]`, `@[grind := foo]`), never valid as a tactic.
+GRIND_ATTR_EQ_RE = re.compile(r'(?<!\w)grind\s*[:=]')
+
 
 def _has_grind(line: str) -> bool:
-    """Return True if line contains a grind tactic call."""
-    return bool(GRIND_RE.search(line))
+    """Return True if line contains a grind tactic call (not an attribute use)."""
+    if not GRIND_RE.search(line):
+        return False
+    # Reject attribute lines: `@[simp, grind =]` etc.  Lean's `grind` is also
+    # registered as an attribute, and the same word in attribute position
+    # cannot be substituted with `decompile grind`.
+    if ATTR_RE.search(line):
+        return False
+    if GRIND_ATTR_EQ_RE.search(line):
+        return False
+    return True
 
 
 def _find_grind_line(source: str) -> int:

@@ -30,11 +30,11 @@ Readability is secondary to correctness. When the structural decompiler cannot s
 
 ## Top TODO
 
-1. **Order-grind handlers** for `Lean.Grind.Order.*` — analog to the existing `Int.Linear.*` arithmetic specialization in `Specialized/Grind.lean`.  Investigation 2026-05-01: `min_assoc` (one of the historical "replaced with manual proof" cases — the human replacement is 6 lines) decompiles to 112 lines that re-elaborate correctly, but 3 inner `exact <Eq.trans …>` chains reference `Lean.Grind.Order.le_eq_false_of_lt` etc.  Specialized handlers for these would close the order-grind cluster of failures (≈10 of the 36 broader-corpus failures, including the `Field/Basic.lean` and `Ring/Unbundled/*` clusters).
-2. **Cross-version stability experiment.** Pick a grind-heavy mathlib file, decompile every grind site, then bump grind/Lean toolchain and count how many decompiled proofs still elaborate vs how many grind sites still close. Mining surfaced the headline anchor: `Mathlib/Algebra/ContinuedFractions/.../CorrectnessTerminating.lean:150` was reverted with `#adaptation_note` citing [lean4#9825](https://github.com/leanprover/lean4/issues/9825) — author waiting for upstream grind fix.  Decompile-once should survive that regression.
-3. **Stage-3 tactic simplifier (residual speed gap).** After the byContradiction Phase-A short-circuit landed (2026-05-01) and the `Or.casesOn → bare lia` collapse landed (2026-05-04 — see Done section below), decompile is 0.72×–1.13× of grind on grind-success cases.  The remaining gap is in the `by_cases h_abs : … ; · rw [abs_of_nonpos h_abs] at hp; lia ; · rw [abs_of_pos (not_le.mp h_abs)] at hp; lia` shape emitted by `tryDecompAbsCaseSplitContradiction` (Int L47/L91): two `lia` calls, neither obviously merge-able since each branch needs a different rewrite first.  Closing this needs either lia/cutsat to natively handle `abs x` case splits or a hypothesis-rewrite-aware "single lia over the conjoined goal" rule — much less mechanical than the trivial `Or` collapse was.  Polish item, not paper-blocker.
-4. **Decompile-cost characterization on the broader corpus.** Coverage on `Mathlib/Algebra/Order/` is 33% (18/54).  Failure clusters: 15 cross-file re-elaboration (anonymous `inst✝` refs), 10 wall-clock timeouts (>120s — simplifier hangs on giant grind output), 5 heartbeat timeouts, 5 validation→exact-fallback, 1 too-large output. Each cluster suggests a concrete fix: emit hygienic typeclass refs / add heartbeat checks in the simplifier / etc.
-5. **Snapshot tests for the decompiler output.** Tests 14/15 lock down the `Eq.mp (Eq.symm? (propext (Iff.intro f g))) ev → f/g ev` simplifier collapse; **Tests 16/17/18** lock down the `tryDecompEqMpForallCongr` / `tryDecompEqMpImpliesCongr` peelers. Still missing: snapshots for the actual Sum/Int *output shape* — those depend on grind's emitted certificates and are version-sensitive.
+1. **Investigate the `Ring/Unbundled/Rat.lean` cluster (4 failures: L44, L83, L89, L97, L142).**  The 2026-05-05 broader-corpus sweep showed coverage jumped from 33% to 47% on the cross-file fix, leaving 26 failures across 49 actual grind sites.  `Rat.lean` alone has 4: one too-large, one heartbeat, three validate-fallback.  Investigating one file with multiple failures is high-leverage — a common shape probably underlies several.  Concrete first step: `cat dump-broader-order/Mathlib/Algebra/Order/Ring/Unbundled/Rat/L89.decompile.failed.lean` (or `*.query.lean`) and look at what shape grind emits for `Rat`-arithmetic proofs.
+2. **Order-grind handlers** for `Lean.Grind.Order.*` — analog to the existing `Int.Linear.*` arithmetic specialization in `Specialized/Grind.lean`.  Investigation 2026-05-01: `min_assoc` (one of the historical "replaced with manual proof" cases — the human replacement is 6 lines) decompiles to 112 lines that re-elaborate correctly, but 3 inner `exact <Eq.trans …>` chains reference `Lean.Grind.Order.le_eq_false_of_lt` etc.  Specialized handlers for these would close the order-grind cluster of failures.
+3. **Cross-version stability experiment.** Pick a grind-heavy mathlib file, decompile every grind site, then bump grind/Lean toolchain and count how many decompiled proofs still elaborate vs how many grind sites still close. Mining surfaced the headline anchor: `Mathlib/Algebra/ContinuedFractions/.../CorrectnessTerminating.lean:150` was reverted with `#adaptation_note` citing [lean4#9825](https://github.com/leanprover/lean4/issues/9825) — author waiting for upstream grind fix.  Decompile-once should survive that regression.
+4. **Stage-3 tactic simplifier (residual speed gap, polish).** After the byContradiction Phase-A short-circuit (2026-05-01) and the `Or.casesOn → bare lia` collapse (2026-05-04), decompile is 0.72×–1.13× of grind on grind-success cases.  The remaining gap is in the `by_cases h_abs : … ; · rw [abs_of_nonpos h_abs] at hp; lia ; · rw [abs_of_pos (not_le.mp h_abs)] at hp; lia` shape emitted by `tryDecompAbsCaseSplitContradiction` (Int L47/L91): two `lia` calls, neither obviously merge-able since each branch needs a different rewrite first.  Closing this needs either lia/cutsat to natively handle `abs x` case splits or a hypothesis-rewrite-aware "single lia over the conjoined goal" rule — much less mechanical than the trivial `Or` collapse was.  Polish item, not paper-blocker.
+5. **Snapshot tests for the decompiler output.** Tests 14/15 lock down the `Eq.mp (Eq.symm? (propext (Iff.intro f g))) ev → f/g ev` simplifier collapse; **Tests 16/17/18** lock down the `tryDecompEqMpForallCongr` / `tryDecompEqMpImpliesCongr` peelers; **Test 19** (added 2026-05-05) locks down the bare-`inst✝ → inferInstance` sanitizer rewrite.  Still missing: a snapshot for the projection-chain case (`inst✝.toLE → inferInstance`) — see "Tomorrow's first thing" for why this is deferred — and snapshots for the actual Sum/Int *output shape* (depends on grind's emitted certificates, version-sensitive).
 6. **Document the supported envelope.** The decompiler ships with a stable list of structural handlers (see *What Is Working* below) and grind-specific specializations (see `Specialized/Grind.lean`). A short "what shapes do we handle" table near the top of the README would make it easier to predict whether a new failure is in scope.
 
 ## Long-term plan / Paper framing
@@ -47,9 +47,9 @@ Goal: a paper on decompiling Lean proofs as a way to get **simpler, more stable,
 - **Phase 4 — generality (~8 weeks, parallel with refactors).** Extend coverage beyond grind: `omega`, `polyrith`, `linarith`, `norm_num`. Each tactic has its own certificate shape; one paper subsection each. The structural handlers (`Eq.mp`, `casesOn`, `propext`, etc.) are general — most of the work is per-tactic specializer modules under `Specialized/`.
 - **Phase 5 — paper writing.** Outline: motivation (opaque automation, broken-after-grind-bumps proofs); approach (3-stage pipeline: term simplify → term-to-tactic → tactic simplify); specialization (per-tactic certificate handlers); evaluation (mathlib coverage %, head-to-head speed, cross-version stability); limitations (heartbeat-bounded recursion, generalized cases motives, etc.).
 
-## Performance Snapshot (2026-05-01, updated after byContradiction specialized-first)
+## Performance Snapshot (2026-05-01 baseline, validated within noise 2026-05-04)
 
-Benchmarks via `scripts/nightly.py --runs 3 --warmup 1 --treatment {original,decompile}`. Times are cumulative `tactic execution` seconds at default heartbeat budget; "speedup" is (original / decompile).
+Benchmarks via `scripts/nightly.py --runs 3 --warmup 1 --treatment {original,decompile}`. Times are cumulative `tactic execution` seconds at default heartbeat budget; "speedup" is (original / decompile).  Note: 2026-05-04 spot-checks reproduced these numbers within ±20% (noise is dominated by competing CPU load — a Friday `lean` orphan pile-up was caught and cleaned up; see Done section).  No re-baseline needed.
 
 | File / line | grind (orig) | decompile | speedup |
 |-|-|-|-|
@@ -71,11 +71,29 @@ Concrete L91 example: was 14× slower (0.640s, ~50 lines), now 1.3× slower (0.0
 
 Speed pitch for the paper now defensible: **comparable to grind on grind-success cases (within 30% on average), much faster on grind-timeout cases** (yet to be measured systematically).  The remaining 20–30% gap is from running `lia`/`grind`'s engine multiple times per branch in the cases that *do* genuinely need a case-split — addressable via the Top TODO #1 stage-3 simplifier.
 
-## Broader corpus coverage (2026-05-01)
+## Broader corpus coverage (2026-05-05, fresh sweep)
 
-Ran nightly across all of `Mathlib/Algebra/Order/` (25 files containing 54 grind sites), with a per-query 120s wall-clock timeout to prevent hangs from blocking the rest.  Results in `results-broader-order.json`, dumps in `dump-broader-order/`.
+Ran nightly across all of `Mathlib/Algebra/Order/` (25 files), with a per-query 120s wall-clock timeout.  Results in `results-broader-order.json`, dumps in `dump-broader-order/`.  Sweep took ~17 min wall-clock, zero orphan processes (process-group cleanup verified working in production).
 
-**Coverage: 18/54 = 33%** at the time of the sweep.  The dominant failure mode in this snapshot — "suggestion produced but cross-file re-elaboration failed" — was driven by `inst✝` references and is **addressed by the 2026-05-04 `inferInstance` substitution** (see Done section below).  Coverage on a fresh sweep is expected to jump well above 33% but hasn't been re-measured yet (the broader-corpus re-run is the next benchmark task; it's deferred while we're still iterating on individual handlers).
+**Coverage: 23/49 = 47%** — up from the 2026-05-01 baseline of 18/54 = 33% (re-baselined to 49 actual grind tactic sites; 5 of the original 54 turned out to be `@[grind =]` *attribute* uses that the script's regex falsely matched as tactic calls — fixed in `bench_grind.py:_has_grind`).  Same fix-adjusted comparison: **23/49 vs 18/49** = +5 successful sites = **+10 percentage points** from yesterday's two cross-file fixes.
+
+**Where the +5 wins came from**: every gain is in the cross-file `inst✝` cluster.  That cluster collapsed from 15/36 failures to 0/26 — entirely closed by the 2026-05-04 `inferInstance` substitution + projection-chain handling.
+
+Failure breakdown of the remaining 26:
+
+| Failure mode | Count (2026-05-05) | Was (2026-05-01, of 36) | Notes |
+|-|-|-|-|
+| Wall-clock timeout (>120s) | 10 | 10 | Mostly slow file-load (Antidiag/* per yesterday's investigation), not decompile bug; some Field/Basic, Module/Defs, MinMax, Ring/Int may be fixable. |
+| `other` (parse / typeclass / heterogeneous errors) | 5 | 9 | -4 from removing the false-positive parse-error sites.  Remainder includes `Mathlib/Algebra/Order/Ring/Abs.lean:62` (typeclass synth missing context), `Field/Basic.lean:664/668` (grind error before decompile), `BigOperators/GroupWithZero/Finset.lean:68`, `Star/Basic.lean:184`. |
+| Validation → exact fallback | 5 | 5 | 3 of 5 are `Ring/Unbundled/Rat.lean:89/97/142` — likely common shape, worth investigating. |
+| Heartbeat timeout | 5 | 5 | Heterogeneous: `BigOperators/Group/Finset.lean:596`, `BigOperators/Ring/Finset.lean:144`, `Group/MinMax.lean:73`, `Ring/StandardPart.lean:193`, `Ring/Unbundled/Rat.lean:83`. |
+| Cross-file `inst✝` ref | 0 | 15 | **Closed by the 2026-05-04 `inferInstance` substitution.** |
+| Output too large (>20KB) | 1 | 1 | `Ring/Unbundled/Rat.lean:44` — fall-through to giant `exact` term. |
+
+Highest-leverage next targets:
+1. **`Ring/Unbundled/Rat.lean` cluster** (4 failures: L44 too-large, L83 heartbeat, L89/L97/L142 validate-fallback) — one file, four shapes; common cause likely.
+2. **Wall-clock-timeout cluster** — investigation needed to separate "slow file load" from "decompile-induced hang".  Per-phase profile markers (2026-05-04) help here: rerun with `set_option leanDecomp.profile true` and look for which phase wall-clocks.
+3. **Validation→exact fallback cluster** — `Group/Finset.lean:599` and the 3 Rat sites; small enough to hand-investigate each.
 
 Failure breakdown from the original sweep (36 total):
 
@@ -118,6 +136,41 @@ Top representative cases (by replacement size):
 5. `Mathlib/Algebra/ContinuedFractions/Computation/CorrectnessTerminating.lean:150` — explicitly reverted with `#adaptation_note` citing [lean4#9825](https://github.com/leanprover/lean4/issues/9825) — author waiting for upstream grind fix.  **This is the headline stability story:** decompile-once and you don't need to revert when grind's flaky.
 
 These cases are not yet directly testable from our pinned mathlib commit (the mining went back further than the pin), but the paper plan can cite them and rerun against an updated pin once we're ready to run the cross-version stability experiment (Phase 3 of the long-term plan).
+
+### Tomorrow's first thing (resume marker, 2026-05-05 mid-day)
+
+The broader-corpus sweep landed: **23/49 = 47% (up from 33%)**.  The cross-file `inst✝` cluster is fully closed.  Remaining 26 failures: 10 wall-clock-timeout, 5 other, 5 validate-fallback, 5 heartbeat, 1 too-large.  See "Broader corpus coverage (2026-05-05)" for the full table.
+
+- **(A) Investigate `Ring/Unbundled/Rat.lean`** (Top TODO #1).  4 failures in one file (L44 too-large, L83 heartbeat, L89/L97/L142 validate-fallback) — high probability of a common underlying shape.  Concrete first move: `cat dump-broader-order/Mathlib/Algebra/Order/Ring/Unbundled/Rat/L89.decompile.failed.lean` to see what the macro emitted, then check the simplified proof shape via `set_option leanDecomp.dumpOnFail true` and a probe.
+- **(B) Validation→exact fallback in `BigOperators/Group/Finset.lean:599`** — 1 isolated case in the validate-fallback cluster, smaller than the Rat cluster but with a known signature ("intro y h_1; exact @Classical.byContradiction …" giant) per the original 2026-05-01 dump.
+- **(C) Order-grind handlers** (Top TODO #2) — still the long-tail coverage move.  Concrete starting point: `min_assoc` in `Mathlib/Order/Defs/LinearOrder.lean:158`.
+
+**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests (Test 19 included), `bigstep`, `simple`, `bench_grind` regex unit tests (validates the 2026-05-05 attribute-line skip).  All passed at end of 2026-05-05 mid-day.
+
+### Done: broader-corpus sweep + attribute false-positive fix (2026-05-05)
+
+Re-ran `nightly.py` across all of `Mathlib/Algebra/Order/` to validate the 2026-05-04 cross-file fixes.  **Coverage jumped from 18/54 = 33% → 23/49 = 47%** (re-baselined after the false-positive correction below).  Sweep took ~17 min wall-clock; zero stray `lean Mathlib` processes after — the 2026-05-04 process-group cleanup verified working in production.
+
+**Where the wins came from**: every gain is in the cross-file `inst✝` cluster.  That cluster collapsed from 15 failures → 0.  All other failure clusters (wall-clock-timeout, validate-fallback, heartbeat, too-large, "other") are unchanged from 2026-05-01.  See "Broader corpus coverage" section above for the full failure breakdown.
+
+**Re-baseline note: 5 sites were never grind tactic calls**.  The script's `bench_grind.GRIND_RE = r'(?<!\w)grind(?=\s|\[|$)'` matched `grind` in `@[simp, grind =]` *attribute* declarations (Lean's `grind` is registered as both a tactic and an attribute).  Substituting `decompile grind` produced invalid syntax `@[simp, decompile grind =]` and the queries failed at parse time with "unexpected token '='; expected ']'".  Affected: `Ring/Abs.lean:49`, `Interval/Set/Instances.lean:74/78/173/229`.  Fix: added two attribute-skip checks to `_has_grind` — `ATTR_RE` (line contains `@[…]`) and `GRIND_ATTR_EQ_RE` (`grind =` / `grind :=` patterns).  Unit-tested against 9 line shapes in-process before re-deploy.  The corrected total is **49 actual grind tactic sites** in the Order/ folder.
+
+**Top remaining clusters by leverage**:
+1. `Ring/Unbundled/Rat.lean` — 4 failures in one file (L44 too-large, L83 heartbeat, L89/L97/L142 validate-fallback).  High probability of a common underlying shape.  **Top TODO #1.**
+2. Wall-clock-timeout (10) — mostly slow file-load (per yesterday's Antidiag/* investigation), but Field/Basic.lean L327/656, Module/Defs L1076, MinMax L30/34, Ring/Int L58 worth probing with `leanDecomp.profile` on.
+3. Order-grind cluster (in "other" + some validate-fallback) — `Lean.Grind.Order.le_eq_false_of_lt` chains.  **Top TODO #2.**
+
+### Done: Test 19 sanitizer snapshot lock (2026-05-05)
+
+Added §7 + Test 19 to `Test.lean`: a regression lock for the 2026-05-04 `inst✝ → inferInstance` substitution.  Triggers `tryDecompTheoremAppFallback` via a synthetic `class FooBar (α : Type) where rel : α → α → Prop` and an axiom `foo_trans` with two proof args, so the decompile output is `refine @LeanDecomp.Test.Sanitize.foo_trans α inferInstance a b c ?_ ?_; · exact h1; · exact h2`.  The `inferInstance` slot exercises the bare-ident gate of `sanitizeInaccessibleIdents`.
+
+**Investigation note (don't repeat this loop)**: also tried to add a Test 20 for the projection-chain case (`inst✝.toLE → inferInstance`).  Two synthetic probes (`/tmp/sanitize-probe2.lean`, `/tmp/sanitize-probe3.lean`) were written using `class A` + `class B extends A`, but neither reproduced the actual failure shape:
+- `[b : B α]` (named binder): proof term carries `b.toA` — `b` is accessible, sanitizer correctly does NOT fire (validation passes too).
+- `[B α]` (anonymous binder) + `B.toA (self := inferInstance)` in source: proof term carries `inferInstance.toA` — the `inferInstance` is the *const*, not a fvar, so the sanitizer's narrow gate (correctly) doesn't fire.  The cross-file failure is "type class instance expected ?m" because of the literal `inferInstance`-without-type-annotation, NOT a sanitization bug.
+
+The actual `inst✝.toLE` failure mode (Group/List.lean L234) requires grind to emit an explicit `<inst-fvar>.toLE` projection in the proof term against an anonymously-bound class.  Reproducing that without mathlib's `Lean.Grind.Order.*` infra is hard.  The L234 regression test (currently passing in nightly via the dump-list-test slice) is the existing lock for that path; promoting it into a Test.lean snapshot needs either a mathlib-importing test target or a more clever synthetic — deferred (see Tomorrow's first thing for the deferred work).
+
+A follow-up false start (also avoid): added a `hasInaccessibleClassPrefix` helper that walked qualified names component-by-component looking for an inst-fvar parent, hoping the `inferInstance.toA` failure was a qualified-ident form of inaccessible-projection.  It wasn't — `inferInstance` (the global const) doesn't have macro scopes or `✝` markers, so the helper correctly didn't fire either.  Reverted; the original two-arm match (proj-node + bare-ident) is the right shape.
 
 ### Done: per-phase profile markers + `Core.checkSystem` in simplifier (2026-05-04)
 
@@ -393,6 +446,8 @@ The decompiler currently has two responses:
   - `simplifyEqRecOfIdMotive` (formerly `simplifyEqRecOfTrueIntro`) reduces `Eq.rec.{0, _} Prop True (motive := fun x _ => x) True.intro target h` to `Eq.mp h True.intro`.
   - `simplifyEqMpTrueIntroEqTrue` matches both `Eq.mp` and `Eq.mpr` (since `simplifyPropCast` rewrites between them) and handles applied transports with beta-reduction.
 - Output policy is enforced: the decompiler does **not** emit `simp`, `simp_all`, `grind`, or `omega` as generated proof steps.
+- Output sanitization (`sanitizeInaccessibleIdents` in `Helpers.lean`, run at `buildDecompiledTactics`) replaces inaccessible-named typeclass-instance refs (`inst✝`, `inst✝.toLE`, etc.) with `inferInstance` so emitted suggestions survive cross-file re-elaboration.  Three-condition narrow gate (macro-scoped/✝ name + lctx hit + `Meta.isClass?` true) ensures non-instance hygienic refs are left alone.
+- Tactic-level collapse: `tryDecompCasesOn` recognises the trivial `Or.casesOn` with both branches reducing to bare `lia` (Sum L55/L81 hot pattern) and short-circuits to a single `lia`, validated against the original goal.
 
 ### Nightly Snapshot
 
@@ -410,16 +465,16 @@ python scripts/nightly.py \
   --dump dump-nightly-sum --output results-nightly-sum.json
 ```
 
-Results (2026-04-30):
+Results (2026-05-04, unchanged from 2026-04-30 except where today's `Or.casesOn → bare lia` collapse fired):
 - `Mathlib/Algebra/Order/Group/Unbundled/Int.lean`: 5/5 (lines 47, 69, 76, 79, 91).
 - `Mathlib/Algebra/Order/Group/Int/Sum.lean`: 4/4 (lines 36, 55, 70, 81).
 
-Int L69 simplifies to `apply Classical.byContradiction; intro hp; lia`. L47/L76/L79/L91 decompile via byContradiction → outer `cases` over an `of_eq_eq_true`-shaped disjunction → inner `cases` of the resulting `And` → `tryDecompAbsCaseSplitContradiction` at each leaf. Sum L70 and L36 both collapse to byContradiction + `have h_fact := hs x …` + `rw [Finset.mem_sdiff, Finset.mem_<Ico|Ioc>] at hp` + `lia` via the lctx-based mem-rewrite scan + `tryDecompEqMpForallCongr` peeler (see "Done" above).
+Int L69 simplifies to `apply Classical.byContradiction; intro hp; lia`. L47/L76/L79/L91 decompile via byContradiction → outer `cases` over an `of_eq_eq_true`-shaped disjunction → inner `cases` of the resulting `And` → `tryDecompAbsCaseSplitContradiction` at each leaf. Sum L70 and L36 both collapse to byContradiction + `have h_fact := hs x …` + `rw [Finset.mem_sdiff, Finset.mem_<Ico|Ioc>] at hp` + `lia` via the lctx-based mem-rewrite scan + `tryDecompEqMpForallCongr` peeler.  **Sum L55/L81** further collapse all the way to bare `apply Classical.byContradiction; intro hp; lia` via the 2026-05-04 `Or → lia` rule.
 
 ### Main Open Blockers
 
-- **No stage-3 tactic simplifier.** Successful decompiles still contain `have hOr : ... := by lia; cases hOr with | inl ⟨..⟩ => ...` boilerplate.
-- **Coverage of grind sites is still narrow.** Both nightly slices are deliberately small. Broader sweeps will surface new shapes the structural handlers don't cover yet.
+- **Stage-3 tactic simplifier (residual).**  Trivial `cases hOr | lia | lia` collapse landed 2026-05-04.  Remaining residue: `tryDecompAbsCaseSplitContradiction`'s two-branch `by_cases h_abs ; · rw …; lia ; · rw …; lia` shape (Int L47/L91) — see Top TODO #4.
+- **Cross-file coverage on the broader corpus** (Top TODO #1).  Today's `inferInstance` substitution and projection-chain handling addressed the dominant 15/36 failure mode, but a fresh sweep is needed to confirm the new coverage number and identify the next cluster.
 
 ## Lessons Learned (selected)
 
@@ -434,6 +489,10 @@ These are the lessons most likely to bite future work; the full chronological lo
 - **Generalized motives extension via `MVarId.generalize` + eq-fvar substitution breaks `LeanDecomp.simple`.** Tried the obvious extension (use `MVarId.generalize` with `hName?` to introduce both abstracted fvar and eq hyp, then `MVarId.cases`, then substitute `heq → real_eq_fvar` in the body). Two issues surfaced: (1) `MVarId.cases` reverts and re-introduces dependent hypotheses, so the eq-fvar's id changes per branch — must be looked up by user name. (2) More importantly, the old path's `Eq.rec` cleanup (substituting `heq → Eq.refl s` and stripping the resulting transport) is **load-bearing** for downstream handlers like `contradiction` and `noConfusion`, which consume the type-incorrect intermediate the cleanup produces. Reverted; documented in Recommended Next Steps.
 - **The `MVarId.cases` refactor reduced wall-time elaboration cost as a side effect.** Sum L70 wall time at 8M heartbeats dropped from ~24s to ~12s. Likely because the cases-substituted lctx is smaller (the discriminant fvar is gone, references go directly to the constructor pattern rather than through a transport). The 200k-heartbeat budget is unchanged — the timeout for L70/L36 is bounded by kernel `isDefEq`/`whnf` work, which the substitution doesn't reduce.
 - **Decompilation does not share subterms.** Walking the proof as a tree (no hash-consing or `let`-binding) means an inner subproof appearing `n` times generates `n` copies in the output. CSE on the proof term would amortize the elaborator's work, but is deferred until simpler structural fixes are exhausted.
+- **Inaccessible-name sanitization needs three conditions** (2026-05-04).  The `inst✝ → inferInstance` rewrite must check (a) `Name.hasMacroScopes ∨ isInaccessibleUserName`, (b) FVar exists in lctx with that exact userName, AND (c) `Meta.isClass?` returns `some _`.  An earlier broader version that fired on any `hasMacroScopes` ident broke validation by replacing accessible hygienic binders.  Also: the substitute MUST be built via `mkIdent ``inferInstance` (not `\`(inferInstance)` quotation) — quotation attaches a fresh macro scope which PrettyPrinter then sanitizes back to `inferInstance✝`, ironically reproducing the exact problem we're fixing.
+- **Projection-chain inaccessible refs need whole-projection replacement** (2026-05-04).  `inst✝.toLE` cannot be rewritten to `inferInstance.toLE` — Lean fails to synthesize `inferInstance : ?m` before descending into `.toLE` ("type class instance expected ?m").  The correct fix replaces the WHOLE `Term.proj` chain with a single `inferInstance`, since the projection's result type is also a class — typeclass synthesis can target the chain's final type directly.
+- **Per-phase profile markers must `(← IO.getStderr).flush` explicitly** (2026-05-04).  Stderr is fully-buffered when redirected; without flush, `IO.eprintln` markers are lost on SIGKILL — defeating the diagnostic for "macro hung at phase X" cases that the markers exist to identify.
+- **`subprocess.run(timeout=…)` only kills the immediate child** (2026-05-04, `bench_grind.run_cmd`).  `lake env lean` spawns `lean` workers that orphan to PID 1 when the lake parent dies.  Friday's broader-corpus run left 18 orphans burning CPU for 30+ hours.  Fix: `start_new_session=True` + `os.killpg(pgid, SIGTERM)` on timeout, plus an `atexit` / `SIGINT` / `SIGTERM` / `SIGHUP` walker over a `_LIVE_GROUPS` registry for script-level Ctrl-C / crash cases.  EPERM on `killpg(_, 0)` (probe) and EPERM on `killpg(_, SIGTERM/SIGKILL)` are both treated as "group is gone" — macOS returns EPERM after the leader is reaped even though the group is effectively dead.
 
 ## Things that already failed and should not be retried naively
 
