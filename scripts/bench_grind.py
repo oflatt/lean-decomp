@@ -596,7 +596,19 @@ def _extract_non_direct_treatment(workspace, source, lean_file, grind_line,
 
 
 def _parallel_workers(task_count: int) -> int:
-    """Choose a conservative worker count for subprocess-heavy tasks."""
+    """Choose a conservative worker count for subprocess-heavy tasks.
+
+    Honours `LEAN_DECOMP_INNER_WORKERS` env var when set, so an outer
+    orchestrator (e.g. nightly.py's `--parallel N`) can cap inner
+    parallelism to avoid oversubscribing CPUs.  Without the env var, uses
+    `cpu_count - 1` as before."""
+    env_cap = os.environ.get("LEAN_DECOMP_INNER_WORKERS")
+    if env_cap:
+        try:
+            cap = max(1, int(env_cap))
+            return max(1, min(task_count, cap))
+        except ValueError:
+            pass
     cpu_count = os.cpu_count() or 1
     return max(1, min(task_count, max(cpu_count - 1, 1)))
 

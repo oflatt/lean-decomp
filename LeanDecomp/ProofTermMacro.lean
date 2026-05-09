@@ -84,7 +84,27 @@ private def expandAuxiliaryProofs (e : Expr) : MetaM Expr := do
 /-- Try running tactics against the current goal state, always restoring the
     original state afterwards. Returns an error string on failure. -/
 private def checkDecompiled (tactics : TSyntax `Lean.Parser.Tactic.tacticSeq) : TacticM (Option String) := do
-  let tacticStr := toString (← PrettyPrinter.ppTactic ⟨tactics⟩)
+  let tacticStr := toString (← LeanDecomp.ppTacticFull tactics)
+  -- Pre-flight check: scan for U+22EF ('⋯' MIDLINE HORIZONTAL ELLIPSIS),
+  -- the marker Lean's PrettyPrinter inserts on truncation.  If present in
+  -- the rendered source, re-elaboration would fail with an opaque
+  -- "internal exception #5" (the parser cannot consume `⋯`).  Fail fast
+  -- with a specific diagnostic instead so the user knows WHERE to look.
+  --
+  -- All known truncation paths are option-controlled: `pp.deepTerms`
+  -- (depth-50), `pp.proofs` (Prop subterms), `pp.maxSteps` (5000-step
+  -- visit counter).  `LeanDecomp.delabRefinable` and `ppTacticFull`
+  -- (Helpers.lean) lift all three; `ppExprToTermSyntaxWith _ true` lifts
+  -- `pp.maxSteps` plus `pp.all` (which implies the other two).  A new
+  -- delab/format call site that doesn't go through these helpers is the
+  -- expected cause of any future hit here.
+  if tacticStr.contains '⋯' then
+    return some s!"decompile output contains the `⋯` truncation marker; \
+this means a PrettyPrinter call site somewhere does not lift the truncation \
+options (pp.deepTerms / pp.proofs / pp.maxSteps).  Route it through \
+`LeanDecomp.delabRefinable` / `LeanDecomp.ppTacticFull` (Helpers.lean) \
+or wrap with `withOptions LeanDecomp.liftPPTruncationOptions`.\n\n\
+generated tactics:\n{tacticStr}"
   let savedState ← saveState
   let savedMsgs ← Core.getMessageLog
   -- Suppress intermediate error messages during validation
@@ -186,7 +206,7 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   match validateResult with
   | some err =>
       let dumpHint ← if leanDecomp.dumpOnFail.get (← getOptions) then
-          let tacticStr := toString (← PrettyPrinter.ppTactic ⟨tacticSeq⟩)
+          let tacticStr := toString (← LeanDecomp.ppTacticFull tacticSeq)
           let stem ← writeFailureDump tacticStr simplifiedProof lctx
           pure m!"\n[dump: {stem}.tac / {stem}.proof / {stem}.lctx]"
         else
@@ -198,7 +218,7 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
   -- Check if the decompiled proof is too large, which indicates the decompiler
   -- fell through to raw `exact` terms for constructs it doesn't handle yet.
   let maxSize := 20000
-  let tacticStr := toString (← PrettyPrinter.ppTactic ⟨tacticSeq⟩)
+  let tacticStr := toString (← LeanDecomp.ppTacticFull tacticSeq)
   -- (FileMap is available via CoreM which TacticM extends)
   let col : Nat ←
     match tk.getPos? true with
@@ -213,6 +233,28 @@ elab (name := decompileTac) tk:"decompile " t:tacticSeq : tactic => withMainCont
       | _ => pure 0
   let codeActionStr := reindentForCodeAction tacticStr col
   if tacticStr.length > maxSize then
+    -- Last-resort: try `chooseExactStrategy` on the whole proof.  This
+    -- triggers the `grind only [<extracted-lemmas>]` attempt (in
+    -- `Helpers.lean`), which compresses a giant structural emission into
+    -- a small `grind only [a, b, c]` line when the lemma list closes the
+    -- goal.  Concrete target: `Mathlib/Algebra/Order/Ring/Unbundled/
+    -- Rat.lean:44` — structural decomp produces 34KB; grind-only
+    -- compression gets it under the 20KB sanity cap.
+    let fallbackTacs ← LeanDecomp.chooseExactStrategy simplifiedProof lctx localInstances {
+      enforceMaxSize := false   -- already past the size we care about
+      tryDecideFirst := true
+      forcePrettyPrint := fun _ => false
+    }
+    let fallbackSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$fallbackTacs]*)
+    let fallbackStr := toString (← LeanDecomp.ppTacticFull fallbackSeq)
+    if fallbackStr.length <= maxSize then
+      match ← checkDecompiled fallbackSeq with
+      | none =>
+          let codeActionStr := reindentForCodeAction fallbackStr col
+          evalTactic fallbackSeq
+          addSuggestion tk { suggestion := .string codeActionStr } (origSpan? := ← getRef)
+          return
+      | some _ => pure ()
     logError m!"decompile failed: generated proof too large ({tacticStr.length} chars, max {maxSize}). The decompiler likely lacks handlers for some proof term constructs."
     return
   evalTactic tacticSeq
@@ -300,7 +342,7 @@ elab "showdecomp " t:term : tactic => withMainContext do
   let tacs ← (decompileExpr simplifiedProof lctx localInstances).run' []
   let tactics ← simplifyTactics tacs
   let tacticSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$tactics]*)
-  let tacticStr := toString (← PrettyPrinter.ppTactic ⟨tacticSeq⟩)
+  let tacticStr := toString (← LeanDecomp.ppTacticFull tacticSeq)
   logInfo m!"decompiled tactics:\n{tacticStr}"
 
 end LeanDecomp

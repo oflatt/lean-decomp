@@ -4,9 +4,10 @@ import LeanDecomp.Helpers
 
 namespace LeanDecomp.Specialized.Grind
 open Lean Elab Meta Tactic
-open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
+-- delabRefinable routed through `LeanDecomp.delabRefinable`
+-- (Helpers.lean) for pp.deepTerms+pp.proofs lifting.
 
-open LeanDecomp (peelArgs)
+open LeanDecomp (peelArgs delabRefinable)
 
 /-- Strip `Eq.mp <cast> inner` when the cast is automation-generated junk and
     the inner proof already has the goal type. This is grind-specific today, so
@@ -43,7 +44,7 @@ private def tryDecompEqMpKnownGrindCast (castName : Name) (expr : Expr)
   let inner := args[3]!
   let some _ := LeanDecomp.matchConstApp? castProof castName 0 | return none
   withLCtx lctx localInsts do
-    let castStx ← delabToRefinableSyntax castProof
+    let castStx ← delabRefinable castProof
     let eqMpIdent : Ident := ⟨mkIdent ``Eq.mp |>.raw.setInfo .none⟩
     let headTac ← `(tactic| refine $eqMpIdent:ident $castStx ?_)
     let result ← LeanDecomp.emitTacticWithSubgoals headTac #[inner] lctx localInsts decompileExpr
@@ -320,12 +321,12 @@ private def tryHavesPlusLia (expr exprTy : Expr) (lctx : LocalContext)
     let factStx ← try
       withOptions (fun o =>
         (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
-        Lean.Meta.Tactic.TryThis.delabToRefinableSyntax fact
+        delabRefinable fact
     catch _ => continue
     let factTyStx ← try
       withOptions (fun o =>
         (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
-        Lean.Meta.Tactic.TryThis.delabToRefinableSyntax factTy
+        delabRefinable factTy
     catch _ => continue
     let hName := LeanDecomp.mkUniqueName "h_fact" (← LeanDecomp.getUsed)
     LeanDecomp.addUsed hName
@@ -607,9 +608,9 @@ def tryDecompAbsCaseSplitContradiction (expr : Expr) (lctx : LocalContext)
     let some x := absX? | return none
     let targets ← findHypsWithAbsOf x
     if targets.isEmpty then return none
-    let xStx ← delabToRefinableSyntax x
+    let xStx ← delabRefinable x
     let xTy ← Meta.inferType x
-    let xTyStx ← delabToRefinableSyntax xTy
+    let xTyStx ← delabRefinable xTy
     let hName := LeanDecomp.mkUniqueName "h_abs" (← LeanDecomp.getUsed)
     let hIdent : Ident := mkIdent (Name.mkSimple hName)
     let nonposLemma : Ident := mkIdent `abs_of_nonpos
@@ -761,10 +762,93 @@ def tryDecompFalseFromLia (expr : Expr) (lctx : LocalContext)
       return some r
     return none
 
+/-- True iff `e` contains a `Lean.Grind.Order.<name>_unsat_k` constant
+    anywhere in its subterm tree (bounded walk, 5000 nodes).  This is
+    grind's order-arithmetic "this is unsatisfiable" certificate shape;
+    the term proves `False` directly (no other lemmas in the family
+    have type `False`). -/
+private def containsOrderUnsatLemma (e : Expr) : Bool := Id.run do
+  let mut stack : List Expr := [e]
+  let mut count := 0
+  while !stack.isEmpty && count < 5000 do
+    let cur := stack.head!
+    stack := stack.tail!
+    count := count + 1
+    match cur with
+    | .const n _ =>
+      let s := n.toString
+      if s.startsWith "Lean.Grind.Order." && s.endsWith "_unsat_k" then
+        return true
+    | .app f a => stack := f :: a :: stack
+    | .lam _ t b _ => stack := t :: b :: stack
+    | .forallE _ t b _ => stack := t :: b :: stack
+    | .letE _ t v b _ => stack := t :: v :: b :: stack
+    | .mdata _ b => stack := b :: stack
+    | .proj _ _ b => stack := b :: stack
+    | _ => pure ()
+  return false
+
+/-- Approximate node-count cap for the order-grind leaf handler.  Larger
+    proofs cause `with_unfolding_all exact <giant>` validation to burst
+    the wall-clock budget (Rat L89/97 hit 120s timeouts when the leaf was
+    effectively the entire proof).  Keep this small enough that the
+    handler only fires on actual *leaves* of a structural decomp tree,
+    not on the whole proof falling through. -/
+private def orderGrindLeafMaxNodes : Nat := 5000
+
+/-- When the goal is `False` and the proof contains a
+    `Lean.Grind.Order.<name>_unsat_k` certificate (rational/order
+    arithmetic unsat shape), emit a local `with_unfolding_all exact`
+    rather than letting the whole containing proof fall through to a
+    monolithic fallback.  Bounded by `orderGrindLeafMaxNodes` so it
+    only fires on small leaves.
+
+    Why: structural decomp of an `Or.casesOn → And.casesOn → False.elim
+    (Lean.Grind.Order.lt_unsat_k …)` chain previously bailed at the leaf
+    (no specialized handler matched), causing the OUTER cases-on to fall
+    through and emit one huge `with_unfolding_all exact <whole-proof>`.
+    Recognizing the leaf as "specialized exact OK here" lets the outer
+    structural form succeed with each branch having its own (much
+    smaller) `with_unfolding_all exact <leaf>`.  Concrete target:
+    `Mathlib/Algebra/Order/Ring/Unbundled/Rat.lean:89/97/142`.
+
+    `lia`/`omega` would be cleaner but neither handles `Rat`; emitting
+    the original term wrapped with `with_unfolding_all` is the only
+    output-policy-compliant choice. -/
+def tryDecompFalseFromOrderGrind (expr : Expr) (lctx : LocalContext)
+    (localInsts : LocalInstances) (_decompileExpr : DecompileCallback)
+  : DecompM (Option (Array (TSyntax `tactic))) := do
+  withLCtx lctx localInsts do
+    let exprTy ← Meta.inferType expr
+    unless exprTy.isConstOf ``False do return none
+    unless containsOrderUnsatLemma expr do return none
+    -- Size guard: skip on giant proofs to avoid wall-clock timeouts during
+    -- the outer validation step.  The handler is for LEAVES of a
+    -- structural decomp; if we've been handed the whole proof, the
+    -- structural recursion isn't getting traction and a single big
+    -- `with_unfolding_all exact` won't help.
+    if LeanDecomp.exprNodeCount expr > orderGrindLeafMaxNodes then return none
+    let termStx ← LeanDecomp.delabRefinable expr
+    let exactTac ← `(tactic| with_unfolding_all exact $termStx)
+    -- Validate locally so we don't emit candidates the outer validation
+    -- can't handle (saves the wall-clock-timeout failure mode by failing
+    -- fast at the heartbeat-bounded `candidateTacticsCloseGoal`).
+    if ← LeanDecomp.candidateTacticsCloseGoal #[exactTac] exprTy lctx localInsts then
+      return some #[exactTac]
+    return none
+
 def handlers : List (Expr → LocalContext → LocalInstances → DecompileCallback →
     DecompM (Option (Array (TSyntax `tactic)))) := [
   tryDecompFinsetIntervalMembership,
   tryDecompFalseFromLia,
+  -- DISABLED 2026-05-07 PM: `tryDecompFalseFromOrderGrind` (defined above)
+  -- did not move Rat coverage and regressed L89/L97 from "fail fast
+  -- (validate-fallback ~15s)" to "wall-clock-timeout (120s)".  The
+  -- handler's size-guarded structural emission lets the OUTER decomp
+  -- proceed deeper, which then validates a bigger candidate that
+  -- exhausts the file-level heartbeat budget.  Definition kept in tree
+  -- as preparatory infra for a future Order-shapes pass.
+  -- tryDecompFalseFromOrderGrind,
   tryDecompEqMpIntLinearNormLe,
   tryDecompEqMpIffEq,
   tryDecompEqMpNotEqProp,

@@ -9,7 +9,8 @@ import LeanDecomp.Simplify
 
 namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter Tactic
-open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
+-- delabRefinable routed through `LeanDecomp.delabRefinable`
+-- (Helpers.lean) for pp.deepTerms+pp.proofs lifting.
 
 private def theoremHeadToExplicitTermSyntax (headName : Name) : MetaM Term := do
   let env ← getEnv
@@ -32,9 +33,9 @@ private def theoremAppToNotationTermSyntax (headName : Name) (args : List Expr)
         let argType ← instantiateMVars (← Meta.inferType arg)
         if argType.isSort then
           try ppExprToTermSyntaxWith arg false
-          catch _ => delabToRefinableSyntax arg
+          catch _ => delabRefinable arg
         else
-          delabToRefinableSyntax arg
+          delabRefinable arg
     argTerms := argTerms.push argTerm
   pure <| Syntax.mkApp headTerm argTerms
 
@@ -543,7 +544,7 @@ mutual
       let letDeclName := Name.mkSimple letName
       let newLctx := lctx.mkLetDecl letFVarId letDeclName (← Meta.inferType value) value
       let newBody := body.instantiate1 (Expr.fvar letFVarId)
-      let valueStx ← delabToRefinableSyntax value
+      let valueStx ← delabRefinable value
       let letTac ← `(tactic| let $(mkIdent letDeclName):ident := $valueStx)
       let bodyTactics ← withLCtx newLctx localInsts do
         let newLocalInsts ← getLocalInstances
@@ -578,8 +579,8 @@ mutual
       -- and replace with `exact absurd h h'`. This works at tactic level because
       -- casesOn branches unify the types that differ at the Expr level.
       if let some (h, h') := extractContradiction falseArg then
-        let hStx ← delabToRefinableSyntax h
-        let h'Stx ← delabToRefinableSyntax h'
+        let hStx ← delabRefinable h
+        let h'Stx ← delabRefinable h'
         let absurdId := mkIdent ``absurd
         let tac ← `(tactic| exact $absurdId $hStx $h'Stx)
         return some #[tac]
@@ -705,10 +706,10 @@ mutual
       -- using the equivalent `refine $delabTerm` — if the refine matches,
       -- so does apply.
       let allArgsProofLike := proofLikeMask.all id
-      let delabTerm ← delabToRefinableSyntax app
+      let delabTerm ← delabRefinable app
       if ← refineTacMatchesProofArgs delabTerm exprTy proofArgs lctx localInsts then
         let headTac ← if allArgsProofLike then
-            let headTerm ← delabToRefinableSyntax fn
+            let headTerm ← delabRefinable fn
             `(tactic| apply $headTerm)
           else
             `(tactic| refine $delabTerm)
@@ -724,7 +725,7 @@ mutual
 
       let compactTerm ←
         try ppExprToTermSyntaxWith app false
-        catch _ => delabToRefinableSyntax app
+        catch _ => delabRefinable app
       let usePpAll := !(← refineTacProducesGoals compactTerm exprTy proofArgs.size lctx localInsts)
       let refineTerm ← if usePpAll then
           try ppExprToTermSyntaxWith app true

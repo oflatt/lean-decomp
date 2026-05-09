@@ -5,7 +5,9 @@ import LeanDecomp.Helpers
 
 namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter Tactic
-open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
+-- All `delabRefinable` calls go through `LeanDecomp.delabRefinable`
+-- (Helpers.lean), which lifts pp.deepTerms + pp.proofs so emitted source
+-- isn't truncated with `⋯`.
 
 /-- Some proposition-equality proof terms delaborate into anonymous structure
     literals like `{ mp := ..., mpr := ... }`, which are fragile in calc steps
@@ -167,7 +169,7 @@ def tryDecompCongrArg (expr : Expr) (lctx : LocalContext)
     let f := args[args.length - 2]!
     let hEq := args[args.length - 1]!
     let some _ ← inferEqType? hEq | return none
-    let fStx ← delabToRefinableSyntax f
+    let fStx ← delabRefinable f
     let refineTac ← `(tactic| refine $(mkIdent ``congrArg) $fStx ?_)
     let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[hEq] lctx localInsts decompileExpr
     return some result
@@ -190,7 +192,7 @@ private partial def getCalcProof (proof : Expr) (lctx : LocalContext)
       let proofTactics ← LeanDecomp.decompileOrExact proof lctx localInsts decompileExpr
       `(term| by $proofTactics:tactic*)
     else
-      let termStx ← delabToRefinableSyntax proof
+      let termStx ← delabRefinable proof
       pure termStx
 
 /-- Walk a normalized `Eq.trans` chain collecting `calcStep` syntax nodes.
@@ -204,7 +206,7 @@ private partial def getCalcSteps (proof : Expr) (acc : Array (TSyntax ``calcStep
     | Eq.refl _ _ => getCalcSteps p2 acc lctx localInsts decompileExpr  -- skip refl steps
     | _ =>
       let proofStx ← getCalcProof p1 lctx localInsts decompileExpr
-      let step ← `(calcStep| _ = $(← delabToRefinableSyntax rhs) := $proofStx)
+      let step ← `(calcStep| _ = $(← delabRefinable rhs) := $proofStx)
       getCalcSteps p2 (acc.push step) lctx localInsts decompileExpr
   | Eq.refl _ _ => return acc  -- skip trailing refl
   | _ => do
@@ -212,7 +214,7 @@ private partial def getCalcSteps (proof : Expr) (acc : Array (TSyntax ``calcStep
     let some (_, _, rhs) := type.eq?
       | throwError "Expected proof of equality, got {type}"
     let proofStx ← getCalcProof proof lctx localInsts decompileExpr
-    let step ← `(calcStep| _ = $(← delabToRefinableSyntax rhs) := $proofStx)
+    let step ← `(calcStep| _ = $(← delabRefinable rhs) := $proofStx)
     return acc.push step
 
 /-- Handle `Eq.symm` by naming the input equality and reusing `Eq.symm`. -/
@@ -247,12 +249,12 @@ def tryDecompEqTrans (expr : Expr) (lctx : LocalContext)
     | Eq.trans _ _ _ _ _ _ => do
       let stepStx ← getCalcSteps exprNorm #[] lctx localInsts decompileExpr
       let calcTac ← `(tactic| calc
-            $(← delabToRefinableSyntax lhs):term
+            $(← delabRefinable lhs):term
             $stepStx*)
       return some #[calcTac]
     | _ => do
       -- Single-step result after normalization; just delaborate it
-      let proofStx ← delabToRefinableSyntax exprNorm
+      let proofStx ← delabRefinable exprNorm
       let tac ← `(tactic| exact $proofStx)
       return some #[tac]
 
@@ -298,8 +300,8 @@ def tryDecompEqRecPropTransport (expr : Expr) (lctx : LocalContext)
           mkEqSymm' hEqNorm
         else
           return none
-      let sourceTyStx ← delabToRefinableSyntax sourceTy
-      let targetTyStx ← delabToRefinableSyntax targetTy
+      let sourceTyStx ← delabRefinable sourceTy
+      let targetTyStx ← delabRefinable targetTy
       let eqMpIdent := mkCleanIdent ``Eq.mp
       let refineTac ← `(tactic| refine @$eqMpIdent:ident $sourceTyStx $targetTyStx ?_ ?_)
       let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[transportEq, baseWithArgs] lctx localInsts decompileExpr
@@ -315,8 +317,8 @@ def tryDecompEqRecPropTransport (expr : Expr) (lctx : LocalContext)
       return none
 
     let transportEq ← mkCongrArg' motive hEqNorm
-    let sourceTyStx ← delabToRefinableSyntax sourceTy
-    let targetTyStx ← delabToRefinableSyntax targetTy
+    let sourceTyStx ← delabRefinable sourceTy
+    let targetTyStx ← delabRefinable targetTy
     let eqMpIdent := mkCleanIdent ``Eq.mp
     let refineTac ← `(tactic| refine @$eqMpIdent:ident $sourceTyStx $targetTyStx ?_ ?_)
     let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[transportEq, baseWithArgs] lctx localInsts decompileExpr
@@ -365,8 +367,8 @@ def tryDecompEqMp (expr : Expr) (lctx : LocalContext)
 
     let targetTy ← Meta.inferType expr
     let eqProofNorm ← simplifyEqProof eqProofArg
-    let sourceTyStx ← delabToRefinableSyntax sourceTy
-    let targetTyStx ← delabToRefinableSyntax targetTy
+    let sourceTyStx ← delabRefinable sourceTy
+    let targetTyStx ← delabRefinable targetTy
     let eqMpIdent := mkCleanIdent ``Eq.mp
     let refineTac ← `(tactic| refine @$eqMpIdent:ident $sourceTyStx $targetTyStx ?_ ?_)
     let result ← LeanDecomp.emitTacticWithSubgoals refineTac #[eqProofNorm, sourceProofArg] lctx localInsts decompileExpr
@@ -396,7 +398,7 @@ private def emitHavePeel
   let hFvarId := FVarId.mk (← mkFreshId)
   let lctxWithH := postIntroLctx.mkLocalDecl hFvarId (Name.mkSimple hName) witnessTy
   let hInsts ← withLCtx lctxWithH postIntroInsts getLocalInstances
-  let witnessStx ← withLCtx postIntroLctx postIntroInsts (delabToRefinableSyntax witness)
+  let witnessStx ← withLCtx postIntroLctx postIntroInsts (delabRefinable witness)
   let hIdent := mkIdent (Name.mkSimple hName)
   let haveTac ← `(tactic| have $hIdent:ident := $witnessStx)
   let prefixTacs := introTacs.push haveTac

@@ -5,7 +5,7 @@ import LeanDecomp.Helpers
 
 namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter Tactic
-open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)
+open LeanDecomp (delabRefinable)
 
 /-- Replace the (empty) binder list of an `inductionAltLHS` node with the given
     binder identifiers.  An `inductionAlt` parses to
@@ -562,7 +562,7 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
         -- this, mixed ℕ/ℤ expressions can fail because `-1` requires `Neg`.
         let discTypeStx ← withOptions (fun o =>
             (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
-          delabToRefinableSyntax discType
+          delabRefinable discType
         let discSeq ← `(Lean.Parser.Tactic.tacticSeq| $[$discTacticsEarly]*)
         let hOrName := LeanDecomp.mkUniqueName "hOr" (← getUsed)
         addUsed hOrName
@@ -573,7 +573,7 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
       else
         withOptions (fun o =>
           (o.setBool `pp.coercions.types true).setBool `pp.numericTypes true) <|
-        delabToRefinableSyntax info.discriminant
+        delabRefinable info.discriminant
     let eqBinderName? : Option String := eqInfo.map fun (eqName, _) =>
       let discName := getDiscriminantName info.discriminant lctx
       if discName == some eqName then s!"{eqName}_eq" else eqName

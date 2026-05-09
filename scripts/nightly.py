@@ -7,6 +7,7 @@ the decompiler on each Lean file containing `grind` in the given path.
 import argparse
 import http.server
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -201,6 +202,21 @@ def main():
                         help="Skip benchmarking and just serve existing results")
     parser.add_argument("--port", type=int, default=8080,
                         help="Port for the eval-live server (default: 8080)")
+    parser.add_argument("--skip-mathlib-setup", action="store_true",
+                        help=("Skip the git checkout / clean / lean-decomp dependency "
+                              "registration in ensure_mathlib.  Use when invoking "
+                              "nightly.py multiple times in parallel from a wrapper "
+                              "script (e.g. smoke.sh) — the parallel git ops race "
+                              "on .git/index.lock.  Caller is responsible for "
+                              "running mathlib setup once before the parallel block."))
+    parser.add_argument("--parallel", type=int, default=1, metavar="N",
+                        help=("Run up to N files concurrently in the outer loop "
+                              "(default 1 = serial).  Each file's bench_grind keeps "
+                              "its inner per-query parallelism, but capped to "
+                              "cpu_count // N via LEAN_DECOMP_INNER_WORKERS to avoid "
+                              "oversubscribing.  Aim for N ~ 4 on this 8-core box "
+                              "to roughly halve wall-clock for a broader-corpus sweep "
+                              "without catastrophic CPU contention."))
     add_bench_args(parser)
     args = parser.parse_args()
 
@@ -232,8 +248,14 @@ def main():
         serve_results(results, workspace, args.port)
         return 0
 
-    mathlib = ensure_mathlib(workspace)
-    build_lean_decomp(workspace)
+    if args.skip_mathlib_setup:
+        mathlib = workspace / MATHLIB_DIR
+        if not mathlib.exists():
+            print(f"--skip-mathlib-setup but {mathlib} doesn't exist; aborting", file=sys.stderr)
+            return 2
+    else:
+        mathlib = ensure_mathlib(workspace)
+        build_lean_decomp(workspace)
 
     if args.path is None:
         target = mathlib / "Mathlib" / "Algebra" / "Order" / "Group"
@@ -259,14 +281,54 @@ def main():
         print(f"\nBuilding {len(modules)} module(s)...")
         run(["lake", "build"] + modules, cwd=mathlib)
 
-    # Benchmark each file
+    # Benchmark each file (optionally in parallel — see --parallel).
     db = BenchDB()
-    for i, f in enumerate(lean_files, 1):
-        rel = f.relative_to(mathlib)
-        print(f"\n{'='*60}")
-        print(f"[{i}/{len(lean_files)}] {rel}")
-        print(f"{'='*60}")
-        bench_grind(str(rel), mathlib, args, db=db)
+    if args.parallel <= 1:
+        for i, f in enumerate(lean_files, 1):
+            rel = f.relative_to(mathlib)
+            print(f"\n{'='*60}")
+            print(f"[{i}/{len(lean_files)}] {rel}")
+            print(f"{'='*60}")
+            bench_grind(str(rel), mathlib, args, db=db)
+    else:
+        # Outer-parallel mode: cap inner workers so total concurrent lean
+        # processes stay around cpu_count.  Each thread gets its own
+        # BenchDB instance (SQLite in-memory dbs aren't thread-safe) and
+        # we merge into the main `db` after all complete.  Print output
+        # interleaves freely; the [k/N] prefix lets readers correlate.
+        import concurrent.futures
+        cpu = os.cpu_count() or 1
+        inner = max(1, cpu // args.parallel)
+        os.environ["LEAN_DECOMP_INNER_WORKERS"] = str(inner)
+        print(f"\nOuter-parallel sweep: {args.parallel} files concurrent, "
+              f"inner cap {inner} (cpu_count={cpu})")
+
+        def _work(idx_total_relpath):
+            i, total, rel = idx_total_relpath
+            local_db = BenchDB()
+            print(f"\n[{i}/{total}] start {rel}")
+            try:
+                bench_grind(str(rel), mathlib, args, db=local_db)
+            except Exception as e:
+                print(f"[{i}/{total}] EXCEPTION {rel}: {e}", file=sys.stderr)
+            print(f"[{i}/{total}] done  {rel}")
+            # Serialize to plain Python lists in the SAME thread the SQLite
+            # connection was created in.  SQLite forbids cross-thread
+            # access by default, so reading the connection on the main
+            # thread (during merge) raises ProgrammingError.  Returning
+            # detached lists sidesteps the issue cleanly.
+            timings_rows = list(local_db.conn.execute("SELECT * FROM timings"))
+            errors_rows = list(local_db.conn.execute("SELECT * FROM errors"))
+            return (timings_rows, errors_rows)
+
+        tasks = [(i, len(lean_files), f.relative_to(mathlib))
+                 for i, f in enumerate(lean_files, 1)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as ex:
+            for (timings_rows, errors_rows) in ex.map(_work, tasks):
+                for row in timings_rows:
+                    db.add_timing(row[0], row[1], row[2], json.loads(row[3]), row[4])
+                for row in errors_rows:
+                    db.add_error(row[0], row[1], row[2], row[3])
 
     db.save_json(args.output)
     print(f"\nResults saved to {args.output}")

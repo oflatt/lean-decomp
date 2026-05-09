@@ -137,15 +137,192 @@ Top representative cases (by replacement size):
 
 These cases are not yet directly testable from our pinned mathlib commit (the mining went back further than the pin), but the paper plan can cite them and rerun against an updated pin once we're ready to run the cross-version stability experiment (Phase 3 of the long-term plan).
 
-### Tomorrow's first thing (resume marker, 2026-05-05 mid-day)
+### Done: pre-flight `⋯` detection (2026-05-06)
 
-The broader-corpus sweep landed: **23/49 = 47% (up from 33%)**.  The cross-file `inst✝` cluster is fully closed.  Remaining 26 failures: 10 wall-clock-timeout, 5 other, 5 validate-fallback, 5 heartbeat, 1 too-large.  See "Broader corpus coverage (2026-05-05)" for the full table.
+Defensive forward-looking check in `checkDecompiled` (`ProofTermMacro.lean`): scan the formatted `tacticStr` for U+22EF (`⋯`, MIDLINE HORIZONTAL ELLIPSIS) BEFORE `evalTactic`.  If present, fail fast with a specific diagnostic ("decompile output contains the `⋯` truncation marker; route through `LeanDecomp.delabRefinable` / `LeanDecomp.ppTacticFull` …") instead of letting Lean bubble up an opaque "internal exception #5" with no actionable info.
 
-- **(A) Investigate `Ring/Unbundled/Rat.lean`** (Top TODO #1).  4 failures in one file (L44 too-large, L83 heartbeat, L89/L97/L142 validate-fallback) — high probability of a common underlying shape.  Concrete first move: `cat dump-broader-order/Mathlib/Algebra/Order/Ring/Unbundled/Rat/L89.decompile.failed.lean` to see what the macro emitted, then check the simplified proof shape via `set_option leanDecomp.dumpOnFail true` and a probe.
-- **(B) Validation→exact fallback in `BigOperators/Group/Finset.lean:599`** — 1 isolated case in the validate-fallback cluster, smaller than the Rat cluster but with a known signature ("intro y h_1; exact @Classical.byContradiction …" giant) per the original 2026-05-01 dump.
-- **(C) Order-grind handlers** (Top TODO #2) — still the long-tail coverage move.  Concrete starting point: `min_assoc` in `Mathlib/Order/Defs/LinearOrder.lean:158`.
+**Why**: the L599 investigation (2026-05-04 / 2026-05-06) burned hours diagnosing what `internal exception #5` meant before identifying it was a parser-level rejection of `⋯`.  A future delab/format call site added without going through the wrappers would re-trigger the same multi-hour debugging.  The substring scan is O(n) on the rendered string (already produced for the error message), so cost is negligible.
 
-**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests (Test 19 included), `bigstep`, `simple`, `bench_grind` regex unit tests (validates the 2026-05-05 attribute-line skip).  All passed at end of 2026-05-05 mid-day.
+`liftPPTruncationOptions` is now public so the diagnostic's suggested fix is actionable from anywhere.  In normal operation the diagnostic never fires — it's a guard against future regressions, not a behavior change.
+
+### Done: route all delab through `delabRefinable` + lift `pp.maxSteps` (2026-05-06)
+
+Followed up on yesterday's resume marker option (A) — thread the option lift through ALL `delabToRefinableSyntax` call sites.  Implementation: introduced **two single-source helpers** in `Helpers.lean`:
+
+- `liftPPTruncationOptions : Lean.Options → Lean.Options` — lifts THREE truncation options (not two — yesterday's analysis missed `pp.maxSteps`).
+- `delabRefinable : Expr → MetaM Term` — wraps `delabToRefinableSyntax` with the lift.
+- `ppTacticFull : TSyntax → CoreM Format` — wraps `PrettyPrinter.ppTactic` with the lift, used at every `tacticSeq → string` site in `ProofTermMacro.lean`.
+
+Then renamed every `delabToRefinableSyntax` call across `CasesOn.lean`, `EqDecomp.lean`, `Decompiler.lean`, `Specialized/Grind.lean` (plus the two fully-qualified `Lean.Meta.Tactic.TryThis.delabToRefinableSyntax` uses) to `delabRefinable`.  Removed the per-file `open Lean.Meta.Tactic.TryThis (delabToRefinableSyntax)` (replaced with `open LeanDecomp (delabRefinable)` where appropriate, or just a comment pointer).  The local `delabFull` previously inside `chooseExactStrategy` is now redundant — replaced with `delabRefinable`.
+
+**The third option was the real culprit (`pp.maxSteps`)**.  Yesterday I lifted only `pp.deepTerms` and `pp.proofs` — neither helped L599.  Today's investigation: `pp.maxSteps` defaults to **5000** and tracks visited-expression count globally during a single format.  Large proof terms exhaust this budget mid-print, causing tail truncation as `⋯`.  L599's binder annotation `(h_2 : ⋯)` was elided BECAUSE the counter ran out before the binder, not because of depth or proof-elision.  Critically: `pp.all := true` does NOT lift `pp.maxSteps`, so even the `ppExprToTermSyntaxWith _ true` path was producing `⋯` for L599-sized proofs.  Lifted `pp.maxSteps := 1000000` in BOTH `ppExprToTermSyntaxWith` and `delabRefinable`/`ppTacticFull` via `liftPPTruncationOptions`.
+
+**Validation on L599**: previously the failure was `unexpected '⋯'` style "internal exception #5".  Now the failure mode CHANGES — `decompile failed: generated proof too large (127738 chars, max 20000)`.  The fallback `exact <giant>` is now produced in full (127KB!), exceeding the macro's 20KB sanity guard.  This is a **correct** failure: the truncation was hiding a "proof is genuinely massive" issue.  L599's real fix would be either an order-grind handler that decomposes the giant fallback, or raising the 20KB threshold + adding a real exact-emission strategy that's more readable.  Either way, "the suggestion has `⋯` and crashes the parser" is no longer the failure mode.
+
+**Other affected sites** (potential gains, not yet validated): every nightly query that previously failed validation due to `⋯` in any rendered output should now either succeed or fail with a more informative error.  Re-running the broader-corpus is Top TODO #1.
+
+### Done: dev-loop tooling pass — probe.sh, analyze.py, smoke.sh, parallel sweep (2026-05-05/06)
+
+Per the dev-loop priorities surfaced 2026-05-05:
+
+1. **`scripts/probe.sh`** extended: accepts any `--dump <dir>` (default searches all `dump-*` dirs, was hardcoded to `dump-nightly-*`).  Also added `--profile` and `--dumpOnFail` flags for one-shot diagnostic injection.
+2. **`scripts/analyze.py`** (new): `bucket RESULTS_JSON [DUMP_ROOT]` prints per-cluster failure breakdown; `diff OLD NEW` shows fixed/regressed/persistent (with shape-changed callouts) between sweeps.  Replaces the ad-hoc Python I was writing inline every analysis.
+3. **`scripts/smoke.sh`** (new): runs `lake build` + Sum slice + Int slice + Group/List L234 cross-file.  Sequential mathlib setup once upfront, then Sum/List in parallel via `--skip-mathlib-setup`.  **80s sequential → 16s parallel**.  Catches >95% of regressions.  Includes orphan-process check at end.
+4. **`nightly.py --parallel N`** (new): outer-loop parallelization via `concurrent.futures.ThreadPoolExecutor`.  Each worker uses its own `BenchDB` (SQLite in-memory dbs aren't thread-safe), merged at the end.  `LEAN_DECOMP_INNER_WORKERS` env var caps inner per-file parallelism to `cpu_count // N` so total concurrent `lean` processes stay around `cpu_count`.  Process-group cleanup from 2026-05-04 handles per-child orphans correctly under parallel load.  Verified launches 11 properly-parented `lean Mathlib/...` processes; no orphans after kill.
+5. **`nightly.py --skip-mathlib-setup`** (new, supporting #3 + #4): skips the `git checkout` / `git clean` / `lake update` block in `ensure_mathlib`.  Required because parallel invocations otherwise race on `.git/index.lock`.  Caller is responsible for one-shot setup.
+6. **`bench_grind.py` attribute false-positive fix (yesterday morning, 2026-05-05)**: `GRIND_RE` was matching `grind` inside `@[simp, grind =]` *attribute* declarations.  Added `ATTR_RE` and `GRIND_ATTR_EQ_RE` skip checks.  Re-baselined corpus from 54 → 49 actual grind tactic sites.
+
+### Done: too-large escape hatch via `chooseExactStrategy` (2026-05-10, infra only)
+
+Added a fallback in `ProofTermMacro.lean` after the 20KB max-size check: when the structural decomp produces output > 20KB, retry `chooseExactStrategy` on the whole simplified proof.  This triggers the `grind only [<extracted>]` attempt at the WHOLE-proof level — when the compressed form fits AND validates, emit it instead of erroring.
+
+**Coverage win**: zero new sites today.  Tested on:
+- `Mathlib/Algebra/Order/Ring/Unbundled/Rat.lean:44` (the targeted case): the compressed form is the SAME 34KB (the goal `0 ≤ if true = true then normalize … else …` requires `cases` on `s : Bool` to make progress; one-shot `grind only [<extracted>]` doesn't compress because the goal isn't directly grind-closable without the case split).  Stays "too-large".
+- `Mathlib/Algebra/Order/Ring/Unbundled/Rat.lean:142` (validate-fallback): structural decomp doesn't get traction at all; the new escape doesn't help.  Stays failing.
+- `Mathlib/Algebra/Order/BigOperators/Group/Finset.lean:599`: structural decomp now passes LOCAL validation (was failing before) — but cross-file re-elaboration fails with "typeclass instance problem is stuck: Singleton α ?m.143".  Some metavariable in the goal isn't fully determined.  Different failure mode; not addressed here.
+- `Mathlib/Algebra/Order/Ring/IsNonarchimedean.lean:216`: hits `(deterministic) timeout at delab` (the giant proof's delaboration overruns 200k heartbeats during the rendering pass).  Different shape; not addressed.
+
+**Kept in tree** because the escape hatch is correct infrastructure: smoke 4/4 unaffected, no regressions, and any future case where structural-decomp-but-too-large overlaps with grind-only-can-compress will benefit automatically.
+
+### Done: `grind only [<extracted>]` last-resort fallback (2026-05-09)
+
+**Coverage win**: Rat 0/5 → **3/5** on `Mathlib/Algebra/Order/Ring/Unbundled/Rat.lean` (L83, L89, L97 now pass cross-file).  L142 (validate-fallback) and L44 (too-large) still fail.  Smoke green throughout (Sum 4/4, Int 5/5, List 1/1, build OK).  Zero stray processes.
+
+**The fix**: in `chooseExactStrategy` (`Helpers.lean`), before emitting the giant `(with_unfolding_all)? exact <giant>` fallback, try `grind only [<extracted-user-lemmas>]` first.  The lemma list is collected from the proof term itself by `extractGrindOnlyLemmas` — these are the user-form lemmas grind picked up during proof search (e.g. `Rat.mkRat_pos_iff`, `Int.not_le_eq`).  When the extracted-lemma `grind only` validates locally, we emit it; otherwise fall through to the existing exact emission.
+
+The output shape: structural decomp wins for everything that decomposes cleanly, with `grind only [<extracted>]` ONLY at leaf positions where the structural recursion can't make progress.  Concrete L89 emission:
+
+```lean
+apply Classical.byContradiction
+intro hp
+have hOr : … := by lia
+cases hOr with
+| inl h_1 =>
+    cases h_1 with
+    | intro left =>
+      refine False.elim ?_
+      · refine @Lean.Grind.Order.lt_unsat_k ℚ … ?_ ?_ ?_ ?_
+        · exact Lean.Grind.instLawfulOrderLTRat
+        · exact instIsPreorder_mathlib
+        · exact Lean.Grind.instOrderedRingRat
+        · decide
+        · refine …
+            · grind only [mkRat, Rat.mkRat_pos_iff, Int.not_le_eq]   -- ← here
+        ...
+```
+
+Most of the proof is structural; `grind only` appears only at the (formerly opaque) order-grind leaves.
+
+**`extractGrindOnlyLemmas` filter**: after a tightening pass, rejects (a) grind-internal namespaces (`Lean.Grind.*`, `Lean.Omega.*`, `Int.Linear.*`, `Lean.RArray.*`, `Lean.Parser.*`, `Lean.Elab.*`, `Lean.Meta.*`); (b) names with components starting `inst` (typeclass instances like `Rat.instLT`, `instOfNatNat`, `instIsPreorder_mathlib`) or starting `to` (typeclass projections like `PartialOrder.toPreorder`); (c) a small list of structural primitives + operator/literal classes.  Without the `inst*`/`to*` filter, lists ballooned to 37 lemmas of mostly typeclass instance noise; with it, lists are typically 1–3 user lemmas plus 1–2 type/constructor names.
+
+**Policy note**: this is the deliberate relax of the "no `grind` in output" policy, scoped to `grind only [<extracted>]` AS A LAST RESORT.  Bare `grind` (with grind's automatic lemma discovery) is still forbidden.  `grind only [...]` is meaningfully different: the lemma list is fixed at decompile time, so the output is stable across grind-internal changes (grind's automatic lemma instantiation can shift between versions; an explicit `only [...]` list cannot).  Order: structural handlers → specialized handlers → terminal arithmetic (`lia`/`decide`) → **`grind only [<extracted>]`** → giant `(with_unfolding_all)? exact <whole>`.
+
+**Limitation**: 100k-node walk cap in `extractGrindOnlyLemmas` (was 5k initially — too small; the L89 proof is ~13k nodes and `mkRat_pos_iff` appears past the 5k mark).  100k is enough for typical mathlib proofs while bounding worst-case time.
+
+### Investigation: `Lean.Grind.Order.eq_mp` simplifier rewrite (2026-05-08, no coverage win)
+
+**Tried**: in `Simplify/Grind.lean`, added rewrites for `Lean.Grind.Order.eq_mp p q h₁ h₂ → Eq.mp h₁ h₂` (and `eq_mp_not` similarly) so the existing `simplifyPropCast` / `tryDecompEqMp` chain could handle them on Rat-arithmetic order proofs.  Rationale: the L89 simplified proof has many `Lean.Grind.Order.eq_mp` wrappers around polynomial-form transports — converting them to core `Eq.mp` form would feed into the established peeler chain.
+
+**Did not ship a coverage win**:
+- The rewrite fired (post-rewrite simplified proof has 0 `Lean.Grind.Order.eq_mp` references — confirmed via `dumpOnFail`).
+- Smoke 4/4 unchanged — no regressions.
+- Rat 0/5 unchanged.  L89/L97 unaffected.
+- The simplified proof STILL contains many other `Lean.Grind.Order.*` lemmas that the decompiler can't peel: `eq_trans_true`, `le_eq_true_of_lt_k`, `lt_of_not_le_k`, `Lean.Grind.CommRing.le_norm_expr`, etc.  The rewrite for `eq_mp` alone doesn't unblock the structural decomp because the surrounding wrappers are still opaque.
+
+**Reverted**: the rewrites are removed from `simplifyGrindWrappers`.  Lesson: piecewise simplifier rewrites for the order-grind family don't compose with the existing decompiler — too many sibling lemmas need handlers / rewrites simultaneously to make a difference.  A coordinated `Specialized/Grind/Order.lean` pass is the right level of intervention, not one rewrite.
+
+### Investigation: order-grind leaf handler (2026-05-07 PM, no coverage win)
+
+**Tried**: added `tryDecompFalseFromOrderGrind` in `Specialized/Grind.lean`, between `tryDecompFalseFromLia` and `tryDecompEqMpIntLinearNormLe`.  Matches `False` goals where the proof contains a `Lean.Grind.Order.<name>_unsat_k` constant (grind's order-arithmetic unsat-certificate shape, which `lia` can't close because the underlying field is `Rat` not `Int`).  Emits `with_unfolding_all exact <leaf>` with a heartbeat-bounded validation.
+
+Hypothesis was: structural decomp of `Or.casesOn → And.casesOn → False.elim (Lean.Grind.Order.lt_unsat_k …)` was bailing at the leaf (no specialized handler matched), so the OUTER cases-on couldn't make progress and the whole proof fell through to one monolithic `with_unfolding_all exact <whole-proof>`.  Recognizing the leaf would let the outer structural form succeed with each branch having its own (much smaller) `with_unfolding_all exact <leaf>`.
+
+**Did not ship a coverage win**:
+- Without size guard: Rat L83/89/97 regressed from "fail fast (validate-fallback, ~15s)" to "wall-clock-timeout (120s)".  The validation `with_unfolding_all exact <giant>` for the full-proof case bursts the heartbeat budget.
+- With size guard (`exprNodeCount > 5000` skips): regression mostly fixed (L83 returns to fast-fail).  But L89/L97 still wall-clock-timeout — the structural decomp succeeds at the leaf level and validation moves to a higher level which is itself slow.
+- L142 / L44: unchanged.  Coverage on Rat: still 0/5.
+- Smoke (Sum 4/4, Int 5/5, List 1/1, build OK): unaffected.
+
+**Kept in tree but DISABLED in dispatch list** (2026-05-08): on re-test the next day with the size guard, L89/L97 returned to wall-clock-timeout (the structural decomp progresses deeper, then validates a bigger candidate that exhausts the file's heartbeat budget).  Definition retained as preparatory infra; `tryDecompFalseFromOrderGrind` is commented out of the `handlers` list.
+
+**For tomorrow**: the actual blockage on L89/L97 is upstream of this handler — the structural recursion isn't getting traction even when the leaf is recognized.  Probably need to also handle one of: (a) `Or.casesOn` discriminant with `Lean.Grind.of_eq_eq_true (eq_true …)` shape, (b) the `Eq.mp (Lean.Grind.Order.eq_mp …) …` chain that wraps each leaf, (c) the `Eq.mp (Lean.Grind.CommRing.lt_norm_expr …) …` polynomial-form transport.  Each is a separate `Specialized/Grind/Order.lean`-style handler.
+
+### Investigation: `rename_i` fallback for inaccessible hypotheses (2026-05-07, no coverage win)
+
+**Tried**: prepend `rename_i name1 name2 …` to the fallback exact emission, plus a post-process pass that replaces references to inaccessible userNames in the delabbed Syntax with the freshly-assigned accessible names.  Targeted `IsNonarchimedean.lean:216` (its fallback `exact <…> a✝` references inaccessible `a✝` literally and fails re-elab with a free-reference type-mismatch).
+
+**Did not ship a coverage win**:
+1. Wiring it into `chooseExactStrategy` regressed L234 (smoke went 1/1 → 0/1).  The `Meta.withLCtx renamedLctx` propagated the renamed lctx to upstream validation paths, breaking structural decomp.  Switched to a post-process `Syntax.replaceM` to keep delab in the original lctx — fixed L234 regression.
+2. With the post-process approach: L216 now hangs at 120s+ during validation (was failing fast before with a clear error).  Hypothesis: `rename_i` consumes inaccessibles → original userNames are gone from lctx → the giant exact term's references fail to resolve → Lean's elaborator explores a large search space (instance synthesis trying to fill missing lctx slots) → wall-clock timeout.
+
+**Reverted**: `chooseExactStrategy` no longer emits the prefix.  Smoke 4/4 across the board; no regressions.
+
+**Helpers retained** (`Helpers.lean`) for future use:
+- `renameInaccessibleHyps : LocalContext → (Array Ident × Std.HashMap Name Name)` — given an lctx, generates fresh `h_inacc_N` names for inaccessibles AND a `oldName → newName` map.
+- `replaceInaccessibleRefs : Syntax → Std.HashMap Name Name → Syntax` — post-process that walks a Syntax tree replacing matching idents.
+
+**For tomorrow**: if pursuing this path, the right approach is probably narrower — fire the rename ONLY when the proof term actually references inaccessibles (check via `Expr.foldl` or similar) AND only on smaller proofs where the elaborator search space is bounded.  The blunt "always emit rename_i" caused the L216 hang because Lean's elaborator on giant terms with missing names goes off the rails.  Or skip this entirely: option (B) order-grind handlers is more leverage on the same Rat / `Lean.Grind.Order.*` cluster.
+
+### Tomorrow's first thing (resume marker, 2026-05-10 EOD)
+
+**Today**: investigated remaining Rat failures (L44 too-large, L142 validate-fallback) and probed Group/Finset L599 + IsNonarchimedean L216 to see if the 2026-05-09 grind-only fallback helps elsewhere.  No new coverage wins — added a too-large escape hatch in `ProofTermMacro.lean` (retry `chooseExactStrategy` on the whole proof when structural emits >20KB) as infrastructure but didn't move L44 specifically.
+
+**Pick from**:
+- **(O) Re-run broader-corpus** to see the actual coverage delta from 2026-05-09's grind-only fallback.  Last measured 23/49 = 47% on 2026-05-05; today's fixes target validate-fallback and too-large clusters which had ~6-7 sites.  Quick (~5 min via `nightly.py --parallel 4 --skip-mathlib-setup`).  Highest-leverage move because it picks the next handler target based on actual data instead of guessing.
+- **(P) `Group/Finset:L599`-style typeclass-metavariable issue**: structural decomp now produces locally-valid tactics that fail cross-file with "typeclass instance problem is stuck: Singleton α ?m.143".  Likely: the structural form has a binder-typing issue that leaves a metavariable.  Investigate by looking at the dumped failed.lean and finding the metavariable site.
+- **(Q) Delab heartbeat timeout on giant proofs** (IsNonarchimedean:216): the delaborator runs out of 200k heartbeats during rendering.  May need progressive simplification — apply more simplifier rules upfront to shrink the proof before delab.
+- **(R) Tighten `extractGrindOnlyLemmas` filter** — current filter still emits non-theorem names like `mkRat` (a definition), `Finset` (a type).  Could narrow to "is a theorem-typed const" via env lookup; might enable extra grind-only validations to succeed.
+
+**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`.  All passing at end of 2026-05-10.
+
+### Tomorrow's first thing (resume marker, 2026-05-09 EOD)
+
+**Today's win**: `grind only [<extracted-user-lemmas>]` last-resort fallback in `chooseExactStrategy`.  Rat 0/5 → 3/5 (L83, L89, L97 cross-file pass).  See "Done: grind only [<extracted>] last-resort fallback (2026-05-09)" above.
+
+**Pick from**:
+- **(L) Re-run broader-corpus** to measure the coverage delta from today's `grind only` fallback.  Last measurement was 23/49 = 47% on 2026-05-05.  Today's fix may push that significantly higher — many of the wall-clock-timeout / validate-fallback failures had a similar shape (structural decomp falls through, no terminal tactic available).  Quick (~5 min parallel via `nightly.py --parallel 4 --skip-mathlib-setup`).
+- **(M) Investigate the remaining Rat failures**: L44 (too-large, ~34KB exact) and L142 (validate-fallback).  L44 may benefit from a deeper structural decomp + `grind only` at leaves; L142 is some specific shape that needs investigation.
+- **(N) Tighten `isUserLemmaName`** — current filter catches typeclass instances reasonably but emits `mkRat` (a definition, not a theorem) in the lemma list.  Could narrow to "is a theorem-typed const" via env lookup, though `grind only` already handles non-theorems gracefully.
+
+**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`.  All passing at end of 2026-05-09.
+
+### Tomorrow's first thing (resume marker, 2026-05-08 EOD)
+
+**Three Rat-cluster attempts on 2026-05-07 / 2026-05-08 — none shipped a coverage win**:
+1. (PM-1) rename_i fallback for inaccessible hypotheses → L216 hung.  Helpers in tree, inert.
+2. (PM-2) `tryDecompFalseFromOrderGrind` handler → L89/L97 wall-clock-timeout regression.  Definition in tree, commented out of dispatch list.
+3. (today) `Lean.Grind.Order.eq_mp` simplifier rewrite → fired correctly but didn't unblock decomp; reverted.
+
+**Lesson**: piecewise interventions on the order-grind family don't compose with the existing decompiler.  The Rat proofs use a half-dozen sibling lemmas (`Order.eq_mp`, `eq_trans_true`, `le_eq_true_of_lt_k`, `lt_of_not_le_k`, `CommRing.le_norm_expr`, …) that all need to be handled together.  Going forward, the right level of intervention is a coordinated `Specialized/Grind/Order.lean` module that handles the family as a system, not individual handlers/rewrites.
+
+**For tomorrow** (lower-leverage but feasible):
+- **(I) Re-run broader-corpus** to confirm 2026-05-05 lift + today's `delabRefinable` routing didn't accidentally regress sites that were passing.  Quick (~5 min parallel).  Should be done before more handler work to validate the existing tree state.
+- **(J) Look at the `Lean.Grind.CommRing.lt_norm_expr` shape** in the Rat proofs — this is the polynomial-form transport that wraps every Order arithmetic claim.  A handler that recognizes `Eq.mp (Lean.Grind.CommRing.lt_norm_expr …) <evidence>` and emits something traceable might be more impactful than the leaf-targeted handlers.
+- **(K) Drop the Rat work entirely** and pivot to other clusters from the broader-corpus.  Per 2026-05-05 breakdown: 5 heartbeat (`BigOperators/Group/Finset.lean:596`, `BigOperators/Ring/Finset.lean:144`, `Group/MinMax.lean:73`, `Ring/StandardPart.lean:193`, `Ring/Unbundled/Rat.lean:83`) might have a different shape.
+
+**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`.  All passing at end of 2026-05-08.
+
+### Tomorrow's first thing (resume marker, 2026-05-06 EOD)
+
+Today's `delabRefinable` + `pp.maxSteps` lift unblocks `⋯`-truncation cases globally.  L599 changed failure mode (truncation → too-large at 127KB).  Don't know yet whether other clusters benefit — broader-corpus re-run (Top TODO #1) is the validation step.  Pick from:
+
+- **(A) Re-run broader-corpus with `nightly.py --parallel 4 --skip-mathlib-setup`** to re-baseline coverage post-`delabRefinable` and post-`pp.maxSteps` lift.  `dump-broader-order/` from 2026-05-05 morning was 23/49 = 47% (after the cross-file `inst✝` fix).  Today's truncation-lift might unblock additional sites that were previously hitting `⋯` in delab/ppTactic paths and falling through to validate-fallback.  Use `scripts/analyze.py diff dump-broader-order/results.json /tmp/results-new.json` to see what moved.  Quick — should take ~5 min parallel.
+- **(B) Order-grind handlers** (Top TODO #2 / Rat cluster + L599's now-127KB fallback).  After today's truncation fix, L599 falls through to a 127KB raw exact term — visibly the wrong shape.  Adding a `Specialized/Grind/Order.lean` (analogous to the existing `Int.Linear.*` handlers) would decompose the `Lean.Grind.Order.lt_unsat_k` / `lt_le_trans_k` / `CommRing.lt_norm_expr` leaves into structural form.  Concrete starting case: `Mathlib/Order/Defs/LinearOrder.lean:158` (`min_assoc`) — 112-line decompile, 3 inner `Lean.Grind.Order.*` chains.
+- **(C) L599-specific: raise the 20KB max-size guard OR change the fallback emission**.  After today's fix, L599 fails with "proof too large (127738 chars, max 20000)".  20KB is a sanity cap from `ProofTermMacro.lean:200`.  Raising it would emit ugly-but-correct giants; a better fix is to bias toward NOT emitting fallbacks that large, which falls under (B).
+
+**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`.  All passing at end of 2026-05-06.
+
+### In progress: investigating the post-cross-file-fix failure clusters (2026-05-05 PM)
+
+After the morning's broader-corpus sweep showed 23/49 = 47% coverage with the cross-file `inst✝` cluster fully closed, started investigating the next clusters per Top TODO #1 (Rat.lean) and the `BigOperators/Group/Finset.lean:599` validate-fallback case.
+
+**Two findings, neither shipped a coverage win yet but both informative**:
+
+1. **`Mathlib/Algebra/Order/Ring/Unbundled/Rat.lean` cluster (4 failures) is order-grind-shaped.** All 4 sites (L83, L89, L97, L142) and the L44 too-large site share a common simplified-proof skeleton: `Classical.byContradiction (fun hp => Or.casesOn (Lean.Grind.of_eq_eq_true (eq_true ...)) ...)` with each branch terminating in `Lean.Grind.Order.lt_unsat_k` / `Lean.Grind.Order.lt_le_trans_k` / `Lean.Grind.CommRing.lt_norm_expr`-style leaves.  The structural decomp's `tryDecompCasesOn` fails to handle the discriminant `Lean.Grind.of_eq_eq_true (eq_true (Eq.mp ...))` cleanly — falls through to the exact fallback.  The exact fallback then over-unfolds via `with_unfolding_all`, breaking type-correctness (`Lean.Grind.iff_eq` unfolds to `propext (Iff.intro …)` and the surrounding `(fun h b => Eq.symm h ▸ b)` lambda's `h : α = β` no longer typechecks).  **Real fix is order-grind specialized handlers** (Top TODO #2), not a small simplifier rule — the `Lean.Grind.Order.*` lemma family deserves its own `Specialized/Grind/Order.lean` analogous to the `Int.Linear.*` handlers.  Probe script saved at `/tmp/rat89-probe.lean`.
+
+2. **`BigOperators/Group/Finset.lean:599` truncated-by-pp issue.** The fallback `exact <giant>` had `(h_2 : ⋯)` literally in the source (PrettyPrinter elision), causing `internal exception #5` at re-elab.  Tried two fixes in `chooseExactStrategy`'s delab path: lifting `pp.deepTerms` (depth-50 truncation) and `pp.proofs` (proof-elision truncation) when calling `delabToRefinableSyntax`.  **Both options now lifted defensively, but L599 STILL produces `⋯`** — meaning the ⋯-emitting path is NOT through `chooseExactStrategy` for this case.  Likely culprit: `tryDecompTheoremAppFallback` in `Decompiler.lean:708` calls `delabToRefinableSyntax app` directly without option lifting; same for several other delab sites in `Decompiler.lean`.  Tomorrow's first thing: thread the option-lifting helper through ALL `delabToRefinableSyntax` call sites in handler code, OR shadow `delabToRefinableSyntax` at file-import time with a wrapper that always lifts these options.  The defensive change in `chooseExactStrategy` does correctly handle the cases it covers — kept in place.
+
+Validation: Sum 4/4, Int 5/5, all 20 snapshot tests still pass.  No coverage delta from yesterday morning's 23/49 (the L599 fix is incomplete; Rat needs order-grind handlers).
 
 ### Done: broader-corpus sweep + attribute false-positive fix (2026-05-05)
 

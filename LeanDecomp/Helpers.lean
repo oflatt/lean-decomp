@@ -91,12 +91,65 @@ def ppExprToTermSyntaxWith (e : Expr) (usePpAll : Bool) : MetaM Term :=
   withOptions (fun o =>
       let o := pp.coercions.types.set o true
       let o := pp.numericTypes.set o true
+      -- `pp.maxSteps` defaults to 5000 — large proof terms overflow this
+      -- and get tail-truncated as `⋯` even with `pp.all := true` (which
+      -- doesn't override maxSteps).  L599 hit this exactly: the binder
+      -- type was elided as `(h_2 : ⋯)` because the counter ran out
+      -- before the printer reached the binder annotation.
+      let o := pp.maxSteps.set o 1000000
       if usePpAll then
         pp.all.set o true
       else
         o
     ) do
       ppExprToTermSyntax e
+
+/-- Three PrettyPrinter options control terminal-source truncation; we
+    lift all three for any rendering of generated source so emitted
+    suggestions survive re-elaboration.  Lean's defaults are tuned for
+    interactive goal display, not source emission — for our use, `⋯` is
+    fatal because the parser rejects it.
+
+    - `pp.deepTerms := true` (default false, threshold 50): general
+      depth-based subterm elision.
+    - `pp.proofs := true` (default false, threshold 0): elides Prop-typed
+      sub-terms regardless of depth, including binder type annotations.
+    - `pp.maxSteps := 1000000` (default 5000): the printer maintains a
+      visited-expression counter; everything visited after the budget is
+      `⋯`.  L599's `(h_2 : ⋯)` came from this path — proof was big, the
+      counter overflowed before reaching the binder, so the binder type
+      annotation got `⋯` even though it was relatively shallow.
+
+    Concrete failure this addresses: `Mathlib/Algebra/Order/BigOperators/
+    Group/Finset.lean:599`'s `exact @Classical.byContradiction (Eq.{1}
+    Nat ...) (fun (h_2 : ⋯) => ...)`. -/
+def liftPPTruncationOptions (o : Lean.Options) : Lean.Options :=
+  let o := pp.deepTerms.set o true
+  let o := pp.proofs.set o true
+  pp.maxSteps.set o 1000000
+
+/-- `delabToRefinableSyntax` wrapper that disables PrettyPrinter
+    truncation (all three paths — see `liftPPTruncationOptions`).  Use
+    this everywhere we delab a proof term destined for emitted source.
+    `pp.all := true` (via `ppExprToTermSyntaxWith _ true`) already implies
+    `deepTerms`/`proofs`, but NOT `maxSteps`, so the alternate pp.all
+    path also benefits from the maxSteps lift in `ppTacticFull`. -/
+def delabRefinable (e : Expr) : MetaM Term :=
+  withOptions liftPPTruncationOptions (delabToRefinableSyntax e)
+
+/-- `PrettyPrinter.ppTactic` wrapper that lifts the same truncation options
+    as `delabRefinable`.  Even when the Syntax tree has no `⋯` (because we
+    delabbed with the lifts), the FORMATTING step in `ppTactic` re-applies
+    the truncation logic when rendering large sub-terms inside the tactic
+    syntax (notably arg lists and binder type annotations in `exact <giant>`
+    fallbacks).  Use this everywhere we format a generated tactic seq for
+    emission as a suggestion or for re-elaboration validation.
+
+    Concrete failure this addresses: `BigOperators/Group/Finset.lean:599`'s
+    `exact @Classical.byContradiction (Eq.{1} Nat ...) (fun (h_2 : ⋯) => ...)`
+    where `(h_2 : ⋯)` was being injected by ppTactic, not by delab. -/
+def ppTacticFull (stx : TSyntax `Lean.Parser.Tactic.tacticSeq) : CoreM Format :=
+  withOptions liftPPTruncationOptions (PrettyPrinter.ppTactic ⟨stx⟩)
 
 /-- True iff `n` is the Name of an inaccessible binder — one Lean's pretty
     printer renders with the `✝` marker.  Two stored representations both
@@ -333,6 +386,149 @@ private def isBoolEqTrue (ty : Expr) : Bool :=
   | some (α, _, rhs) => α.isConstOf ``Bool && rhs.isConstOf ``Bool.true
   | none => false
 
+/-- Walk `lctx`, identify every inaccessible non-implementation-detail
+    fvar in `lctx`, return a fresh accessible name.  The result is a
+    pair:
+    - `idents` (lctx order): the new accessible idents, suitable for
+      `rename_i` (after reversing — see `chooseExactStrategy` for why).
+    - `oldToNew`: a `Std.HashMap Name Name` from each inaccessible
+      userName to its replacement.  Use with `replaceInaccessibleRefs`
+      to post-process delabbed `Syntax` so references to old userNames
+      become references to new accessible ones.  This is safer than
+      mutating `lctx` and using `withLCtx` around the delab — that
+      approach regressed the L234 structural decomp (the renamed lctx
+      leaked into upstream validation paths).
+
+    Use case: emitting an `exact <term>` fallback where the proof term
+    references inaccessible hypotheses (e.g. `a✝` from a previous
+    elaborator-implicit `intro`).  Without renaming, the rendered source
+    contains `a✝` literally and fails re-elaboration with a type-mismatch
+    on a free reference.  Concrete failure: `Mathlib/Algebra/Order/Ring/
+    IsNonarchimedean.lean:216`. -/
+def renameInaccessibleHyps (lctx : LocalContext) :
+    Array Ident × Std.HashMap Name Name := Id.run do
+  let mut idents : Array Ident := #[]
+  let mut oldToNew : Std.HashMap Name Name := {}
+  let mut idx := 0
+  for declOpt in lctx.decls.toList do
+    let some decl := declOpt | continue
+    if decl.isImplementationDetail then continue
+    -- Match the same set Lean's PrettyPrinter sanitizer would render as
+    -- `name✝`: literal `✝` in any string component OR macro scopes.
+    let needsRename := decl.userName.isInaccessibleUserName
+                       || decl.userName.hasMacroScopes
+    if !needsRename then continue
+    idx := idx + 1
+    let newName := Name.mkSimple s!"h_inacc_{idx}"
+    oldToNew := oldToNew.insert decl.userName newName
+    idents := idents.push (mkIdent newName)
+  return (idents, oldToNew)
+
+/-- Walk `stx` and replace each `Syntax.ident` whose name appears in
+    `oldToNew` with a fresh ident bearing the new name.  Used to retarget
+    delab output at renamed (now-accessible) bindings without having to
+    delab inside a `withLCtx renamedLctx`. -/
+def replaceInaccessibleRefs (stx : Syntax) (oldToNew : Std.HashMap Name Name) : Syntax :=
+  if oldToNew.isEmpty then stx else
+  Id.run <| stx.replaceM fun s =>
+    match s with
+    | .ident _ _ name _ =>
+      match oldToNew.get? name with
+      | some newName => pure (some (mkIdent newName).raw)
+      | none => pure none
+    | _ => pure none
+
+/-- True iff `n` is a "user lemma" name worth handing to `grind only [...]`
+    as a hint when reconstructing a proof.  Heuristic: reject names in the
+    grind-internal certificate namespaces (Lean.Grind, Lean.Omega,
+    Int.Linear, Lean.RArray) and structural primitives (Eq, Or, And, Iff,
+    propext, eagerReduce, …).  Accept anything else — `grind only [a, b]`
+    will silently ignore lemmas it can't make use of, so a few extras
+    don't hurt.
+
+    The point is to surface the lemmas grind ITSELF used during proof
+    search (the original `grind [<hint>]` ones, plus any auto-discovered
+    rewrites that show up in the proof term).  When all our structural
+    handlers fail, re-running grind with EXACTLY this lemma set is the
+    last-resort fallback — see `chooseExactStrategy`. -/
+def isUserLemmaName (n : Name) : Bool :=
+  let s := n.toString
+  let internalPrefixes := [
+    "Lean.Grind.", "Lean.Omega.", "Int.Linear.", "Lean.RArray.",
+    "Lean.Parser.", "Lean.Elab.", "Lean.Meta."
+  ]
+  if internalPrefixes.any (s.startsWith ·) then false
+  else if n.components.any (fun c =>
+      let cs := c.toString
+      -- Reject typeclass instance / projection names (`instLT`, `instAdd`,
+      -- `instOfNatNat`, `Rat.instAdd`, `instIsPreorder_mathlib`, etc.).
+      -- These pollute `grind only [...]` lists without contributing —
+      -- grind synthesizes instances itself.
+      cs.startsWith "inst" ||
+      -- Reject typeclass projections (`Lattice.toSemilatticeInf`,
+      -- `PartialOrder.toPreorder`, etc.).
+      cs.startsWith "to") then false
+  else
+    let structuralExact := [
+      "Eq", "Eq.refl", "Eq.trans", "Eq.symm", "Eq.mp", "Eq.mpr", "Eq.rec",
+      "Eq.ndrec", "Eq.subst", "HEq", "HEq.refl",
+      "Or", "Or.inl", "Or.inr", "Or.casesOn", "Or.elim", "Or.rec",
+      "And", "And.intro", "And.left", "And.right", "And.casesOn", "And.rec",
+      "Iff", "Iff.intro", "Iff.mp", "Iff.mpr", "Iff.casesOn", "Iff.refl",
+      "Not", "False", "False.elim", "False.rec", "True", "True.intro",
+      "Classical.byContradiction", "Classical.em", "Classical.byCases",
+      "Classical.choice", "Classical.choose",
+      "Exists", "Exists.intro", "Exists.casesOn", "Exists.elim",
+      "id", "funext", "propext", "cast", "eagerReduce",
+      "congrArg", "congrFun", "congr", "congrFun'",
+      "eq_true", "eq_false", "of_eq_true", "of_eq_false",
+      "absurd", "mt", "implies_congr", "forall_congr",
+      -- Operator/literal classes (typeclass-related but caught by name).
+      "LT.lt", "LE.le", "HAdd.hAdd", "HMul.hMul", "HSub.hSub",
+      "OfNat.ofNat", "Neg.neg", "IntCast.intCast", "NatCast.natCast",
+      "Membership.mem", "DFunLike.coe",
+      -- Common type names that pass the above filter.
+      "Nat", "Int", "Bool", "Bool.true", "Bool.false", "Rat", "Real",
+      "Ne"
+    ]
+    !(structuralExact.any (· == s))
+
+/-- Walk a proof term and collect distinct const names that look like
+    user-callable lemmas (per `isUserLemmaName`).  Bounded walk (5000
+    nodes) so giant proofs don't burn the heartbeat budget here.  Used by
+    `chooseExactStrategy` to construct a `grind only [<extracted>]`
+    last-resort fallback.
+
+    Capped at 64 unique lemmas so the resulting `grind only` invocation
+    has bounded parse/elaboration cost.  In practice typical proofs name
+    1-5 user lemmas. -/
+def extractGrindOnlyLemmas (e : Expr) : Array Name := Id.run do
+  let mut found : Std.HashSet Name := {}
+  let mut order : Array Name := #[]
+  let mut stack : List Expr := [e]
+  let mut count := 0
+  -- 100k node cap — large enough to walk a typical multi-KB grind proof
+  -- (Rat L89 is ~13k nodes); small enough that pathological inputs don't
+  -- burn the heartbeat budget.  A previous 5k cap missed `mkRat_pos_iff`
+  -- in L89 because the user lemma appears past the 5k mark.
+  while !stack.isEmpty && count < 100000 && order.size < 64 do
+    count := count + 1
+    let cur := stack.head!
+    stack := stack.tail!
+    match cur with
+    | .const n _ =>
+      if isUserLemmaName n && !found.contains n then
+        found := found.insert n
+        order := order.push n
+    | .app f a => stack := f :: a :: stack
+    | .lam _ t b _ => stack := t :: b :: stack
+    | .forallE _ t b _ => stack := t :: b :: stack
+    | .letE _ t v b _ => stack := t :: v :: b :: stack
+    | .mdata _ b => stack := b :: stack
+    | .proj _ _ b => stack := b :: stack
+    | _ => pure ()
+  return order
+
 /-- Configuration for `chooseExactStrategy`.  The three fallback sites differ
     only in this config (size check on/off, decide-first on/off, and whether
     propext/Iff.intro forces pp.all rendering). -/
@@ -375,25 +571,62 @@ def chooseExactStrategy (proof : Expr) (lctx : LocalContext)
     : TacticM (Array (TSyntax `tactic)) := do
   if cfg.enforceMaxSize then
     throwIfFallbackProofTooLarge proof
+  -- Rename inaccessible hypotheses to accessible names BEFORE delab so
+  -- the rendered source can refer to them.  Prepend a `rename_i` tactic
+  -- to the result so re-elaboration ends up with matching names.
+  -- See `renameInaccessibleHyps` docstring for the failure mode this
+  -- addresses (`a✝` references in fallback exact term).
+  -- NOTE 2026-05-07: `renameInaccessibleHyps` + `replaceInaccessibleRefs`
+  -- are wired up in this file but NOT yet hooked into `chooseExactStrategy`.
+  -- An attempt to prepend `rename_i ...` + post-process the delabbed
+  -- term hung L216 at ≥120s validation (the rename_i + giant exact
+  -- combination causes Lean's elaborator to explore a large search
+  -- space, possibly looking for a typeclass instance whose old name has
+  -- just been replaced).  The helpers are correct in isolation; revisit
+  -- when we have a smaller scoped use case.
+  let renamePrefix : Array (TSyntax `tactic) := #[]
   let needsPrettyPrint := containsEagerReduce proof || cfg.forcePrettyPrint proof
-  let termStx ← if needsPrettyPrint then
+  let termStx ←
+    if needsPrettyPrint then
       try ppExprToTermSyntaxWith proof true
-      catch _ => delabToRefinableSyntax proof
+      catch _ => delabRefinable proof
     else
-      try delabToRefinableSyntax proof
+      try delabRefinable proof
       catch _ => ppExprToTermSyntaxWith proof true
+  -- Last-resort BEFORE the giant exact: try `grind only [<extracted>]`.
+  -- The extracted lemmas come from the proof term (`extractGrindOnlyLemmas`)
+  -- — these are the user-form lemmas grind picked up during proof search.
+  -- A restricted `grind only [...]` is much more stable than bare grind
+  -- (no automatic lemma instantiation), and dramatically cleaner than a
+  -- 100KB raw exact term that may not even re-elaborate.
+  --
+  -- This is the explicit relax of the "no grind in output" policy: when
+  -- nothing else closes, extracted-lemma `grind only` is the compromise.
+  -- Order: specialized handlers fail → structural recursion fails → here.
+  let proofTy ← instantiateMVars (← Meta.inferType proof)
+  let lemmas := extractGrindOnlyLemmas proof
+  if !lemmas.isEmpty then
+    -- `grind only [a, b, c]` expects `grindParam`s, not bare idents.
+    -- Each `grindParam` wraps a `grindLemma` which wraps the ident.
+    -- See `Lean.Meta.Tactic.Grind.EMatchTheoremParam.toGrindParam`.
+    let grindParams : Array (TSyntax ``Lean.Parser.Tactic.grindParam) ←
+      lemmas.mapM fun n => do
+        let lemmaStx ← `(Lean.Parser.Tactic.grindLemma| $(mkIdent n):ident)
+        return ⟨Syntax.node SourceInfo.none ``Lean.Parser.Tactic.grindParam #[lemmaStx]⟩
+    let grindTac ← `(tactic| grind only [$grindParams,*])
+    if ← subproofTacticsCloseGoal #[grindTac] proofTy lctx localInsts then
+      return renamePrefix.push grindTac
   if containsEagerReduce proof then
     if cfg.tryDecideFirst then
-      let proofTy ← instantiateMVars (← Meta.inferType proof)
       if isBoolEqTrue proofTy then
         let decideTac ← `(tactic| decide)
         if ← subproofTacticsCloseGoal #[decideTac] proofTy lctx localInsts then
           return #[decideTac]
     let tac ← `(tactic| with_unfolding_all exact $termStx)
-    return #[tac]
+    return renamePrefix.push tac
   else
     let tac ← `(tactic| exact $termStx)
-    return #[tac]
+    return renamePrefix.push tac
 
 /-- Validation-failure fallback.  Wraps `chooseExactStrategy` with the config
     used by `validateOrExact` — see `ExactStrategyConfig` for the rationale. -/
