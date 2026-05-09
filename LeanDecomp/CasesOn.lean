@@ -382,23 +382,12 @@ def tryDecompCasesOn (expr : Expr) (lctx : LocalContext)
 
     let mut alts : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt) := #[]
 
-    -- Set up a synthetic outer mvar and run `MVarId.cases` once.  This
-    -- produces subgoals whose lctxs reflect the real cases substitution
-    -- (the discriminant fvar is replaced by the constructor application
-    -- throughout the lctx, just as the real `cases` tactic would do).
-    -- Recursive per-branch decomp then runs in the real substituted lctx —
-    -- matching the **decompiler invariant** that every recursive call sees
-    -- the proof state the real run would produce.
-    --
-    -- Generalized motives (`cases h : disc with`) currently take the older
-    -- Meta.lambdaTelescope path because `MVarId.cases` doesn't reproduce the
-    -- trailing `heq : disc = ctor xs` hypothesis.  A naive extension that
-    -- generalizes with `hName?` and substitutes the eq param with the real
-    -- eq fvar broke `LeanDecomp.simple`: the old body's `Eq.rec` cleanup
-    -- (substituting `heq → Eq.refl s` and stripping the resulting transport)
-    -- is load-bearing for downstream handlers like `contradiction` and
-    -- `noConfusion` — they consume the type-incorrect intermediate that the
-    -- cleanup produces.  Improving this is documented in the README.
+    -- `MVarId.cases` produces subgoals with lctxs reflecting the real
+    -- cases substitution (discriminant fvar replaced by ctor apps), so
+    -- recursive per-branch decomp upholds the decompiler invariant.
+    -- Generalized motives (`cases h : disc with`) take the older
+    -- `lambdaTelescope` path — see README "Recommended Next Steps" for
+    -- why and what was tried.
     let casesSubgoals : Option (Array Meta.CasesSubgoal) ←
       if hasEqMotive then pure none else runMVarIdCases expr info
 

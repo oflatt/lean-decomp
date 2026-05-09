@@ -1,6 +1,10 @@
 import Lean
 import Lean.Meta.Tactic.TryThis
 import Lean.PrettyPrinter
+-- Re-export sub-files so `import LeanDecomp.Helpers` still gives
+-- consumers the full surface (delab/PP wrappers, sanitizer, etc.).
+import LeanDecomp.Helpers.PP
+import LeanDecomp.Helpers.Sanitizer
 
 namespace LeanDecomp
 open Lean Elab Meta PrettyPrinter Tactic
@@ -54,176 +58,6 @@ def mkTacticSeq (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax ``Lean.Parser.
 def mkFocusedBlock (tacs : Array (TSyntax `tactic)) : CoreM (TSyntax `tactic) := do
   let seq ← mkTacticSeq tacs
   `(tactic| · $seq:tacticSeq)
-
-/-- Replace parser-generated `?m.N` placeholders with anonymous holes. -/
-def anonymizeSyntheticMVars (s : String) : String := Id.run do
-  let chars := s.toList.toArray
-  let mut out := ""
-  let mut i := 0
-  while i < chars.size do
-    if chars[i]! == '?' && i + 2 < chars.size && chars[i + 1]! == 'm' && chars[i + 2]! == '.' then
-      let mut j := i + 3
-      let mut sawDigit := false
-      while j < chars.size && chars[j]!.isDigit do
-        sawDigit := true
-        j := j + 1
-      if sawDigit then
-        out := out ++ "?_"
-        i := j
-      else
-        out := out.push chars[i]!
-        i := i + 1
-    else
-      out := out.push chars[i]!
-      i := i + 1
-  out
-
-def ppExprToTermSyntax (e : Expr) : MetaM Term := do
-  let env ← getEnv
-  let fmt ← Meta.ppExpr e
-  let termStr := anonymizeSyntheticMVars fmt.pretty
-  match Parser.runParserCategory env `term termStr with
-  | .ok stx => pure ⟨stx⟩
-  | .error err =>
-    throwError "failed to parse pretty-printed term:\n{err}\n\n{termStr}"
-
-def ppExprToTermSyntaxWith (e : Expr) (usePpAll : Bool) : MetaM Term :=
-  withOptions (fun o =>
-      let o := pp.coercions.types.set o true
-      let o := pp.numericTypes.set o true
-      -- `pp.maxSteps` defaults to 5000 — large proof terms overflow this
-      -- and get tail-truncated as `⋯` even with `pp.all := true` (which
-      -- doesn't override maxSteps).  L599 hit this exactly: the binder
-      -- type was elided as `(h_2 : ⋯)` because the counter ran out
-      -- before the printer reached the binder annotation.
-      let o := pp.maxSteps.set o 1000000
-      if usePpAll then
-        pp.all.set o true
-      else
-        o
-    ) do
-      ppExprToTermSyntax e
-
-/-- Three PrettyPrinter options control terminal-source truncation; we
-    lift all three for any rendering of generated source so emitted
-    suggestions survive re-elaboration.  Lean's defaults are tuned for
-    interactive goal display, not source emission — for our use, `⋯` is
-    fatal because the parser rejects it.
-
-    - `pp.deepTerms := true` (default false, threshold 50): general
-      depth-based subterm elision.
-    - `pp.proofs := true` (default false, threshold 0): elides Prop-typed
-      sub-terms regardless of depth, including binder type annotations.
-    - `pp.maxSteps := 1000000` (default 5000): the printer maintains a
-      visited-expression counter; everything visited after the budget is
-      `⋯`.  L599's `(h_2 : ⋯)` came from this path — proof was big, the
-      counter overflowed before reaching the binder, so the binder type
-      annotation got `⋯` even though it was relatively shallow.
-
-    Concrete failure this addresses: `Mathlib/Algebra/Order/BigOperators/
-    Group/Finset.lean:599`'s `exact @Classical.byContradiction (Eq.{1}
-    Nat ...) (fun (h_2 : ⋯) => ...)`. -/
-def liftPPTruncationOptions (o : Lean.Options) : Lean.Options :=
-  let o := pp.deepTerms.set o true
-  let o := pp.proofs.set o true
-  pp.maxSteps.set o 1000000
-
-/-- `delabToRefinableSyntax` wrapper that disables PrettyPrinter
-    truncation (all three paths — see `liftPPTruncationOptions`).  Use
-    this everywhere we delab a proof term destined for emitted source.
-    `pp.all := true` (via `ppExprToTermSyntaxWith _ true`) already implies
-    `deepTerms`/`proofs`, but NOT `maxSteps`, so the alternate pp.all
-    path also benefits from the maxSteps lift in `ppTacticFull`. -/
-def delabRefinable (e : Expr) : MetaM Term :=
-  withOptions liftPPTruncationOptions (delabToRefinableSyntax e)
-
-/-- `PrettyPrinter.ppTactic` wrapper that lifts the same truncation options
-    as `delabRefinable`.  Even when the Syntax tree has no `⋯` (because we
-    delabbed with the lifts), the FORMATTING step in `ppTactic` re-applies
-    the truncation logic when rendering large sub-terms inside the tactic
-    syntax (notably arg lists and binder type annotations in `exact <giant>`
-    fallbacks).  Use this everywhere we format a generated tactic seq for
-    emission as a suggestion or for re-elaboration validation.
-
-    Concrete failure this addresses: `BigOperators/Group/Finset.lean:599`'s
-    `exact @Classical.byContradiction (Eq.{1} Nat ...) (fun (h_2 : ⋯) => ...)`
-    where `(h_2 : ⋯)` was being injected by ppTactic, not by delab. -/
-def ppTacticFull (stx : TSyntax `Lean.Parser.Tactic.tacticSeq) : CoreM Format :=
-  withOptions liftPPTruncationOptions (PrettyPrinter.ppTactic ⟨stx⟩)
-
-/-- True iff `n` is the Name of an inaccessible binder — one Lean's pretty
-    printer renders with the `✝` marker.  Two stored representations both
-    qualify:
-    1. **Macro scopes attached** (the common case): a hygienic name like
-       `Lean.Name.num "inst" 12345` from `Macro.addMacroScope`.
-       `Name.hasMacroScopes` detects these.
-    2. **Literal `✝` in a component string**: rare, but happens when a name
-       was constructed via the printer's renaming pass and re-fed into the
-       elaborator.  Caught by the component-string check.
-
-    `inst✝`, `inst✝¹`, …, `h✝`, `a✝²` all qualify; ordinary `foo`, `inst_1`
-    don't. -/
-def isInaccessibleName (n : Name) : Bool :=
-  n.hasMacroScopes ||
-    n.components.any fun comp => comp.toString.contains '✝'
-
-/-- Walk `stx` and replace identifier references that resolve to
-    inaccessibly-named typeclass-instance fvars in `lctx` with `_` holes.
-    Cross-file re-elaboration of decompiled scripts fails on `refine @foo
-    R inst✝ ...` and `exact inst✝¹` — the `✝` marks the ident as
-    inaccessible (Lean's hygiene scheme).  Typeclass inference can re-fill
-    these positions, so `_` works.
-
-    Three-condition narrow trigger so we don't over-fire on hygienic but
-    accessible binders (which would substitute `_` for a real reference
-    and fail validation):
-    1. ident has macro scopes OR a literal `✝` component;
-    2. the name resolves to an FVar in `lctx`;
-    3. that FVar's type is a typeclass instance (`Meta.isClass?`).
-
-    Returns the input unchanged when no qualifying idents are present.
-
-    Substitutes `inferInstance` (not bare `_`) because `_` in tactic
-    `exact` position becomes an unfilled term mvar (raises "internal
-    exception #5" under `exact _`).  `inferInstance` works in BOTH term
-    position (`refine @foo R inferInstance …`) and tactic position
-    (`exact inferInstance`) by explicitly invoking typeclass synthesis. -/
-def sanitizeInaccessibleIdents (lctx : LocalContext) (stx : Syntax) : MetaM Syntax := do
-  -- Build via `mkIdent` rather than `\`(inferInstance)` quotation: the
-  -- quotation form attaches a fresh macro scope which PrettyPrinter would
-  -- then sanitize back to `inferInstance✝` — defeating the purpose.
-  let inferInst : Syntax := mkIdent ``inferInstance
-  let isInaccessibleClassRef (name : Name) : MetaM Bool := do
-    if !name.hasMacroScopes && !name.isInaccessibleUserName then return false
-    let some decl := lctx.findFromUserName? name | return false
-    return (← Meta.isClass? decl.type).isSome
-  -- Walk down chained projections (`inst✝.foo.bar`) to find the receiver
-  -- ident at the bottom.  Returns the bottom ident's name iff the chain
-  -- is purely `.proj` nodes terminating in an ident.
-  let rec projRoot : Syntax → Option Name
-    | .node _ ``Lean.Parser.Term.proj #[receiver, _, _] => projRoot receiver
-    | .ident _ _ name _ => some name
-    | _ => none
-  Meta.withLCtx lctx #[] do
-    stx.replaceM fun s => do
-      match s with
-      -- Whole-projection replacement: `inst✝.toLE` → `inferInstance`.
-      -- Without this, the inner ident swap would produce `inferInstance.toLE`,
-      -- which fails with "type class instance expected ?m" because Lean
-      -- can't infer the type to synthesize for the bare `inferInstance`
-      -- before descending into `.toLE`.  Replacing the whole projection
-      -- works because the projection's RESULT type is also a class
-      -- (e.g. `(inst : LinearOrder M).toLE : LE M`).
-      | .node _ ``Lean.Parser.Term.proj _ =>
-        match projRoot s with
-        | some name =>
-          if (← isInaccessibleClassRef name) then pure (some inferInst)
-          else pure none
-        | none => pure none
-      | .ident _ _ name _ =>
-        if (← isInaccessibleClassRef name) then pure (some inferInst)
-        else pure none
-      | _ => pure none
 
 /-- Peel off all applications from an expression to get the head and arguments.
     Returns (head, args) where args is in left-to-right order. -/
@@ -386,58 +220,6 @@ private def isBoolEqTrue (ty : Expr) : Bool :=
   | some (α, _, rhs) => α.isConstOf ``Bool && rhs.isConstOf ``Bool.true
   | none => false
 
-/-- Walk `lctx`, identify every inaccessible non-implementation-detail
-    fvar in `lctx`, return a fresh accessible name.  The result is a
-    pair:
-    - `idents` (lctx order): the new accessible idents, suitable for
-      `rename_i` (after reversing — see `chooseExactStrategy` for why).
-    - `oldToNew`: a `Std.HashMap Name Name` from each inaccessible
-      userName to its replacement.  Use with `replaceInaccessibleRefs`
-      to post-process delabbed `Syntax` so references to old userNames
-      become references to new accessible ones.  This is safer than
-      mutating `lctx` and using `withLCtx` around the delab — that
-      approach regressed the L234 structural decomp (the renamed lctx
-      leaked into upstream validation paths).
-
-    Use case: emitting an `exact <term>` fallback where the proof term
-    references inaccessible hypotheses (e.g. `a✝` from a previous
-    elaborator-implicit `intro`).  Without renaming, the rendered source
-    contains `a✝` literally and fails re-elaboration with a type-mismatch
-    on a free reference.  Concrete failure: `Mathlib/Algebra/Order/Ring/
-    IsNonarchimedean.lean:216`. -/
-def renameInaccessibleHyps (lctx : LocalContext) :
-    Array Ident × Std.HashMap Name Name := Id.run do
-  let mut idents : Array Ident := #[]
-  let mut oldToNew : Std.HashMap Name Name := {}
-  let mut idx := 0
-  for declOpt in lctx.decls.toList do
-    let some decl := declOpt | continue
-    if decl.isImplementationDetail then continue
-    -- Match the same set Lean's PrettyPrinter sanitizer would render as
-    -- `name✝`: literal `✝` in any string component OR macro scopes.
-    let needsRename := decl.userName.isInaccessibleUserName
-                       || decl.userName.hasMacroScopes
-    if !needsRename then continue
-    idx := idx + 1
-    let newName := Name.mkSimple s!"h_inacc_{idx}"
-    oldToNew := oldToNew.insert decl.userName newName
-    idents := idents.push (mkIdent newName)
-  return (idents, oldToNew)
-
-/-- Walk `stx` and replace each `Syntax.ident` whose name appears in
-    `oldToNew` with a fresh ident bearing the new name.  Used to retarget
-    delab output at renamed (now-accessible) bindings without having to
-    delab inside a `withLCtx renamedLctx`. -/
-def replaceInaccessibleRefs (stx : Syntax) (oldToNew : Std.HashMap Name Name) : Syntax :=
-  if oldToNew.isEmpty then stx else
-  Id.run <| stx.replaceM fun s =>
-    match s with
-    | .ident _ _ name _ =>
-      match oldToNew.get? name with
-      | some newName => pure (some (mkIdent newName).raw)
-      | none => pure none
-    | _ => pure none
-
 /-- True iff `n` is a "user lemma" name worth handing to `grind only [...]`
     as a hint when reconstructing a proof.  Heuristic: reject names in the
     grind-internal certificate namespaces (Lean.Grind, Lean.Omega,
@@ -571,20 +353,6 @@ def chooseExactStrategy (proof : Expr) (lctx : LocalContext)
     : TacticM (Array (TSyntax `tactic)) := do
   if cfg.enforceMaxSize then
     throwIfFallbackProofTooLarge proof
-  -- Rename inaccessible hypotheses to accessible names BEFORE delab so
-  -- the rendered source can refer to them.  Prepend a `rename_i` tactic
-  -- to the result so re-elaboration ends up with matching names.
-  -- See `renameInaccessibleHyps` docstring for the failure mode this
-  -- addresses (`a✝` references in fallback exact term).
-  -- NOTE 2026-05-07: `renameInaccessibleHyps` + `replaceInaccessibleRefs`
-  -- are wired up in this file but NOT yet hooked into `chooseExactStrategy`.
-  -- An attempt to prepend `rename_i ...` + post-process the delabbed
-  -- term hung L216 at ≥120s validation (the rename_i + giant exact
-  -- combination causes Lean's elaborator to explore a large search
-  -- space, possibly looking for a typeclass instance whose old name has
-  -- just been replaced).  The helpers are correct in isolation; revisit
-  -- when we have a smaller scoped use case.
-  let renamePrefix : Array (TSyntax `tactic) := #[]
   let needsPrettyPrint := containsEagerReduce proof || cfg.forcePrettyPrint proof
   let termStx ←
     if needsPrettyPrint then
@@ -615,7 +383,7 @@ def chooseExactStrategy (proof : Expr) (lctx : LocalContext)
         return ⟨Syntax.node SourceInfo.none ``Lean.Parser.Tactic.grindParam #[lemmaStx]⟩
     let grindTac ← `(tactic| grind only [$grindParams,*])
     if ← subproofTacticsCloseGoal #[grindTac] proofTy lctx localInsts then
-      return renamePrefix.push grindTac
+      return #[grindTac]
   if containsEagerReduce proof then
     if cfg.tryDecideFirst then
       if isBoolEqTrue proofTy then
@@ -623,10 +391,10 @@ def chooseExactStrategy (proof : Expr) (lctx : LocalContext)
         if ← subproofTacticsCloseGoal #[decideTac] proofTy lctx localInsts then
           return #[decideTac]
     let tac ← `(tactic| with_unfolding_all exact $termStx)
-    return renamePrefix.push tac
+    return #[tac]
   else
     let tac ← `(tactic| exact $termStx)
-    return renamePrefix.push tac
+    return #[tac]
 
 /-- Validation-failure fallback.  Wraps `chooseExactStrategy` with the config
     used by `validateOrExact` — see `ExactStrategyConfig` for the rationale. -/

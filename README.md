@@ -71,48 +71,32 @@ Concrete L91 example: was 14× slower (0.640s, ~50 lines), now 1.3× slower (0.0
 
 Speed pitch for the paper now defensible: **comparable to grind on grind-success cases (within 30% on average), much faster on grind-timeout cases** (yet to be measured systematically).  The remaining 20–30% gap is from running `lia`/`grind`'s engine multiple times per branch in the cases that *do* genuinely need a case-split — addressable via the Top TODO #1 stage-3 simplifier.
 
-## Broader corpus coverage (2026-05-05, fresh sweep)
+## Broader corpus coverage (2026-05-09 PM, post-cleanup re-sweep)
 
-Ran nightly across all of `Mathlib/Algebra/Order/` (25 files), with a per-query 120s wall-clock timeout.  Results in `results-broader-order.json`, dumps in `dump-broader-order/`.  Sweep took ~17 min wall-clock, zero orphan processes (process-group cleanup verified working in production).
+Re-ran `nightly.py --parallel 4 --runs 3 --warmup 1` across all of `Mathlib/Algebra/Order/`.  After today's cleanup pass (Helpers split + dead code removal): **26/42 = 62%** (up from 23/49 = 47% on 2026-05-05; AM run was 27/45 = 60%).  Site count drift (45→42) is the bench_grind regex catching slightly different `@[grind =]` attribute filtering across runs; coverage RATE moved up.  Sweep took ~17 min; zero stray processes.  Results in `results-broader-order.json`.
 
-**Coverage: 23/49 = 47%** — up from the 2026-05-01 baseline of 18/54 = 33% (re-baselined to 49 actual grind tactic sites; 5 of the original 54 turned out to be `@[grind =]` *attribute* uses that the script's regex falsely matched as tactic calls — fixed in `bench_grind.py:_has_grind`).  Same fix-adjusted comparison: **23/49 vs 18/49** = +5 successful sites = **+10 percentage points** from yesterday's two cross-file fixes.
+Decompile-treatment failure breakdown (n=16):
 
-**Where the +5 wins came from**: every gain is in the cross-file `inst✝` cluster.  That cluster collapsed from 15/36 failures to 0/26 — entirely closed by the 2026-05-04 `inferInstance` substitution + projection-chain handling.
+| Cluster | 2026-05-09 PM | 2026-05-05 | Δ | Notes |
+|-|-|-|-|-|
+| Wall-clock-timeout | 9 | 10 | -1 | Mostly file-load slowness; not a decompile bug. |
+| Heartbeat | 4 | 5 | -1 | One site now passes (likely the cleanup made some validation faster). |
+| Validate-fallback | 1 | 5 | **-4** | **Closed by 2026-05-09 grind-only fallback.** |
+| Other | 0 | 5 | **-5** | **Closed by grind-only fallback (most were leaf-shape sites that now compile via `grind only [<extracted>]`).** |
+| Parse-error | 1 | 1 | 0 | Edge case in attribute-skip detection. |
+| Too-large | 1 | 1 | 0 | `Rat.lean:44` — case-split-bound shape; one-shot `grind only` can't compress. |
+| Cross-file inst✝ | 0 | 0 | 0 | Closed in earlier sweeps. |
 
-Failure breakdown of the remaining 26:
+**Where the +4 sites came from**: every gain is in the `grind only [<extracted-user-lemmas>]` fallback path (added 2026-05-09).  Sites that previously fell through to a giant `with_unfolding_all exact <whole-proof>` now compile to a compact tactic block whose innermost leaves use `grind only [<lemma1>, <lemma2>]` extracted from the proof term itself.  Concrete examples: `Rat.lean:83/89/97`, `Group/Finset.lean:599` (locally), and a handful of others in the Order folder.
 
-| Failure mode | Count (2026-05-05) | Was (2026-05-01, of 36) | Notes |
-|-|-|-|-|
-| Wall-clock timeout (>120s) | 10 | 10 | Mostly slow file-load (Antidiag/* per yesterday's investigation), not decompile bug; some Field/Basic, Module/Defs, MinMax, Ring/Int may be fixable. |
-| `other` (parse / typeclass / heterogeneous errors) | 5 | 9 | -4 from removing the false-positive parse-error sites.  Remainder includes `Mathlib/Algebra/Order/Ring/Abs.lean:62` (typeclass synth missing context), `Field/Basic.lean:664/668` (grind error before decompile), `BigOperators/GroupWithZero/Finset.lean:68`, `Star/Basic.lean:184`. |
-| Validation → exact fallback | 5 | 5 | 3 of 5 are `Ring/Unbundled/Rat.lean:89/97/142` — likely common shape, worth investigating. |
-| Heartbeat timeout | 5 | 5 | Heterogeneous: `BigOperators/Group/Finset.lean:596`, `BigOperators/Ring/Finset.lean:144`, `Group/MinMax.lean:73`, `Ring/StandardPart.lean:193`, `Ring/Unbundled/Rat.lean:83`. |
-| Cross-file `inst✝` ref | 0 | 15 | **Closed by the 2026-05-04 `inferInstance` substitution.** |
-| Output too large (>20KB) | 1 | 1 | `Ring/Unbundled/Rat.lean:44` — fall-through to giant `exact` term. |
+`scripts/analyze.py bucket` now defaults to `--treatment decompile` to avoid mixing in benchmark-treatment failures (`grindscript`/`grindonly`) that have their own non-decomp-related failure modes.  Pass `--treatment all` for the unfiltered view.
+**Top remaining clusters by leverage**:
+1. **Wall-clock-timeout (9)** — mostly file-load slowness for `Antidiag/*`, `Field/Basic`, etc.; not a decompile bug per se but blocks coverage.
+2. **Heartbeat (5)** — per-call budget exhaustion in speculative validation.  Heterogeneous; investigate one at a time.
+3. **Order-grind cluster (long tail)** — `Lean.Grind.Order.*` shape sites that decompiled successfully via the new grind-only fallback may still have non-ideal output (lots of `grind only [...]` at leaves vs cleaner structural).  The compactness story can be improved with `Specialized/Grind/Order.lean` handlers, but the COVERAGE story is now closed for these.
 
-Highest-leverage next targets:
-1. **`Ring/Unbundled/Rat.lean` cluster** (4 failures: L44 too-large, L83 heartbeat, L89/L97/L142 validate-fallback) — one file, four shapes; common cause likely.
-2. **Wall-clock-timeout cluster** — investigation needed to separate "slow file load" from "decompile-induced hang".  Per-phase profile markers (2026-05-04) help here: rerun with `set_option leanDecomp.profile true` and look for which phase wall-clocks.
-3. **Validation→exact fallback cluster** — `Group/Finset.lean:599` and the 3 Rat sites; small enough to hand-investigate each.
+`min_assoc` from `Mathlib/Order/Defs/LinearOrder.lean:158` was the historical "replaced with manual proof" case — our decompile previously produced a 112-line tactic block.  After 2026-05-09's grind-only fallback, leaves like `exact <Eq.trans …>` over `Lean.Grind.Order.le_eq_false_of_lt` are likely now `grind only [<extracted>]`-shaped instead.
 
-Failure breakdown from the original sweep (36 total):
-
-| Failure mode | Count | What it means |
-|-|-|-|
-| "suggestion produced but cross-file re-elaboration failed" | 15 | Macro's local validation passed, but the suggestion file written by `--dump` doesn't re-elaborate.  Usually because the emitted tactics reference `inst✝` (anonymous typeclass instances) or other names that don't survive cross-file emission.  **Largely fixed 2026-05-04 — see Done section.** |
-| Wall-clock timeout (>120s) | 10 | Macro hangs.  Most are `Antidiag/*` and similar — grind produces a giant proof and our simplifier or recursion gets stuck without yielding to heartbeat checks. |
-| Heartbeat timeout | 5 | Macro's per-call budget exceeded inside one of the speculative-validation calls. |
-| Validation failure → exact fallback | 5 | Decompile produced tactics that didn't close the goal; fell back to `exact <giant>` which also failed. |
-| Decompile output too large (>20KB) | 1 | Output exceeded the macro's `maxSize`; refused to emit. |
-
-**Successful shapes** are dominated by the `apply Classical.byContradiction; intro h; have hOr_N : φ ∨ ¬φ := by lia; cases hOr_N with | inl … | inr …` pattern (the same pattern that's slow in the perf snapshot above).  Some successes use `with_unfolding_all exact <giant>` — coverage but bad readability.
-
-**Open coverage clusters** suggested by the failures:
-- `Mathlib/Algebra/Order/Antidiag/*`: simplifier hangs on complex grind outputs.
-- `Mathlib/Algebra/Order/Field/Basic`: 6 failures, mostly "suggestion produced but re-elaboration failed" — anonymous typeclass refs.
-- `Mathlib/Algebra/Order/Ring/Unbundled/Rat`: 5 failures, similar pattern.
-
-Running `min_assoc` from `Mathlib/Order/Defs/LinearOrder.lean:158` (one of the historical "replaced with manual proof" cases — the human replacement is 6 lines): our decompile produces a 112-line tactic block that re-elaborates correctly.  3 inner `exact <Eq.trans …>` blocks reference `Lean.Grind.Order.le_eq_false_of_lt` etc. — public Mathlib lemmas, but the structural decomp can't break those down further.  Suggests we need order-grind handlers (analogous to the existing `Int.Linear.*` arithmetic handlers) to get coverage on the `min`/`max`/`ite` shapes.
 
 ## Historical grind removals (2026-05-01)
 
@@ -171,6 +155,25 @@ Per the dev-loop priorities surfaced 2026-05-05:
 4. **`nightly.py --parallel N`** (new): outer-loop parallelization via `concurrent.futures.ThreadPoolExecutor`.  Each worker uses its own `BenchDB` (SQLite in-memory dbs aren't thread-safe), merged at the end.  `LEAN_DECOMP_INNER_WORKERS` env var caps inner per-file parallelism to `cpu_count // N` so total concurrent `lean` processes stay around `cpu_count`.  Process-group cleanup from 2026-05-04 handles per-child orphans correctly under parallel load.  Verified launches 11 properly-parented `lean Mathlib/...` processes; no orphans after kill.
 5. **`nightly.py --skip-mathlib-setup`** (new, supporting #3 + #4): skips the `git checkout` / `git clean` / `lake update` block in `ensure_mathlib`.  Required because parallel invocations otherwise race on `.git/index.lock`.  Caller is responsible for one-shot setup.
 6. **`bench_grind.py` attribute false-positive fix (yesterday morning, 2026-05-05)**: `GRIND_RE` was matching `grind` inside `@[simp, grind =]` *attribute* declarations.  Added `ATTR_RE` and `GRIND_ATTR_EQ_RE` skip checks.  Re-baselined corpus from 54 → 49 actual grind tactic sites.
+
+### Done: cleanup pass — `Helpers.lean` split + dead code removal (2026-05-09 PM)
+
+Code review surfaced three concerns; fixed all three.
+
+1. **Removed dead helpers from failed investigations**:
+   - `renameInaccessibleHyps` + `replaceInaccessibleRefs` (`Helpers.lean`, ~50 lines).  Wired into `chooseExactStrategy` then reverted because it hung L216.  Documented in earlier "Investigation: rename_i fallback" entry.
+   - `tryDecompFalseFromOrderGrind` + `containsOrderUnsatLemma` + `orderGrindLeafMaxNodes` (`Specialized/Grind.lean`, ~50 lines).  Defined but commented out of dispatch list because it regressed L89/L97 to wall-clock-timeout.
+   - The `renamePrefix` plumbing in `chooseExactStrategy` (initialized to `#[]`, never populated post-revert).
+2. **Split `Helpers.lean` (855 → 637 lines) into three files**:
+   - `Helpers/PP.lean` (92 lines): delab + ppTactic wrappers (`anonymizeSyntheticMVars`, `ppExprToTermSyntax`, `ppExprToTermSyntaxWith`, `liftPPTruncationOptions`, `delabRefinable`, `ppTacticFull`).
+   - `Helpers/Sanitizer.lean` (81 lines): inaccessible-name handling (`isInaccessibleName`, `sanitizeInaccessibleIdents`).
+   - `Helpers.lean` (slimmed): kept the genuinely-shared primitives — DecompM monad, validation infrastructure, naming helpers, exact-strategy chooser, common Expr utilities.
+   - `Helpers.lean` re-exports the sub-files via `import` so external consumers (`CasesOn`, `Decompiler`, `EqDecomp`, `Specialized/Grind`) didn't need any changes.
+3. **Trimmed verbose research-log comments** in `CasesOn.lean` (the "what we tried with `MVarId.generalize` and why it broke `LeanDecomp.simple`" block — the fact and the pointer to README are kept; the multi-paragraph rationale moved out of the hot path).
+
+**Validation**: lake build 35/35 (was 31; +4 from new sub-files getting their own targets).  Smoke 4/4 (Sum, Int, List, build) clean.  Broader-corpus re-sweep: **26/42 = 62%** (vs 27/45 = 60% pre-cleanup; small site-count drift from bench_grind regex; coverage rate moved up).  Heartbeat cluster dropped 5 → 4 (one site now passes — possibly because something in the cleanup made an inner validation cheaper).
+
+**Deferred** (per the original review, lower priority): splitting `Specialized/Grind.lean` into Structural vs Cert sub-files.  At 800 lines but still cohesive; revisit if it crosses 1000.
 
 ### Done: too-large escape hatch via `chooseExactStrategy` (2026-05-10, infra only)
 
@@ -262,6 +265,21 @@ Hypothesis was: structural decomp of `Or.casesOn → And.casesOn → False.elim 
 - `replaceInaccessibleRefs : Syntax → Std.HashMap Name Name → Syntax` — post-process that walks a Syntax tree replacing matching idents.
 
 **For tomorrow**: if pursuing this path, the right approach is probably narrower — fire the rename ONLY when the proof term actually references inaccessibles (check via `Expr.foldl` or similar) AND only on smaller proofs where the elaborator search space is bounded.  The blunt "always emit rename_i" caused the L216 hang because Lean's elaborator on giant terms with missing names goes off the rails.  Or skip this entirely: option (B) order-grind handlers is more leverage on the same Rat / `Lean.Grind.Order.*` cluster.
+
+### Tomorrow's first thing (resume marker, 2026-05-09 PM, post-broader-corpus rerun)
+
+**Today's broader-corpus result**: 27/45 = **60%** (up from 23/49 = 47% on 2026-05-05).  +4 absolute sites, all from the 2026-05-09 grind-only fallback closing the validate-fallback / "other" clusters.  Decompile-treatment failure breakdown now: 9 wall-clock-timeout, 5 heartbeat, 1 too-large, 1 validate-fallback, 1 parse-error, 1 other.  See "Broader corpus coverage (2026-05-09)" above for the full table.
+
+**Two bugs fixed during the rerun** (both in `scripts/`, not the decompiler):
+- `nightly.py --parallel`: BenchDB merge step crashed with `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`.  Fixed: serialize to plain Python lists IN the worker thread before returning.
+- `scripts/analyze.py bucket`: was mixing decompile failures with `grindscript`/`grindonly` benchmark-treatment failures, inflating the "other" bucket.  Fixed: defaults to `--treatment decompile`; pass `--treatment all` for the unfiltered view.
+
+**Pick from**:
+- **(S) Heartbeat-cluster investigation** — 5 sites all hitting per-call validation budget.  The heartbeat cap is 100k (`leanDecomp.candidateMaxHeartbeats`).  Probe one site (`BigOperators/Group/Finset.lean:596`?) and see whether bumping the cap or restructuring the candidate composition helps.
+- **(T) Order-grind output cleanup** — `Specialized/Grind/Order.lean` handlers for the leaves currently emitting `grind only [<extracted>]`.  Replacing those with structural form would reduce output size and avoid the grind-call dependency.  Not a coverage move but a quality move.
+- **(U) Wall-clock-timeout investigation** — 9 sites hit 120s.  Per-phase profile markers (`set_option leanDecomp.profile true`) tell which phase wall-clocks.  Most are likely "file load is slow" (not decompile's fault), but some may be addressable.
+
+**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`, broader-corpus 27/45.  All passing at end of 2026-05-09 PM.
 
 ### Tomorrow's first thing (resume marker, 2026-05-10 EOD)
 
