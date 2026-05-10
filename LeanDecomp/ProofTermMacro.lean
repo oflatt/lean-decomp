@@ -133,6 +133,13 @@ private def buildDecompiledTactics (proof : Expr) (lctx : LocalContext)
   -- back to the macro layer.
   let tactics ← (decompileExpr proof lctx localInstances).run' []
   let tactics ← simplifyTactics tactics
+  -- Stage-3 dead-`have` elimination: drop top-level `have h := X` whose
+  -- binder isn't referenced downstream and whose removal still validates.
+  -- Catches the `have h_fact := …` that `tryDecompCasesOn` and
+  -- `tryDecompByContradiction` sometimes emit but that the closing tactic
+  -- (`lia`, `contradiction`) doesn't actually need.  No-op when there
+  -- are no top-level haves.
+  let tactics ← LeanDecomp.eliminateDeadHaves tactics proof lctx localInstances
   -- Replace inaccessible-name references that resolve to typeclass
   -- instances in the surrounding lctx with `_` holes.  Lean's delab emits
   -- macro-scoped names for `[TypeClass]` binders and PrettyPrinter renders

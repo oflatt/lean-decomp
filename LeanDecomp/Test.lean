@@ -20,6 +20,13 @@ Sections:
 - §6 forall_congr / implies_congr peelers (`tryDecompEqMpForallCongr`,
     `tryDecompEqMpImpliesCongr`).  Regression-locks for the L70/L36 peeler
     fixes.
+- §7 Inaccessible-name sanitizer (`sanitizeInaccessibleIdents`).
+- §8 Structural-handler smoke tests (`tryDecompAndProj`, `tryDecompEqSymm`,
+    `tryDecompIffMpMpr`, `tryDecompEqRefl`, `tryDecompEagerReduce`,
+    `tryDecompTheoremAppFallback`).  These handlers run rarely in real
+    grind output but fire deep in dispatch — without coverage, a
+    refactor can silently break them and only surface as a regression
+    in a downstream simplifier chain.
 -/
 
 namespace LeanDecomp.Test
@@ -176,6 +183,14 @@ example (h : False) : False := by
 
 -- Test 12: nested `not_eq_prop` casts simplify to a direct proof of `¬ Q`.
 -- Exercises `tryDecompEqMpNotEqProp` in `Specialized/Grind.lean`.
+--
+-- DISPATCH-ORDER LOCK: this snapshot also pins the invariant that
+-- `trySpecializedDecompHandlers` (Phase 3) runs BEFORE the general
+-- structural `tryDecompEqMp` (Phase 4).  If you swap their order, this
+-- snapshot diverges to a generic `refine @Eq.mp ...` over the
+-- un-collapsed `not_eq_prop`-wrapped expression — losing both the
+-- `intro hq` introduction and the recursive `propext`/`Iff.intro`
+-- restructure.  See `Decompiler.lean:351`.
 /--
 info: Try this:
   [apply] intro hq
@@ -243,6 +258,12 @@ example (P Q : Prop) (f : P → Q) (g : Q → P) (hq : Q) : P := by
 -- puts the user-form hypothesis in the lctx so downstream `lia` (in real
 -- grind output) can close — here there's no arithmetic so we fall through
 -- to the structural `refine @Eq.mp` recursion.
+--
+-- DISPATCH-ORDER LOCK: this snapshot also pins the invariant that
+-- `tryDecompEqMpForallCongr` (Phase 4) runs BEFORE `tryDecompEqMp`
+-- (also Phase 4 but later in the list).  If you swap their dispatch
+-- order, this snapshot diverges to a generic `refine @Eq.mp ...` over
+-- the un-peeled `forall_congr` premise.  See `Decompiler.lean:360`.
 set_option linter.unusedVariables false in
 /--
 info: Try this:
@@ -333,5 +354,101 @@ info: Try this:
 example {α : Type} [FooBar α] (a b c : α)
     (h1 : FooBar.rel a b) (h2 : FooBar.rel b c) : FooBar.rel a c := by
   decompile exact foo_trans h1 h2
+
+-- ╔══════════════════════════════════════════════════════════════════════╗
+-- ║ §8  Structural-handler smoke tests                                   ║
+-- ╚══════════════════════════════════════════════════════════════════════╝
+--
+-- These handlers fire deep in Phase 4 / Phase 6 of dispatch and rarely
+-- appear in nightly snapshots, so changes can silently regress them.
+-- Each test is a tiny synthetic input where the named handler is the
+-- only candidate — if it stops firing, the snapshot drops to a raw
+-- `exact <term>` from `decompExact`, which is easy to spot.
+
+-- Test 20: `tryDecompAndProj` on `And.left h`.  The handler refuses on
+-- the applied-to-extra-args case (`h.left x`), so this is the canonical
+-- 3-arg shape.  Theorem-app fallback would otherwise emit `exact h.left`.
+/--
+info: Try this:
+  [apply] apply And.left
+    · exact h
+-/
+#guard_msgs (whitespace := lax) in
+example (a b : Prop) (h : a ∧ b) : a := by
+  decompile exact And.left h
+
+-- Test 21: `tryDecompEqSymm` on `Eq.symm h`.  `tryDecompEqMp` doesn't
+-- match (no `Eq.mp` head); `tryDecompEqSymm` is the only candidate
+-- before the theorem-app fallback.
+/--
+info: Try this:
+  [apply] refine Eq.symm ?_
+    · exact h
+-/
+#guard_msgs (whitespace := lax) in
+example (a b : Nat) (h : a = b) : b = a := by
+  decompile exact Eq.symm h
+
+-- Test 22: `tryDecompIffMpMpr` on `Iff.mp h hp`.  Phase 4 propositional
+-- handler.  Locks the `@`-prefixed emit shape (concern #11 fix,
+-- 2026-05-09): the handler emits `refine @Iff.mp P Q ?_ ?_` with the
+-- type args explicit so re-elaboration doesn't depend on later mvar
+-- unification.  Without `@` + explicit types, the bare
+-- `refine Iff.mp ?_ ?_` shape fails synthetic re-elab because `?P, ?Q`
+-- can't be inferred before the holes are filled.
+/--
+info: Try this:
+  [apply] refine @Iff.mp P Q ?_ ?_
+    · exact h
+    · exact hp
+-/
+#guard_msgs (whitespace := lax) in
+example (P Q : Prop) (h : P ↔ Q) (hp : P) : Q := by
+  decompile exact Iff.mp h hp
+
+-- Test 23: `tryDecompEqRefl` on `@Eq.refl Nat 1`.  Trivial but locks the
+-- `Eq.refl → rfl` rewrite — without it, the term would render as
+-- `exact @Eq.refl Nat 1` (verbose) or hit the theorem-app fallback
+-- which can't recurse meaningfully on a fully-applied refl.
+/--
+info: Try this:
+  [apply] rfl
+-/
+#guard_msgs in
+example : (1 : Nat) = 1 := by
+  decompile exact @Eq.refl Nat 1
+
+-- Test 24: `tryDecompEagerReduce` on `eagerReduce (Eq.refl true)`.  Phase 6
+-- handler — fires when `eagerReduce` is the literal proof-term head.
+-- Without this handler, the wrapper would prevent `tryDecompEqRefl` from
+-- collapsing to `rfl` (head is `eagerReduce`, not `Eq.refl`), and the
+-- term would fall through to the theorem-app fallback or `exact`.
+-- Real grind certificates use `eagerReduce (Eq.refl true) : <decide-expr> = true`
+-- as a reducibility marker.
+/--
+info: Try this:
+  [apply] decide
+-/
+#guard_msgs in
+example : (true : Bool) = true := by
+  decompile exact eagerReduce (Eq.refl true)
+
+-- Test 25: `tryDecompTheoremAppFallback` const head, mixed proof / non-proof
+-- args, no typeclass binders.  Test 19 covers this path with an inferInstance
+-- sanitizer rewrite; this test locks the no-sanitizer baseline (custom axiom
+-- with two `Prop` parameters and two proof-args).
+namespace MultiArg
+axiom my_thm (P Q : Prop) (h1 : P) (h2 : Q) : P ∧ Q
+end MultiArg
+
+/--
+info: Try this:
+  [apply] refine MultiArg.my_thm P Q ?_ ?_
+    · exact h1
+    · exact h2
+-/
+#guard_msgs (whitespace := lax) in
+example (P Q : Prop) (h1 : P) (h2 : Q) : P ∧ Q := by
+  decompile exact MultiArg.my_thm P Q h1 h2
 
 end LeanDecomp.Test

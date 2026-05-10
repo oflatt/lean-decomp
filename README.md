@@ -30,12 +30,33 @@ Readability is secondary to correctness. When the structural decompiler cannot s
 
 ## Top TODO
 
-1. **Investigate the `Ring/Unbundled/Rat.lean` cluster (4 failures: L44, L83, L89, L97, L142).**  The 2026-05-05 broader-corpus sweep showed coverage jumped from 33% to 47% on the cross-file fix, leaving 26 failures across 49 actual grind sites.  `Rat.lean` alone has 4: one too-large, one heartbeat, three validate-fallback.  Investigating one file with multiple failures is high-leverage — a common shape probably underlies several.  Concrete first step: `cat dump-broader-order/Mathlib/Algebra/Order/Ring/Unbundled/Rat/L89.decompile.failed.lean` (or `*.query.lean`) and look at what shape grind emits for `Rat`-arithmetic proofs.
-2. **Order-grind handlers** for `Lean.Grind.Order.*` — analog to the existing `Int.Linear.*` arithmetic specialization in `Specialized/Grind.lean`.  Investigation 2026-05-01: `min_assoc` (one of the historical "replaced with manual proof" cases — the human replacement is 6 lines) decompiles to 112 lines that re-elaborate correctly, but 3 inner `exact <Eq.trans …>` chains reference `Lean.Grind.Order.le_eq_false_of_lt` etc.  Specialized handlers for these would close the order-grind cluster of failures.
-3. **Cross-version stability experiment.** Pick a grind-heavy mathlib file, decompile every grind site, then bump grind/Lean toolchain and count how many decompiled proofs still elaborate vs how many grind sites still close. Mining surfaced the headline anchor: `Mathlib/Algebra/ContinuedFractions/.../CorrectnessTerminating.lean:150` was reverted with `#adaptation_note` citing [lean4#9825](https://github.com/leanprover/lean4/issues/9825) — author waiting for upstream grind fix.  Decompile-once should survive that regression.
-4. **Stage-3 tactic simplifier (residual speed gap, polish).** After the byContradiction Phase-A short-circuit (2026-05-01) and the `Or.casesOn → bare lia` collapse (2026-05-04), decompile is 0.72×–1.13× of grind on grind-success cases.  The remaining gap is in the `by_cases h_abs : … ; · rw [abs_of_nonpos h_abs] at hp; lia ; · rw [abs_of_pos (not_le.mp h_abs)] at hp; lia` shape emitted by `tryDecompAbsCaseSplitContradiction` (Int L47/L91): two `lia` calls, neither obviously merge-able since each branch needs a different rewrite first.  Closing this needs either lia/cutsat to natively handle `abs x` case splits or a hypothesis-rewrite-aware "single lia over the conjoined goal" rule — much less mechanical than the trivial `Or` collapse was.  Polish item, not paper-blocker.
-5. **Snapshot tests for the decompiler output.** Tests 14/15 lock down the `Eq.mp (Eq.symm? (propext (Iff.intro f g))) ev → f/g ev` simplifier collapse; **Tests 16/17/18** lock down the `tryDecompEqMpForallCongr` / `tryDecompEqMpImpliesCongr` peelers; **Test 19** (added 2026-05-05) locks down the bare-`inst✝ → inferInstance` sanitizer rewrite.  Still missing: a snapshot for the projection-chain case (`inst✝.toLE → inferInstance`) — see "Tomorrow's first thing" for why this is deferred — and snapshots for the actual Sum/Int *output shape* (depends on grind's emitted certificates, version-sensitive).
-6. **Document the supported envelope.** The decompiler ships with a stable list of structural handlers (see *What Is Working* below) and grind-specific specializations (see `Specialized/Grind.lean`). A short "what shapes do we handle" table near the top of the README would make it easier to predict whether a new failure is in scope.
+### Coverage / handler work
+
+1. **Order-grind handlers** for `Lean.Grind.Order.*` — analog to the existing `Int.Linear.*` arithmetic specialization in `Specialized/Grind.lean`.  Concrete starting case: `Mathlib/Order/Defs/LinearOrder.lean:158` (`min_assoc`).  Targeting these would replace the `grind only [<extracted>]` leaves currently used in Rat L83/L89/L97 (visible in `analyze.py shape dump-broader-order`) with cleaner structural emission.  See "On the order-grind family" in the deep-dive doc below.
+2. **Investigate Rat L44 (too-large) and L142 (validate-fallback)**.  The two remaining Rat failures need different attacks than the 2026-05-09 grind-only fallback (which closed L83/L89/L97).  L44's `0 ≤ if true = true then …` shape needs case-split-then-grind-only.  L142's structural decomp doesn't get traction at all.
+3. **Cross-version stability experiment** (paper headline).  Pick a grind-heavy mathlib file, decompile every grind site, then bump grind/Lean toolchain and count survivors.  Mining surfaced the anchor: `Mathlib/Algebra/ContinuedFractions/.../CorrectnessTerminating.lean:150` was reverted with `#adaptation_note` citing [lean4#9825](https://github.com/leanprover/lean4/issues/9825) — decompile-once should survive that regression.
+
+### Refactoring / dev-loop (from 2026-05-09 deep-dive review)
+
+The deep-dive surfaced 10 concerns; the user accepted these for action (#8/#9 declined, #4 deferred).  Order is "smallest cost first":
+
+4. **Add snapshot tests broadly** + lock dispatch order (concern #5).  *Done 2026-05-09 PM*: 20 → 25 snapshot tests via §8 (AndProj / EqSymm / IffMpMpr / EqRefl / EagerReduce / TheoremAppFallback const-head); Tests 12 and 16 docstrings strengthened with explicit dispatch-order claims.  Remaining shapes (`tryDecompFalseRec`, `tryDecompFalseType`) are hard to trigger in isolation because Phase 2 `tryDecompCasesOn` claims most synthetic False-elimination shapes first; deferred — the Sum/Int nightly slice exercises both paths.
+5. **Cheap shape-checks in `tryDecompByContradiction` phases** (concern #2).  *Done 2026-05-09 PM* — the recomputation issue was specifically Phase B → Phase D rerunning the same `decompileExpr`.  Fixed by caching Phase B's body tactics for Phase D reuse.  See Done section.  Phase C's arithmetic shape-check was already in place at `Decompiler.lean:145`.
+6. **Split the `Decompiler.lean` mutual block** (concern #10).  *Done 2026-05-09 EOD* — `tryDecompIntro` → `LeanDecomp/Intro.lean`, `tryDecompByContradiction` → `LeanDecomp/ByContradiction.lean`, and the arith-terminal helper cluster → `LeanDecomp/Helpers/ArithTerminal.lean`.  Decompiler.lean: 823 → 677 lines.  See Done section.
+7. **Stage-3 dead-`have` elimination** (concern #7).  *Implemented 2026-05-09 EOD; gated off by default 2026-05-10* — pass is correct but per-have validation regresses broader-corpus by +11 wall-clock timeouts.  Lives behind `set_option leanDecomp.eliminateDeadHaves true`.  Future work: tighten the cost model so it can be on by default (skip validation when the closing tactic dominates the seq, etc.).  See Done section.
+
+### Documentation
+
+8. **Document the supported envelope.** The decompiler ships with a stable list of structural handlers (see *What Is Working* below) and grind-specific specializations (see `Specialized/Grind.lean`). A short "what shapes do we handle" table near the top of the README would make it easier to predict whether a new failure is in scope.
+
+### Acknowledged but punted
+
+- **Concern #3 (`validateOrExact` cumulative cost)** — `analyze.py shape` (added 2026-05-09 PM) already gives us per-file fallback-shape counts; iterate on actual data rather than instrumenting via Lean code.
+- **Concern #4 (generalized cases motives)** — research item.  Current path silently degrades to `exact`; documented in "Recommended Next Steps".
+- **Concern #6 (grind only output policy)** — clarified in code comments / Done section; doc-only.
+- **Concern #8 (CSE / sub-proof sharing)** — declined as speculative without measurement.  `analyze.py shape` would surface the symptom first.
+- **Concern #9 (two-tier heartbeats)** — declined.
+- **Stage-3 simplifier residual** — only the "abs case-split-bound `lia`" remainder; not a paper-blocker.
 
 ## Long-term plan / Paper framing
 
@@ -121,6 +142,56 @@ Top representative cases (by replacement size):
 
 These cases are not yet directly testable from our pinned mathlib commit (the mining went back further than the pin), but the paper plan can cite them and rerun against an updated pin once we're ready to run the cross-version stability experiment (Phase 3 of the long-term plan).
 
+### Done: stage-3 dead-`have` elimination — opt-in only (2026-05-09 EOD → 2026-05-10, concern #7)
+
+Implemented as a new pass in `LeanDecomp/TacticSimplify.lean` and gated behind `register_option leanDecomp.eliminateDeadHaves` (**default `false`**):
+
+- **`extractHaveBinderName`** — detects `have h := X` / `have h : T := X` (term-RHS forms; `by`-RHS forms are already collapsed by the existing `simplifyTactic` to term-RHS).
+- **`referencesName`** — recursive ident-match over a syntax tree.  Conservative: a destructuring pattern that rebinds the same name still counts as a reference, so we never drop a live have.
+- **`eliminateDeadHavesAux`** — recursive walk; for each candidate, checks textual liveness, then validates the remaining tactic sequence via `LeanDecomp.candidateTacticsCloseGoal` (heartbeat-capped at 100k).  If validation passes, drops the have and re-checks from the same index.
+- **`eliminateDeadHaves`** — entry point.  Called from `buildDecompiledTactics` between `simplifyTactics` and the inaccessible-name sanitizer.  No-op when the option is off.
+
+**Why opt-in**: the pass is *correct* (validation guards correctness) and produces real improvements (Test 17's `have h := h_imp hp; lia` → just `lia` was the first catch).  But the per-have validation cost compounds on heartbeat-bound nightly sites — the 2026-05-09 broader-corpus measurement regressed from 26/42 → 20/45 (+11 wall-clock timeouts) when the pass ran on every `decompile` call.  Default-off lets users enable it in interactive sessions where output quality matters more than per-call cost; the code stays in tree for future investigation (e.g., a tighter cost model that skips validation when the seq is dominated by a single closing tactic).
+
+**Scope**: top-level array only — focused subgoal blocks (`· …`) aren't walked because their lctx isn't available at simplification time.
+
+### Done: split Decompiler.lean mutual block (2026-05-09 EOD, concern #10)
+
+Closed Top TODO #6.  Extracted three modules from `LeanDecomp/Decompiler.lean`:
+- **`LeanDecomp/Intro.lean`** (28 lines) — `tryDecompIntro` with `decompileExpr : DecompileCallback` parameter.
+- **`LeanDecomp/ByContradiction.lean`** (100 lines) — `tryDecompByContradiction` with the same callback.  Imports `LeanDecomp.Helpers.ArithTerminal` and `LeanDecomp.Specialized` for the cross-handler dependencies.
+- **`LeanDecomp/Helpers/ArithTerminal.lean`** (60 lines) — five helpers (`containsArithRelevantConst`, `containsArithmeticAutomationConst`, `isArithmeticLikeGoal`, `tryValidatedTerminalTactic`, `tryDecompArithmeticTerminalPasses`) that were `private` to `Decompiler.lean` but now need to be visible to `ByContradiction.lean`.  Promoted from `private def` to `def`.
+
+`Decompiler.lean` shrank **823 → 677 lines** (-146).  Mutual block went from **11 → 9 partial defs**.  Each handler change in `Intro.lean` / `ByContradiction.lean` now recompiles only that file (~6.5s each) instead of the whole `Decompiler.lean` mutual block.  Build clean (`lake build LeanDecomp.Test` 17 jobs); smoke clean.
+
+**Pattern**: same as `LeanDecomp/CasesOn.lean` — handlers that recurse pass `decompileExpr` as a parameter rather than referencing it through the mutual block.  The remaining mutual-block handlers (`tryDecompBetaRedex`, `tryDecompLet`, etc.) all genuinely need recursion-into-decompileExpr OR are tightly coupled to `decompExact`; they stay where they are.
+
+### Done: byContradiction Phase B/D dedup (2026-05-09 PM, concern #2)
+
+Closed Top TODO #5 with a small surgical change in `tryDecompByContradiction` (`Decompiler.lean:494`).  Phase B (`decompileExpr` + tight `candidateTacticsCloseGoal` validation, capped at `candidateMaxHeartbeats` = 100k) and Phase D (`validateOrExact` re-running the *same* `decompileExpr` under looser `subproofTacticsCloseGoal` validation, no heartbeat cap) used to recompute identical body tactics back-to-back.  Now Phase B caches its body tactics into `phaseBBodyTactics : Option (Array (TSyntax \`tactic))`; Phase D's `validateOrExact` build reuses the cache when present and only recomputes when Phase B threw.
+
+**Why this is safe**: the cached `TSyntax` is pure data (no mutable state).  Phase B's `set savedUsed` restores name state to its pre-Phase-B snapshot, so a hypothetical Phase D recompute would start from the same state as Phase B and produce identical syntax — caching gives the same result with one fewer compute.  Phase D's looser validation still gets its second-chance shot at heartbeat-starved candidates.
+
+**Why this matters**: contradiction bodies in Sum/Int/Rat regularly hit Phase D (the structural decomp produces a candidate that's tactically correct but exceeds 100k heartbeats during validation).  Each duplicated decompileExpr call was burning the full body-decompile cost.  Smoke clean post-change (Sum 4/4, Int 5/5, list 1/1).
+
+### Done: §8 structural-handler snapshot tests + dispatch-order locks + IffMpMpr fix (2026-05-09 PM)
+
+Filled coverage gap from the deep-dive #5: handlers that fire deep in dispatch and rarely show up in nightly snapshots had no regression locks.  Added a §8 section to `LeanDecomp/Test.lean` with five structural-handler smoke tests:
+- **Test 20** — `tryDecompAndProj` on `And.left h` (locks the 3-arg shape; the applied-to-extra-args case correctly falls through).
+- **Test 21** — `tryDecompEqSymm` on `Eq.symm h` (locks `refine Eq.symm ?_` shape).
+- **Test 22** — `tryDecompIffMpMpr` on `Iff.mp h hp` (locks `refine @Iff.mp P Q ?_ ?_` shape, post concern #11 fix).
+- **Test 23** — `tryDecompEqRefl` on `@Eq.refl Nat 1` (locks `Eq.refl → rfl` rewrite).
+- **Test 24** — `tryDecompEagerReduce` on `eagerReduce (Eq.refl true)` (locks the Phase 6 `eagerReduce → decide` rewrite that real grind certificates rely on).
+- **Test 25** — `tryDecompTheoremAppFallback` const head, mixed proof / non-proof args, no typeclass binders.  Test 19 covers the same path with a sanitizer rewrite; Test 25 locks the no-sanitizer baseline.
+
+Also strengthened **Test 16's** and **Test 12's** docstrings with explicit dispatch-order claims:
+- Test 16 — the `tryDecompEqMpForallCongr` MUST-precede `tryDecompEqMp` invariant (Phase 4 internal order).  Points at `Decompiler.lean:360`.
+- Test 12 — the `trySpecializedDecompHandlers` (Phase 3) MUST-precede `tryDecompEqMp` (Phase 4) invariant.  Points at `Decompiler.lean:351`.
+
+**Concern #11 fix in the same pass**: `tryDecompIffMpMpr` was emitting `refine Iff.mp ?_ ?_` without `@`-prefix or explicit type args, which fails synthetic re-elab because `?P, ?Q` can't be inferred before the holes are filled.  Changed emit shape to `refine @Iff.mp P Q ?_ ?_` (matches the `*Congr` peelers' style — see `EqDecomp.lean:306` for the established pattern).  Real grind output worked before via context, but the handler is now robust to isolated use as well.
+
+**Test count: 20 → 25.**  Build clean (`lake build LeanDecomp.Test` 851ms).  Smoke clean (build / int / sum / list — all pass).
+
 ### Done: pre-flight `⋯` detection (2026-05-06)
 
 Defensive forward-looking check in `checkDecompiled` (`ProofTermMacro.lean`): scan the formatted `tacticStr` for U+22EF (`⋯`, MIDLINE HORIZONTAL ELLIPSIS) BEFORE `evalTactic`.  If present, fail fast with a specific diagnostic ("decompile output contains the `⋯` truncation marker; route through `LeanDecomp.delabRefinable` / `LeanDecomp.ppTacticFull` …") instead of letting Lean bubble up an opaque "internal exception #5" with no actionable info.
@@ -155,6 +226,30 @@ Per the dev-loop priorities surfaced 2026-05-05:
 4. **`nightly.py --parallel N`** (new): outer-loop parallelization via `concurrent.futures.ThreadPoolExecutor`.  Each worker uses its own `BenchDB` (SQLite in-memory dbs aren't thread-safe), merged at the end.  `LEAN_DECOMP_INNER_WORKERS` env var caps inner per-file parallelism to `cpu_count // N` so total concurrent `lean` processes stay around `cpu_count`.  Process-group cleanup from 2026-05-04 handles per-child orphans correctly under parallel load.  Verified launches 11 properly-parented `lean Mathlib/...` processes; no orphans after kill.
 5. **`nightly.py --skip-mathlib-setup`** (new, supporting #3 + #4): skips the `git checkout` / `git clean` / `lake update` block in `ensure_mathlib`.  Required because parallel invocations otherwise race on `.git/index.lock`.  Caller is responsible for one-shot setup.
 6. **`bench_grind.py` attribute false-positive fix (yesterday morning, 2026-05-05)**: `GRIND_RE` was matching `grind` inside `@[simp, grind =]` *attribute* declarations.  Added `ATTR_RE` and `GRIND_ATTR_EQ_RE` skip checks.  Re-baselined corpus from 54 → 49 actual grind tactic sites.
+
+### Done: `scripts/analyze.py shape` subcommand (2026-05-09 PM)
+
+Out-of-band detector for fallback-shape patterns in dumped suggestions.  Walks `*.decompile.lean` files in a dump dir, counts three patterns:
+- `with_unfolding_all_exact` — fallback giant exact with eagerReduce wrapper.
+- `grind_only_leaf` — `grind only [...]` at a leaf (the 2026-05-09 fallback).
+- `big_exact` — `exact <multi-line term>` over 500 chars.
+
+Per-file report sorted by total fallback count.  Run on `dump-broader-order` to identify candidate sites for handler work without instrumenting the Lean code.
+
+Replaced an earlier sketch of an in-Lean `fallbackCounter` (concern #3 from the deep-dive) — out-of-band detection is lighter and works on existing dump artifacts.
+
+```
+$ python3 scripts/analyze.py shape dump-broader-order
+Scanned 26 *.decompile.lean files under dump-broader-order.
+Total fallback-shape occurrences:
+     2  with_unfolding_all_exact
+    10  grind_only_leaf
+     2  big_exact
+Per-file (top 6 by total fallback count):
+    4  Mathlib/Algebra/Order/Ring/Int/L58.decompile.lean  (with_unfolding_all_exact=1, grind_only_leaf=2, big_exact=1)
+    3  Mathlib/Algebra/Order/Ring/Unbundled/Rat/L83.decompile.lean  (grind_only_leaf=3)
+    ...
+```
 
 ### Done: cleanup pass — `Helpers.lean` split + dead code removal (2026-05-09 PM)
 
@@ -222,353 +317,83 @@ Most of the proof is structural; `grind only` appears only at the (formerly opaq
 
 **Limitation**: 100k-node walk cap in `extractGrindOnlyLemmas` (was 5k initially — too small; the L89 proof is ~13k nodes and `mkRat_pos_iff` appears past the 5k mark).  100k is enough for typical mathlib proofs while bounding worst-case time.
 
-### Investigation: `Lean.Grind.Order.eq_mp` simplifier rewrite (2026-05-08, no coverage win)
+### Investigations that didn't ship (Rat / order-grind cluster)
 
-**Tried**: in `Simplify/Grind.lean`, added rewrites for `Lean.Grind.Order.eq_mp p q h₁ h₂ → Eq.mp h₁ h₂` (and `eq_mp_not` similarly) so the existing `simplifyPropCast` / `tryDecompEqMp` chain could handle them on Rat-arithmetic order proofs.  Rationale: the L89 simplified proof has many `Lean.Grind.Order.eq_mp` wrappers around polynomial-form transports — converting them to core `Eq.mp` form would feed into the established peeler chain.
+Three attempts in 2026-05-07 / 2026-05-08 to crack the `Mathlib/Algebra/Order/Ring/Unbundled/Rat.lean` failures.  None shipped a coverage win.  The unifying lesson is in the resume-marker archive ("piecewise interventions on the order-grind family don't compose"); summaries below for posterity.
 
-**Did not ship a coverage win**:
-- The rewrite fired (post-rewrite simplified proof has 0 `Lean.Grind.Order.eq_mp` references — confirmed via `dumpOnFail`).
-- Smoke 4/4 unchanged — no regressions.
-- Rat 0/5 unchanged.  L89/L97 unaffected.
-- The simplified proof STILL contains many other `Lean.Grind.Order.*` lemmas that the decompiler can't peel: `eq_trans_true`, `le_eq_true_of_lt_k`, `lt_of_not_le_k`, `Lean.Grind.CommRing.le_norm_expr`, etc.  The rewrite for `eq_mp` alone doesn't unblock the structural decomp because the surrounding wrappers are still opaque.
+- **`Lean.Grind.Order.eq_mp` simplifier rewrite (2026-05-08)** — added rewrites in `Simplify/Grind.lean` for `Order.eq_mp p q h₁ h₂ → Eq.mp h₁ h₂` so the existing peeler chain could handle them.  Fired correctly (post-rewrite proof had 0 `Order.eq_mp` references) but Rat 0/5 unchanged because the surrounding `eq_trans_true` / `le_eq_true_of_lt_k` / `CommRing.le_norm_expr` wrappers are still opaque.  **Reverted.**
+- **`tryDecompFalseFromOrderGrind` leaf handler (2026-05-07 PM)** — added in `Specialized/Grind.lean` to match `False` goals containing `Lean.Grind.Order.<name>_unsat_k` and emit `with_unfolding_all exact <leaf>` with a size guard.  Without the guard: regressed L83/L89/L97 to wall-clock-timeout.  With the guard: L83 returned to fast-fail but L89/L97 still timed out (deeper structural progress → bigger validation candidate).  **Definition kept but commented out of dispatch list.**
+- **`rename_i` fallback for inaccessible hypotheses (2026-05-07)** — targeted `IsNonarchimedean.lean:216`'s fallback `exact <…> a✝` reference.  First wiring into `chooseExactStrategy` regressed L234; reworked as post-process `Syntax.replaceM` to fix L234 but then L216 hung 120s+ (Lean's elaborator on giant terms with missing names).  **Reverted; helpers `renameInaccessibleHyps` / `replaceInaccessibleRefs` removed from Helpers.lean during 2026-05-09 cleanup.**
 
-**Reverted**: the rewrites are removed from `simplifyGrindWrappers`.  Lesson: piecewise simplifier rewrites for the order-grind family don't compose with the existing decompiler — too many sibling lemmas need handlers / rewrites simultaneously to make a difference.  A coordinated `Specialized/Grind/Order.lean` pass is the right level of intervention, not one rewrite.
+Future direction for the order-grind cluster: a coordinated `Specialized/Grind/Order.lean` module (Top TODO #1) that handles the family as a system.
 
-### Investigation: order-grind leaf handler (2026-05-07 PM, no coverage win)
+### Tomorrow's first thing (resume marker, 2026-05-10 — moving to bigger machine)
 
-**Tried**: added `tryDecompFalseFromOrderGrind` in `Specialized/Grind.lean`, between `tryDecompFalseFromLia` and `tryDecompEqMpIntLinearNormLe`.  Matches `False` goals where the proof contains a `Lean.Grind.Order.<name>_unsat_k` constant (grind's order-arithmetic unsat-certificate shape, which `lia` can't close because the underlying field is `Rat` not `Int`).  Emits `with_unfolding_all exact <leaf>` with a heartbeat-bounded validation.
+**For a new agent picking this up**: orient yourself with these five sections first — `## How it works` (5), `### Correctness Invariant` (25), `## Top TODO` (31), `### Pipeline overview` (in Design Notes), `### Concerns and risks`.  The 8-phase dispatch in `Decompiler.lean:382` is the load-bearing decomp logic; `tryDecompCasesOn` (`CasesOn.lean`) and `tryDecompByContradiction` (`ByContradiction.lean`) are the most subtle handlers.  For dev loop: `scripts/smoke.sh` is the fast regression check (16s); `lake build LeanDecomp.Test` is the snapshot regression check.  Standing user constraints in `~/.claude/.../memory/`: never commit; never stack lake/lean processes; broader-corpus sweeps only with explicit approval.
 
-Hypothesis was: structural decomp of `Or.casesOn → And.casesOn → False.elim (Lean.Grind.Order.lt_unsat_k …)` was bailing at the leaf (no specialized handler matched), so the OUTER cases-on couldn't make progress and the whole proof fell through to one monolithic `with_unfolding_all exact <whole-proof>`.  Recognizing the leaf would let the outer structural form succeed with each branch having its own (much smaller) `with_unfolding_all exact <leaf>`.
+**Session state at handoff** — five concrete changes landed (all four code, plus tests):
+1. **Concern #11 fix** (`Decompiler.lean tryDecompIffMpMpr`) — emit changed from `refine Iff.mp ?_ ?_` to `refine @Iff.mp P Q ?_ ?_` so synthetic re-elab works.  Locked by Test 22.
+2. **Concern #2 / Top TODO #5** (`Decompiler.lean tryDecompByContradiction` → after split, `ByContradiction.lean`) — Phase B caches its body tactics; Phase D's `validateOrExact` reuses the cache instead of recomputing `decompileExpr`.  Heartbeat-starved candidates still get Phase D's looser validation second chance, no behavior change otherwise.
+3. **Concern #10 / Top TODO #6** — split `Decompiler.lean`'s mutual block.  Three new files: `LeanDecomp/Intro.lean` (`tryDecompIntro`), `LeanDecomp/ByContradiction.lean` (`tryDecompByContradiction`), `LeanDecomp/Helpers/ArithTerminal.lean` (5 arith-terminal helpers promoted from `private`).  Decompiler.lean: 823 → 677 lines.  Mutual block: 11 → 9 partial defs.
+4. **Concern #7 / Top TODO #7** (`TacticSimplify.lean eliminateDeadHaves`) — implemented + **gated off by default** via `register_option leanDecomp.eliminateDeadHaves`.  See Done section for the cost-regression rationale.
+5. **Top TODO #4** (snapshot tests) — 20 → 25 in `Test.lean §8`: AndProj / EqSymm / IffMpMpr / EqRefl / EagerReduce / TheoremAppFallback const-head.  Tests 12 + 16 docstrings strengthened with explicit dispatch-order claims.
 
-**Did not ship a coverage win**:
-- Without size guard: Rat L83/89/97 regressed from "fail fast (validate-fallback, ~15s)" to "wall-clock-timeout (120s)".  The validation `with_unfolding_all exact <giant>` for the full-proof case bursts the heartbeat budget.
-- With size guard (`exprNodeCount > 5000` skips): regression mostly fixed (L83 returns to fast-fail).  But L89/L97 still wall-clock-timeout — the structural decomp succeeds at the leaf level and validation moves to a higher level which is itself slow.
-- L142 / L44: unchanged.  Coverage on Rat: still 0/5.
-- Smoke (Sum 4/4, Int 5/5, List 1/1, build OK): unaffected.
+Smoke clean throughout (Sum 4/4, Int 5/5, list 1/1).  **All non-research deep-dive items closed.**
 
-**Kept in tree but DISABLED in dispatch list** (2026-05-08): on re-test the next day with the size guard, L89/L97 returned to wall-clock-timeout (the structural decomp progresses deeper, then validates a bigger candidate that exhausts the file's heartbeat budget).  Definition retained as preparatory infra; `tryDecompFalseFromOrderGrind` is commented out of the `handlers` list.
-
-**For tomorrow**: the actual blockage on L89/L97 is upstream of this handler — the structural recursion isn't getting traction even when the leaf is recognized.  Probably need to also handle one of: (a) `Or.casesOn` discriminant with `Lean.Grind.of_eq_eq_true (eq_true …)` shape, (b) the `Eq.mp (Lean.Grind.Order.eq_mp …) …` chain that wraps each leaf, (c) the `Eq.mp (Lean.Grind.CommRing.lt_norm_expr …) …` polynomial-form transport.  Each is a separate `Specialized/Grind/Order.lean`-style handler.
-
-### Investigation: `rename_i` fallback for inaccessible hypotheses (2026-05-07, no coverage win)
-
-**Tried**: prepend `rename_i name1 name2 …` to the fallback exact emission, plus a post-process pass that replaces references to inaccessible userNames in the delabbed Syntax with the freshly-assigned accessible names.  Targeted `IsNonarchimedean.lean:216` (its fallback `exact <…> a✝` references inaccessible `a✝` literally and fails re-elab with a free-reference type-mismatch).
-
-**Did not ship a coverage win**:
-1. Wiring it into `chooseExactStrategy` regressed L234 (smoke went 1/1 → 0/1).  The `Meta.withLCtx renamedLctx` propagated the renamed lctx to upstream validation paths, breaking structural decomp.  Switched to a post-process `Syntax.replaceM` to keep delab in the original lctx — fixed L234 regression.
-2. With the post-process approach: L216 now hangs at 120s+ during validation (was failing fast before with a clear error).  Hypothesis: `rename_i` consumes inaccessibles → original userNames are gone from lctx → the giant exact term's references fail to resolve → Lean's elaborator explores a large search space (instance synthesis trying to fill missing lctx slots) → wall-clock timeout.
-
-**Reverted**: `chooseExactStrategy` no longer emits the prefix.  Smoke 4/4 across the board; no regressions.
-
-**Helpers retained** (`Helpers.lean`) for future use:
-- `renameInaccessibleHyps : LocalContext → (Array Ident × Std.HashMap Name Name)` — given an lctx, generates fresh `h_inacc_N` names for inaccessibles AND a `oldName → newName` map.
-- `replaceInaccessibleRefs : Syntax → Std.HashMap Name Name → Syntax` — post-process that walks a Syntax tree replacing matching idents.
-
-**For tomorrow**: if pursuing this path, the right approach is probably narrower — fire the rename ONLY when the proof term actually references inaccessibles (check via `Expr.foldl` or similar) AND only on smaller proofs where the elaborator search space is bounded.  The blunt "always emit rename_i" caused the L216 hang because Lean's elaborator on giant terms with missing names goes off the rails.  Or skip this entirely: option (B) order-grind handlers is more leverage on the same Rat / `Lean.Grind.Order.*` cluster.
-
-### Tomorrow's first thing (resume marker, 2026-05-09 PM, post-broader-corpus rerun)
-
-**Today's broader-corpus result**: 27/45 = **60%** (up from 23/49 = 47% on 2026-05-05).  +4 absolute sites, all from the 2026-05-09 grind-only fallback closing the validate-fallback / "other" clusters.  Decompile-treatment failure breakdown now: 9 wall-clock-timeout, 5 heartbeat, 1 too-large, 1 validate-fallback, 1 parse-error, 1 other.  See "Broader corpus coverage (2026-05-09)" above for the full table.
-
-**Two bugs fixed during the rerun** (both in `scripts/`, not the decompiler):
-- `nightly.py --parallel`: BenchDB merge step crashed with `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`.  Fixed: serialize to plain Python lists IN the worker thread before returning.
-- `scripts/analyze.py bucket`: was mixing decompile failures with `grindscript`/`grindonly` benchmark-treatment failures, inflating the "other" bucket.  Fixed: defaults to `--treatment decompile`; pass `--treatment all` for the unfiltered view.
-
-**Pick from**:
-- **(S) Heartbeat-cluster investigation** — 5 sites all hitting per-call validation budget.  The heartbeat cap is 100k (`leanDecomp.candidateMaxHeartbeats`).  Probe one site (`BigOperators/Group/Finset.lean:596`?) and see whether bumping the cap or restructuring the candidate composition helps.
-- **(T) Order-grind output cleanup** — `Specialized/Grind/Order.lean` handlers for the leaves currently emitting `grind only [<extracted>]`.  Replacing those with structural form would reduce output size and avoid the grind-call dependency.  Not a coverage move but a quality move.
-- **(U) Wall-clock-timeout investigation** — 9 sites hit 120s.  Per-phase profile markers (`set_option leanDecomp.profile true`) tell which phase wall-clocks.  Most are likely "file load is slow" (not decompile's fault), but some may be addressable.
-
-**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`, broader-corpus 27/45.  All passing at end of 2026-05-09 PM.
-
-### Tomorrow's first thing (resume marker, 2026-05-10 EOD)
-
-**Today**: investigated remaining Rat failures (L44 too-large, L142 validate-fallback) and probed Group/Finset L599 + IsNonarchimedean L216 to see if the 2026-05-09 grind-only fallback helps elsewhere.  No new coverage wins — added a too-large escape hatch in `ProofTermMacro.lean` (retry `chooseExactStrategy` on the whole proof when structural emits >20KB) as infrastructure but didn't move L44 specifically.
-
-**Pick from**:
-- **(O) Re-run broader-corpus** to see the actual coverage delta from 2026-05-09's grind-only fallback.  Last measured 23/49 = 47% on 2026-05-05; today's fixes target validate-fallback and too-large clusters which had ~6-7 sites.  Quick (~5 min via `nightly.py --parallel 4 --skip-mathlib-setup`).  Highest-leverage move because it picks the next handler target based on actual data instead of guessing.
-- **(P) `Group/Finset:L599`-style typeclass-metavariable issue**: structural decomp now produces locally-valid tactics that fail cross-file with "typeclass instance problem is stuck: Singleton α ?m.143".  Likely: the structural form has a binder-typing issue that leaves a metavariable.  Investigate by looking at the dumped failed.lean and finding the metavariable site.
-- **(Q) Delab heartbeat timeout on giant proofs** (IsNonarchimedean:216): the delaborator runs out of 200k heartbeats during rendering.  May need progressive simplification — apply more simplifier rules upfront to shrink the proof before delab.
-- **(R) Tighten `extractGrindOnlyLemmas` filter** — current filter still emits non-theorem names like `mkRat` (a definition), `Finset` (a type).  Could narrow to "is a theorem-typed const" via env lookup; might enable extra grind-only validations to succeed.
-
-**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`.  All passing at end of 2026-05-10.
-
-### Tomorrow's first thing (resume marker, 2026-05-09 EOD)
-
-**Today's win**: `grind only [<extracted-user-lemmas>]` last-resort fallback in `chooseExactStrategy`.  Rat 0/5 → 3/5 (L83, L89, L97 cross-file pass).  See "Done: grind only [<extracted>] last-resort fallback (2026-05-09)" above.
-
-**Pick from**:
-- **(L) Re-run broader-corpus** to measure the coverage delta from today's `grind only` fallback.  Last measurement was 23/49 = 47% on 2026-05-05.  Today's fix may push that significantly higher — many of the wall-clock-timeout / validate-fallback failures had a similar shape (structural decomp falls through, no terminal tactic available).  Quick (~5 min parallel via `nightly.py --parallel 4 --skip-mathlib-setup`).
-- **(M) Investigate the remaining Rat failures**: L44 (too-large, ~34KB exact) and L142 (validate-fallback).  L44 may benefit from a deeper structural decomp + `grind only` at leaves; L142 is some specific shape that needs investigation.
-- **(N) Tighten `isUserLemmaName`** — current filter catches typeclass instances reasonably but emits `mkRat` (a definition, not a theorem) in the lemma list.  Could narrow to "is a theorem-typed const" via env lookup, though `grind only` already handles non-theorems gracefully.
-
-**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`.  All passing at end of 2026-05-09.
-
-### Tomorrow's first thing (resume marker, 2026-05-08 EOD)
-
-**Three Rat-cluster attempts on 2026-05-07 / 2026-05-08 — none shipped a coverage win**:
-1. (PM-1) rename_i fallback for inaccessible hypotheses → L216 hung.  Helpers in tree, inert.
-2. (PM-2) `tryDecompFalseFromOrderGrind` handler → L89/L97 wall-clock-timeout regression.  Definition in tree, commented out of dispatch list.
-3. (today) `Lean.Grind.Order.eq_mp` simplifier rewrite → fired correctly but didn't unblock decomp; reverted.
-
-**Lesson**: piecewise interventions on the order-grind family don't compose with the existing decompiler.  The Rat proofs use a half-dozen sibling lemmas (`Order.eq_mp`, `eq_trans_true`, `le_eq_true_of_lt_k`, `lt_of_not_le_k`, `CommRing.le_norm_expr`, …) that all need to be handled together.  Going forward, the right level of intervention is a coordinated `Specialized/Grind/Order.lean` module that handles the family as a system, not individual handlers/rewrites.
-
-**For tomorrow** (lower-leverage but feasible):
-- **(I) Re-run broader-corpus** to confirm 2026-05-05 lift + today's `delabRefinable` routing didn't accidentally regress sites that were passing.  Quick (~5 min parallel).  Should be done before more handler work to validate the existing tree state.
-- **(J) Look at the `Lean.Grind.CommRing.lt_norm_expr` shape** in the Rat proofs — this is the polynomial-form transport that wraps every Order arithmetic claim.  A handler that recognizes `Eq.mp (Lean.Grind.CommRing.lt_norm_expr …) <evidence>` and emits something traceable might be more impactful than the leaf-targeted handlers.
-- **(K) Drop the Rat work entirely** and pivot to other clusters from the broader-corpus.  Per 2026-05-05 breakdown: 5 heartbeat (`BigOperators/Group/Finset.lean:596`, `BigOperators/Ring/Finset.lean:144`, `Group/MinMax.lean:73`, `Ring/StandardPart.lean:193`, `Ring/Unbundled/Rat.lean:83`) might have a different shape.
-
-**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`.  All passing at end of 2026-05-08.
-
-### Tomorrow's first thing (resume marker, 2026-05-06 EOD)
-
-Today's `delabRefinable` + `pp.maxSteps` lift unblocks `⋯`-truncation cases globally.  L599 changed failure mode (truncation → too-large at 127KB).  Don't know yet whether other clusters benefit — broader-corpus re-run (Top TODO #1) is the validation step.  Pick from:
-
-- **(A) Re-run broader-corpus with `nightly.py --parallel 4 --skip-mathlib-setup`** to re-baseline coverage post-`delabRefinable` and post-`pp.maxSteps` lift.  `dump-broader-order/` from 2026-05-05 morning was 23/49 = 47% (after the cross-file `inst✝` fix).  Today's truncation-lift might unblock additional sites that were previously hitting `⋯` in delab/ppTactic paths and falling through to validate-fallback.  Use `scripts/analyze.py diff dump-broader-order/results.json /tmp/results-new.json` to see what moved.  Quick — should take ~5 min parallel.
-- **(B) Order-grind handlers** (Top TODO #2 / Rat cluster + L599's now-127KB fallback).  After today's truncation fix, L599 falls through to a 127KB raw exact term — visibly the wrong shape.  Adding a `Specialized/Grind/Order.lean` (analogous to the existing `Int.Linear.*` handlers) would decompose the `Lean.Grind.Order.lt_unsat_k` / `lt_le_trans_k` / `CommRing.lt_norm_expr` leaves into structural form.  Concrete starting case: `Mathlib/Order/Defs/LinearOrder.lean:158` (`min_assoc`) — 112-line decompile, 3 inner `Lean.Grind.Order.*` chains.
-- **(C) L599-specific: raise the 20KB max-size guard OR change the fallback emission**.  After today's fix, L599 fails with "proof too large (127738 chars, max 20000)".  20KB is a sanity cap from `ProofTermMacro.lean:200`.  Raising it would emit ugly-but-correct giants; a better fix is to bias toward NOT emitting fallbacks that large, which falls under (B).
-
-**Don't break**: Sum 4/4, Int 5/5, all 20 snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`.  All passing at end of 2026-05-06.
-
-### In progress: investigating the post-cross-file-fix failure clusters (2026-05-05 PM)
-
-After the morning's broader-corpus sweep showed 23/49 = 47% coverage with the cross-file `inst✝` cluster fully closed, started investigating the next clusters per Top TODO #1 (Rat.lean) and the `BigOperators/Group/Finset.lean:599` validate-fallback case.
-
-**Two findings, neither shipped a coverage win yet but both informative**:
-
-1. **`Mathlib/Algebra/Order/Ring/Unbundled/Rat.lean` cluster (4 failures) is order-grind-shaped.** All 4 sites (L83, L89, L97, L142) and the L44 too-large site share a common simplified-proof skeleton: `Classical.byContradiction (fun hp => Or.casesOn (Lean.Grind.of_eq_eq_true (eq_true ...)) ...)` with each branch terminating in `Lean.Grind.Order.lt_unsat_k` / `Lean.Grind.Order.lt_le_trans_k` / `Lean.Grind.CommRing.lt_norm_expr`-style leaves.  The structural decomp's `tryDecompCasesOn` fails to handle the discriminant `Lean.Grind.of_eq_eq_true (eq_true (Eq.mp ...))` cleanly — falls through to the exact fallback.  The exact fallback then over-unfolds via `with_unfolding_all`, breaking type-correctness (`Lean.Grind.iff_eq` unfolds to `propext (Iff.intro …)` and the surrounding `(fun h b => Eq.symm h ▸ b)` lambda's `h : α = β` no longer typechecks).  **Real fix is order-grind specialized handlers** (Top TODO #2), not a small simplifier rule — the `Lean.Grind.Order.*` lemma family deserves its own `Specialized/Grind/Order.lean` analogous to the `Int.Linear.*` handlers.  Probe script saved at `/tmp/rat89-probe.lean`.
-
-2. **`BigOperators/Group/Finset.lean:599` truncated-by-pp issue.** The fallback `exact <giant>` had `(h_2 : ⋯)` literally in the source (PrettyPrinter elision), causing `internal exception #5` at re-elab.  Tried two fixes in `chooseExactStrategy`'s delab path: lifting `pp.deepTerms` (depth-50 truncation) and `pp.proofs` (proof-elision truncation) when calling `delabToRefinableSyntax`.  **Both options now lifted defensively, but L599 STILL produces `⋯`** — meaning the ⋯-emitting path is NOT through `chooseExactStrategy` for this case.  Likely culprit: `tryDecompTheoremAppFallback` in `Decompiler.lean:708` calls `delabToRefinableSyntax app` directly without option lifting; same for several other delab sites in `Decompiler.lean`.  Tomorrow's first thing: thread the option-lifting helper through ALL `delabToRefinableSyntax` call sites in handler code, OR shadow `delabToRefinableSyntax` at file-import time with a wrapper that always lifts these options.  The defensive change in `chooseExactStrategy` does correctly handle the cases it covers — kept in place.
-
-Validation: Sum 4/4, Int 5/5, all 20 snapshot tests still pass.  No coverage delta from yesterday morning's 23/49 (the L599 fix is incomplete; Rat needs order-grind handlers).
-
-### Done: broader-corpus sweep + attribute false-positive fix (2026-05-05)
-
-Re-ran `nightly.py` across all of `Mathlib/Algebra/Order/` to validate the 2026-05-04 cross-file fixes.  **Coverage jumped from 18/54 = 33% → 23/49 = 47%** (re-baselined after the false-positive correction below).  Sweep took ~17 min wall-clock; zero stray `lean Mathlib` processes after — the 2026-05-04 process-group cleanup verified working in production.
-
-**Where the wins came from**: every gain is in the cross-file `inst✝` cluster.  That cluster collapsed from 15 failures → 0.  All other failure clusters (wall-clock-timeout, validate-fallback, heartbeat, too-large, "other") are unchanged from 2026-05-01.  See "Broader corpus coverage" section above for the full failure breakdown.
-
-**Re-baseline note: 5 sites were never grind tactic calls**.  The script's `bench_grind.GRIND_RE = r'(?<!\w)grind(?=\s|\[|$)'` matched `grind` in `@[simp, grind =]` *attribute* declarations (Lean's `grind` is registered as both a tactic and an attribute).  Substituting `decompile grind` produced invalid syntax `@[simp, decompile grind =]` and the queries failed at parse time with "unexpected token '='; expected ']'".  Affected: `Ring/Abs.lean:49`, `Interval/Set/Instances.lean:74/78/173/229`.  Fix: added two attribute-skip checks to `_has_grind` — `ATTR_RE` (line contains `@[…]`) and `GRIND_ATTR_EQ_RE` (`grind =` / `grind :=` patterns).  Unit-tested against 9 line shapes in-process before re-deploy.  The corrected total is **49 actual grind tactic sites** in the Order/ folder.
-
-**Top remaining clusters by leverage**:
-1. `Ring/Unbundled/Rat.lean` — 4 failures in one file (L44 too-large, L83 heartbeat, L89/L97/L142 validate-fallback).  High probability of a common underlying shape.  **Top TODO #1.**
-2. Wall-clock-timeout (10) — mostly slow file-load (per yesterday's Antidiag/* investigation), but Field/Basic.lean L327/656, Module/Defs L1076, MinMax L30/34, Ring/Int L58 worth probing with `leanDecomp.profile` on.
-3. Order-grind cluster (in "other" + some validate-fallback) — `Lean.Grind.Order.le_eq_false_of_lt` chains.  **Top TODO #2.**
-
-### Done: Test 19 sanitizer snapshot lock (2026-05-05)
-
-Added §7 + Test 19 to `Test.lean`: a regression lock for the 2026-05-04 `inst✝ → inferInstance` substitution.  Triggers `tryDecompTheoremAppFallback` via a synthetic `class FooBar (α : Type) where rel : α → α → Prop` and an axiom `foo_trans` with two proof args, so the decompile output is `refine @LeanDecomp.Test.Sanitize.foo_trans α inferInstance a b c ?_ ?_; · exact h1; · exact h2`.  The `inferInstance` slot exercises the bare-ident gate of `sanitizeInaccessibleIdents`.
-
-**Investigation note (don't repeat this loop)**: also tried to add a Test 20 for the projection-chain case (`inst✝.toLE → inferInstance`).  Two synthetic probes (`/tmp/sanitize-probe2.lean`, `/tmp/sanitize-probe3.lean`) were written using `class A` + `class B extends A`, but neither reproduced the actual failure shape:
-- `[b : B α]` (named binder): proof term carries `b.toA` — `b` is accessible, sanitizer correctly does NOT fire (validation passes too).
-- `[B α]` (anonymous binder) + `B.toA (self := inferInstance)` in source: proof term carries `inferInstance.toA` — the `inferInstance` is the *const*, not a fvar, so the sanitizer's narrow gate (correctly) doesn't fire.  The cross-file failure is "type class instance expected ?m" because of the literal `inferInstance`-without-type-annotation, NOT a sanitization bug.
-
-The actual `inst✝.toLE` failure mode (Group/List.lean L234) requires grind to emit an explicit `<inst-fvar>.toLE` projection in the proof term against an anonymously-bound class.  Reproducing that without mathlib's `Lean.Grind.Order.*` infra is hard.  The L234 regression test (currently passing in nightly via the dump-list-test slice) is the existing lock for that path; promoting it into a Test.lean snapshot needs either a mathlib-importing test target or a more clever synthetic — deferred (see Tomorrow's first thing for the deferred work).
-
-A follow-up false start (also avoid): added a `hasInaccessibleClassPrefix` helper that walked qualified names component-by-component looking for an inst-fvar parent, hoping the `inferInstance.toA` failure was a qualified-ident form of inaccessible-projection.  It wasn't — `inferInstance` (the global const) doesn't have macro scopes or `✝` markers, so the helper correctly didn't fire either.  Reverted; the original two-arm match (proj-node + bare-ident) is the right shape.
-
-### Done: per-phase profile markers + `Core.checkSystem` in simplifier (2026-05-04)
-
-Two related fixes for "macro hangs silently with no output" pathology surfaced during the wall-clock-timeout cluster investigation:
-
-1. **`Core.checkSystem "LeanDecomp.simplify"` at the entry of `simplifyPre`** (`Simplify.lean`): `Meta.transform`'s recursive walk doesn't itself check heartbeats, so a giant grind output (millions of nodes) ran the simplifier for >120s with no opportunity to bail out, no error, no profile output. The check now fires once per visited node, so `maxHeartbeats` and external SIGTERM are honoured during the walk.
-2. **`leanDecomp.profile` mode now emits per-phase markers via `IO.eprintln` + explicit `(← IO.getStderr).flush`** (`ProofTermMacro.lean`). Previously the per-phase profile only logged at the END of `decompileTac`; if any phase hung, the summary never printed. Now each of `evalTactic`, `instantiateMVars`, `expandAuxiliaryProofs`, `simplifyProofTerm`, `buildDecompiledTactics`, and `validate` writes a marker like `[leanDecomp.profile] phase: simplifyProofTerm` to stderr the moment it starts. Explicit `flush` is required because stderr is fully-buffered when redirected (without it, SIGKILL'd processes lose the markers).
-
-Antidiag/Nat.lean L94's hang turned out to be NOT in our decompile macro: probing showed the eprintln never fires because earlier theorems in the file run for >120s at default heartbeats (the script wraps the whole file in one `lake env lean` invocation). Decompile itself completes in 126ms when reached. So the L94 timeout is "the file is slow to load," not a decompile bug; the diagnostic infrastructure here is for future cases where the simplifier IS the bottleneck (cluster of 10 wall-clock-timeout failures in the 2026-05-01 broader-corpus run).
-
-### Done: cross-file projection-chain inaccessible refs (2026-05-04)
-
-Follow-up to the `inferInstance` substitution earlier today: extended `sanitizeInaccessibleIdents` to handle `Lean.Parser.Term.proj` nodes whose root receiver is an inaccessible-instance ident.
-
-The earlier fix only matched bare `Syntax.ident`, so `inst✝.toLE` got rewritten to `inferInstance.toLE` — which fails with "type class instance expected ?m" because Lean tries to synthesize `inferInstance : ?m` (no type annotation) before descending into `.toLE`. The chain's RESULT type is also a class (`(inst : LinearOrder M).toLE : LE M`), so replacing the WHOLE projection chain with a single `inferInstance` lets typeclass synthesis target the chain's result type directly.
-
-Implementation: a small recursive helper `projRoot` walks down through nested `.proj` nodes to find the bottom ident, and the outer `replaceM` matches both `Term.proj` and `Syntax.ident` cases. Top-down match-and-stop semantics ensure we replace the whole projection before descending into its receiver.
-
-**Validation**: `Mathlib/Algebra/Order/BigOperators/Group/List.lean:234` (uses `inst✝.toLE inst✝.toLT` from `Lean.Grind.Order.lt_le_trans`) previously failed with "type class instance expected"; now passes both local validation and cross-file re-elab (`Suggestion run finished: exit=0`). Sum 4/4 + Int 5/5 + Ring/Basic L733/L741 still pass — proj match doesn't disturb non-instance projections (`projRoot` only fires when the root resolves to an inaccessible class fvar).
-
-### Done: cross-file `inst✝` → `inferInstance` substitution (2026-05-04)
-
-Biggest single broader-corpus failure cluster (15/36 = 42% of all failures, per the 2026-05-01 sweep): decompiled scripts that mention anonymous `[TypeClass]`-instance binders emit references like `inst✝`, `inst✝¹`, `inst✝²` — the `✝` is Lean's pretty-printer marker for hygienic / inaccessible names.  Local validation passed (the macro's lctx still had those FVars), but the dumped suggestion file failed cross-file re-elaboration with no way for the user to spell `inst✝` in source.
-
-Concrete example: `Mathlib/Algebra/Order/Ring/Unbundled/Basic.lean:733` (`pos_of_right_mul_lt_le`) decompiled to a `refine @mul_le_mul_of_nonpos_left R inst✝ ... ?_ ?_ ?_ ?_ ?_ ?_` followed by `· exact inst✝¹ … · exact inst✝⁴` — un-elaborable.
-
-Fix: new `LeanDecomp.sanitizeInaccessibleIdents` (`Helpers.lean`) walks the post-simplify tactic syntax tree and substitutes idents with `inferInstance` when ALL THREE conditions hold:
-1. The ident's name has macro scopes (`Name.hasMacroScopes`) OR a literal `✝` component (`Name.isInaccessibleUserName`).
-2. The name resolves to an FVar in the surrounding lctx (via `LocalContext.findFromUserName?`).
-3. That FVar's type is a typeclass-instance class (`Meta.isClass?` returns `some _`).
-
-Three-condition narrowness avoids over-firing on ordinary hygienic-but-accessible binders (an earlier broader version that fired on any `hasMacroScopes` ident broke validation by replacing `exact h_1` with `exact _`).
-
-**Two non-obvious snags during implementation**:
-- **Substituting `_` doesn't work in `exact` position**: `exact _` raises "internal exception #5" — `_` becomes an unfilled term mvar, not a typeclass synthesis trigger.  Substituting `inferInstance` (which works in BOTH `refine @foo R inferInstance …` term position and `exact inferInstance` tactic position) is the right token.
-- **Build the substitute via `mkIdent`, not `\`(inferInstance)` quotation**: the quotation form attaches a fresh macro scope, which Lean's PrettyPrinter then sanitizes back to `inferInstance✝` — ironically defeating the entire purpose.  `mkIdent ``inferInstance` produces a clean, unscoped, fully-qualified ident.
-
-Applied at `buildDecompiledTactics` in `ProofTermMacro.lean`, just after `simplifyTactics` and before validation — so `checkDecompiled` round-trips the substituted form and catches any case where typeclass inference can't fill the hole (none observed so far).
-
-**Validation**:
-- `Mathlib/Algebra/Order/Ring/Unbundled/Basic.lean` L733 + L741: previously both failed cross-file (`inst✝`/`inst✝¹–⁴` references); now both pass.
-- Sum.lean still 4/4, Int.lean still 5/5, all 19 snapshot tests pass — narrow gate didn't disturb the slices that didn't have inaccessible-instance refs to begin with.
-- Full broader-corpus re-run not yet done; expected to lift coverage well above 33% since the inaccessible-instance failure mode is the dominant one.
-
-### Done: process-group cleanup in `bench_grind.run_cmd` (2026-05-04)
-
-`scripts/bench_grind.py`'s `run_cmd` previously called `subprocess.run(cmd, timeout=…)` on `lake env lean …` queries.  When a query timed out, `subprocess.run` killed only the immediate `lake` child — its `lean` worker (`lean Mathlib/...decompile_query.lean`) was re-parented to PID 1 and continued running at full CPU.  Friday's broader-corpus run left **18 orphaned `lean` workers** running for 30+ hours each before they were noticed; they contaminated the next benchmark by stealing CPU.
-
-Fix: `run_cmd` now spawns the child with `start_new_session=True` (its own process group) and on timeout calls `os.killpg(pgid, SIGTERM)` followed by a 1s grace period and `SIGKILL` if needed.  An `atexit` hook + `SIGINT`/`SIGTERM`/`SIGHUP` handlers also walk a `_LIVE_GROUPS` registry on script exit, so Ctrl-C or an unhandled exception during a benchmark also takes down every still-running query.  `nightly.py` inherits this for free since it imports `bench_grind`.
-
-Smoke-tested: `run_cmd(['sh', '-c', 'sleep 30 & wait'], …, timeout=1)` returns rc=124 in ~1s and no `sleep` process survives.  Macros / EPERM (returned on macOS once the group leader is reaped) are treated the same as ESRCH so the cleanup never raises during a normal exit.
-
-### Done: collapse trivial `Or.casesOn → lia | lia` to bare `lia` (2026-05-04)
-
-Sum L55/L81 dumps still contained the textbook hot pattern flagged in the previous Top TODO #1:
+**Open from this session**: broader-corpus re-measurement.  The first attempt (with dead-have pass on) showed a regression (26/42 → 20/45, +11 wall-clock timeouts), which led to gating (Z) off.  **A clean post-fix sweep was not completed** — local machine constraints + an accidental cancellation left the run unfinished.  Resume on the bigger machine with:
 
 ```
-have hOr : c + (-1 : ℤ) * x ≤ 0 ∨ ¬c + (-1 : ℤ) * x ≤ 0 := by lia
-cases hOr with
-| inl h_1 => lia
-| inr h_1 => lia
+cd /Users/oflatt/lean-decomp/mathlib4 && git clean -fdx -e .lake -e build Mathlib/Algebra/Order
+cd /Users/oflatt/lean-decomp && python3 scripts/nightly.py --parallel 4 --runs 3 --warmup 1 --skip-mathlib-setup --output results-broader-order.json --dump dump-broader-order mathlib4/Mathlib/Algebra/Order > /tmp/sweep.log 2>&1
+python3 scripts/analyze.py bucket results-broader-order.json dump-broader-order
 ```
 
-The byContradiction Phase-A short-circuit (2026-05-01) didn't catch this because the goal at the `Or.casesOn` site isn't `False` (it's the post-`apply Classical.byContradiction; intro hp` goal) and the residue then takes the structural `tryDecompCasesOn` path.
+Expected: similar to or slightly better than 26/42 = 62% (the IffMpMpr fix + byContradiction dedup are pure wins, no regressions expected).  `results-broader-order-with-deadhave.json` is preserved as the comparison-point for the dead-have-on regression (20/45) if anyone wants to investigate that path further.
 
-Added a post-loop check at the end of `tryDecompCasesOn` (`CasesOn.lean`):
-- Trigger gate: `info.indName == ``Or` AND `useHaveWrapper` AND every branch's tactic seq is exactly `[lia]` (kind comparison against a freshly-built reference, not stringification — robust to whitespace and macro-scope idiosyncrasies).
-- Gated try: validate bare `lia` against the original goal type via `candidateTacticsCloseGoal` (heartbeat-bounded, so a pathological miss doesn't burn the ambient budget).  If `lia` (= cutsat) closes the goal — which it usually does, since cutsat does internal disjunction case splits over `Decidable` shapes — return `[lia]` instead of the cases form.
-- Fall-through: if validation fails, the original cases form is emitted.  Worst case is one extra speculative `lia` validation.
+**Pick from** (after the sweep validates):
+- **(AA) Order-grind handlers** (Top TODO #1) — replace `grind only [<extracted>]` Rat leaves with structural emission.  Multi-session research.
+- **(CC) Tighten dead-have cost model** so it can be on by default.  Idea: skip validation when the tactic following the `have` is one of `lia`/`grind`/`omega` *and* the tactic seq has only that one closing tactic (the regression came from validating big proofs with many haves; small proofs would be cheap).
 
-The fix is intentionally narrow: only `Or` (the propositional disjunction the `have hOr := by lia` wrapper produces), only when both branches reduced to a bare `lia`, only when the `have hOr` wrapper was about to be emitted.  Won't fire spuriously on, say, `Bool.casesOn` or `Nat.casesOn` — those have different shapes and benefit from the structural form.
+**Don't break**: Sum 4/4, Int 5/5, all **25** snapshot tests, `bigstep`, `simple`, `bench_grind` unit tests, `scripts/smoke.sh`.  Broader-corpus baseline still **26/42 = 62%** from last measurement (will be re-measured on bigger machine).
 
-**Why this is in `tryDecompCasesOn` rather than the `TacticSimplify.lean` post-pass**: the validation check needs the original goal's `(lctx, localInsts, exprTy)` to call `candidateTacticsCloseGoal`.  `simplifyTactics` runs in `CoreM` after the `(lctx, …)` context has been discarded, so doing it as a stage-3 syntactic rewrite would require re-plumbing the elaboration context through the simplifier — bigger surgery for the same effect.  Treat this as a stage-2 optimization that does what stage-3 conceptually wants.
+### Earlier resume markers (archived)
 
-**Impact**:
-- Sum L55: was `apply Classical.byContradiction; intro hp; have hOr := …; cases hOr | inl h_1 => lia | inr h_1 => lia` (8 lines), now `apply Classical.byContradiction; intro hp; lia` (3 lines).  Speedup 0.93× → 0.96× of grind.
-- Sum L81: same collapse.  0.98× → 1.13× of grind (now **faster** than grind on this case).
-- Int L47/L91: indirect — the `by_cases h_abs` shape these emit isn't an `Or.casesOn`, so the Or-collapse doesn't fire.  Their dumps unchanged from the 2026-05-01 baseline.
-- Sum L36/L70 / Int L69/L76/L79: unchanged (their cases-on shapes don't match the trigger gate).
+Compressed log of prior session-end states.  Each "today's win + tomorrow's pick" was distilled to one line below; for the full text, `git log -- README.md` and walk back through.
 
-Sum.lean still 4/4, Int.lean still 5/5, all 19 snapshot tests pass.  No new snapshot regression-lock added — the collapse only fires under the narrow gate, and all existing snapshot inputs either have non-`lia` branch bodies or no `useHaveWrapper`, so existing tests are an indirect lock against the gate going too wide.
+- **2026-05-09 PM (post-broader-corpus rerun)** — 27/45 = 60% measurement landed (up from 23/49 = 47% on 2026-05-05).  Two `scripts/` bug fixes during the run: `nightly.py --parallel` SQLite cross-thread crash (serialize to plain lists in worker thread); `analyze.py bucket` mixing treatments (default to `--treatment decompile`).
+- **2026-05-09 EOD** — `grind only [<extracted-user-lemmas>]` fallback shipped (Rat 0/5 → 3/5 covering L83/L89/L97).  See Done section.
+- **2026-05-08 EOD** — three Rat-cluster attempts (rename_i fallback, `tryDecompFalseFromOrderGrind`, `Lean.Grind.Order.eq_mp` rewrite) all failed to ship a coverage win.  Lesson distilled: piecewise interventions on the order-grind family don't compose; the right level is a coordinated `Specialized/Grind/Order.lean` module.
+- **2026-05-06 EOD** — `delabRefinable` + `pp.maxSteps` lift unblocked `⋯`-truncation globally.  L599 failure mode changed (truncation → 127KB exact, exposing the next blocker).
+- **2026-05-05 PM** — investigated post-cross-file-fix clusters: identified the Rat `Lean.Grind.Order.*` family as the dominant remaining blocker; found an additional `⋯` source outside `chooseExactStrategy` that 2026-05-06's delab pass closed.
 
-### Done: byContradiction specialized-first dispatch (2026-05-01)
+### Done log: pre-2026-05-09 (compressed)
 
-`tryDecompByContradiction` (in `Decompiler.lean`) used to recurse structurally into the contradiction body first, falling back to specialized handlers (and then arithmetic terminals) only if the structural attempt failed.  For grind-emitted contradiction bodies whose outer shape is a deeply-nested `Or.casesOn` tree but whose inner leaves all close via the same specialized handler (`tryDecompAbsCaseSplitContradiction`, `tryDecompFalseFromLia`), the structural recursion would emit ~50 lines of nested `cases hOr_N` with 6+ inner `lia` calls before the specialized handler fired at the leaves.
+Older Done entries condensed.  For the full pre-compression text of any entry, walk `git log -- README.md`.
 
-Reordered the dispatch in `tryDecompByContradiction` to four phases:
-- **Phase A — specialized short-circuit** (NEW): try `trySpecializedDecompHandlers` directly on the body before any structural recursion.  If the candidate validates with the `apply Classical.byContradiction; intro h; <body>` wrapping, use it.  Lets `tryDecompAbsCaseSplitContradiction` and friends fire at the OUTER level instead of waiting until the inner branches.
-- **Phase B — structural recursion** (was Phase A): unchanged, runs when no specialized handler matched.
-- **Phase C — arithmetic terminal** (was Phase B): `lia` / `grind_order` / `grind_linarith` against the body.
-- **Phase D — final fallback** (was Phase C): `validateOrExact` with structural recursion → exact term.
+**2026-05-05** — broader-corpus sweep: 18/54 → **23/49 = 47%** after closing the cross-file `inst✝` cluster (15 failures → 0); `bench_grind.GRIND_RE` false-positive fix (5 sites were `@[grind =]` attribute lines, not tactic calls — added `ATTR_RE` + `GRIND_ATTR_EQ_RE` skips).  Test 19 sanitizer snapshot lock added (synthetic `class FooBar` + axiom `foo_trans` exercises bare-ident gate).  A Test 20 for the projection-chain case couldn't be reproduced synthetically without mathlib's `Lean.Grind.Order.*` infra; `Group/List.lean L234` nightly slice is the existing lock for that path.
 
-The state save/restore at error boundaries (the state-monad refactor's `let savedUsed ← getUsed; … set savedUsed`) was also threaded through Phase A so a failed specialized attempt doesn't leak names into Phase B.
+**2026-05-04** — five fixes:
+- **Cross-file `inst✝` → `inferInstance` substitution**: new `LeanDecomp.sanitizeInaccessibleIdents` (now in `Helpers/Sanitizer.lean`).  Three-condition narrow gate (macro-scoped/✝ name + lctx fvar + `Meta.isClass?`).  Uses `inferInstance` (not `_` which fails in `exact`) via `mkIdent` (not `\`(inferInstance)` quotation which re-attaches macro scope).  Closed the dominant 15-failure cluster.
+- **Cross-file projection-chain inaccessible refs**: extended sanitizer to handle `Term.proj` nodes whose root is an inaccessible-instance ident — replace the WHOLE `inst✝.toLE` chain with single `inferInstance` so typeclass synthesis targets the chain's result type.  Closed `Mathlib/Algebra/Order/BigOperators/Group/List.lean:234`.
+- **Per-phase profile markers + `Core.checkSystem` in simplifier**: `IO.eprintln` + flush per phase so hangs surface immediately; `checkSystem` at `simplifyPre` entry so `Meta.transform`'s recursive walk respects heartbeats.  (Antidiag/Nat.lean L94 turned out to be a slow file-load issue, not a decompile bug.)
+- **Process-group cleanup in `bench_grind.run_cmd`**: spawn with `start_new_session=True`, `os.killpg` on timeout/exit.  Closed the "18 orphaned `lean` workers from a Friday sweep" pattern.
+- **Or → bare `lia` collapse**: post-loop check in `tryDecompCasesOn` for `Or` discriminant + both branches `[lia]` + `useHaveWrapper` → emit bare `lia` if validation passes.  Sum L55/L81: 8 lines → 3 lines, 0.96×–1.13× of grind.
 
-**Impact on benchmarks**:
-- Int L91: 0.640s → 0.063s — **10×** speedup, was 14× slower than grind, now 1.3× slower.
-- Int L47: 0.109s → 0.054s — 2× speedup, was 3× slower than grind, now 1.2× slower.
-- Other Int / Sum sites: 1.2×–1.5× speedup each.
-- Range collapses from 0.07×–0.98× to **0.72×–0.98×** of grind.
+**2026-05-01** — three fixes:
+- **byContradiction specialized-first dispatch**: reordered to specialized → structural → terminal → fallback.  Int L91: 0.640s → 0.063s (10× speedup, 14× slower than grind → 1.3× slower).  Range collapsed from 0.07×–0.98× to 0.72×–0.98× of grind.  (The full 4-phase structure persists today, with the additional 2026-05-09 Phase B → Phase D dedup.)
+- **`used : List String` → `DecompM := StateRefT (List String) TacticM`**: ~30–40 functions across 6 files lost the explicit accumulator parameter.  Save/restore at `validateOrExact` and `tryDecompByContradiction` error boundaries.
+- **Dev-cycle tooling pass** — `scripts/probe.sh`, mathlib build cache in `nightly.py`, `set_option trace.leanDecomp / leanDecomp.profile / leanDecomp.dumpOnFail`, `showdecomp <term>` tactic, `leanDecomp.candidateMaxHeartbeats` exposed as register_option.  Debugging Playbook section in README rewritten.
 
-Sum.lean still 4/4, Int.lean still 5/5, all 19 snapshot tests pass.  See "Performance Snapshot" above for the full table.
+**2026-04-30** — cleanup batches (no behavior change; net −410 lines):
+- **Utility consolidation**: deleted 5 dead files (`BenchGrind.lean`, `casesonterm.lean`, `casesOnType.lean`, `IndentTest.lean`, `simpleterm`); consolidated `peelArgs` / `containsConstName` / `containsEagerReduce` / `anonymizeSyntheticMVars` duplicates into `Helpers.lean`; extracted `silentTry` helper; factored `emitHavePeel` shared between `tryDecompEqMpForallCongr` / `tryDecompEqMpImpliesCongr`.
+- **Combinator + strategy + handler-split**: `chooseExactStrategy` unified policy with `ExactStrategyConfig`; `matchConstApp?` combinator applied to 12 handlers; `tryDecompCasesOn` 340-line function split into `runMVarIdCases` / `cleanupEqMotiveTransport` / `mkCasesWithAltsTactic`.
+- **Dispatch + simplifier + test cleanup**: documented `firstSomeM` 8-phase dispatch with ordering invariants; added `leanDecomp.simplify.checkTypes` register_option (catches the `Lean.Grind.of_eq_eq_true` precedent class of bug); refactored `collectFinsetMemRewrites` 3-pass structure; reorganized `Test.lean` into 6 sections.
+- **fvar-app handler collapse**: deleted `tryDecompProblematicProofApp` (~40 lines, dead duplicate of `tryDecompTheoremAppFallback`); generalized fallback to emit `apply $head` when all args are proof-like.  Test 4b regression-locks the path.
+- **lctx-based mem-rewrite scan** (`Specialized/Grind.lean`): added Pass 3 to `collectFinsetMemRewrites` scanning lctx for `Finset.mem_<X>` shapes.  Sum L36: 3/4 → 4/4.  Defensive 100k heartbeat bound on `candidateTacticsCloseGoal` introduced same change.
 
-### Done: dev-cycle tooling (2026-05-01)
+**Earlier** — `forall_congr` / `implies_congr` peelers in `EqDecomp.lean`: two handlers (`tryDecompEqMpForallCongr` for `Eq.mp (forall_congr <body>) <evidence>`, `tryDecompEqMpImpliesCongr` for `Eq.mp (implies_congr Eq.refl q_eq) <evidence>`) that compose with the grind-specific leaf handler.  Each has instantiated and universal cases; `have h := <ev> x` / `<ev> hp` puts the user-form hypothesis in lctx for downstream `lia`.  Closed Sum L70 at default 200k heartbeats (collapses to 7 lines via `lia` fast path).
 
-A pass on developer-experience pain points that surfaced during the previous batches' work.  No behavior change; new tooling all opt-in via options or scripts.
-
-- **`scripts/probe.sh <file> <line> [maxHeartbeats]`**: wraps the workflow that previously took 5 manual steps when investigating a failing query — locate the dumped query file, copy to `/tmp`, inject `set_option maxHeartbeats N`, run `lake env lean` from `mathlib4/`, capture output.  Default heartbeat cap 8M (40× the default 200k file budget).
-- **Mathlib module build cache in `nightly.py`**: when every target module's `.olean` is newer than its source `.lean`, skip the redundant `lake build Mathlib.X` invocation (which costs ~5–8s of lake startup overhead per nightly call even when nothing has changed).  Saves several seconds per iteration when the only edits are to lean-decomp itself.  Cache key is the per-module mtime comparison; lean-decomp source mtimes are NOT included because mathlib doesn't import lean-decomp.
-- **`set_option trace.leanDecomp true`**: registers the `leanDecomp` trace class and adds a `tracedFirstSomeM` dispatcher in `Decompiler.lean` that logs `<HandlerName>: ✓` (matched and emitted) or `<HandlerName>: ·` (skipped) for every handler tried at every recursion point.  InfoView shows the full dispatch trail.  Replaces hand-instrumented `IO.println` / `dbg_trace` calls.
-- **`set_option leanDecomp.dumpOnFail true`**: on validation failure, the macro writes the candidate tactics + simplified proof term + lctx to `/tmp/lean-decomp-debug-<timestamp>.{tac,proof,lctx}` and includes the path stem in the error message.  Replaces the "instrument the macro, build, run, revert" loop that previously took 10+ minutes per debugging session.
-- **`showdecomp <term>` (tactic form)**: runs `<term>` through the simplifier + decompiler in the current goal context and prints the resulting tactic block as a message.  Doesn't validate or emit a `Try this` suggestion — strictly an inspection helper for "what does the decompiler produce on this shape?" without writing an `example := by decompile …` plus going through the full validation round-trip.  (Term-form `#showdecomp` deferred — `decompileExpr` runs in `DecompM = StateRefT _ TacticM` which the term elaborator doesn't naturally provide.)
-- **`set_option leanDecomp.profile true`**: at the end of each `decompile` call, log per-stage wall-clock timing — `inner` (the wrapped tactic), `simplify`, `decomp`, `validate`, `emit`, `total`.  Pairs with the trace mode (which tells you *which* handlers fired) to get a "where did the time go" picture.  Per-handler breakdown intentionally not measured — would require state-monad plumbing of a `ProfileMap` for limited dev-cycle gain.
-- **`leanDecomp.candidateMaxHeartbeats` option**: previously hardcoded at 100000; now exposed as a `set_option` so individual `decompile` calls can tune the speculative-validation cap without recompiling.
-- **README "Debugging Playbook" rewrite**: now references all the new tooling with copy-pasteable examples for trace / profile / dump / probe / `--grind-line` workflows.
-
-### Done: fvar-app handler collapse (2026-04-30, batch 4)
-
-- **Deleted `tryDecompProblematicProofApp`** (`Decompiler.lean`, ~40 lines).  Phase 1 dispatch slot is now empty; fvar-headed apps with proof args fall through to `tryDecompTheoremAppFallback` at Phase 8.  Investigation showed `tryDecompTheoremAppFallback` was already handling fvar heads correctly when reached — the duplicate handler was preserved purely to make fvar-app dispatch happen at Phase 1 rather than Phase 8, which had no semantic effect (no Phase 2-7 handler matches fvar heads).
-- **Generalized `tryDecompTheoremAppFallback`'s emission**.  Previously it always used `refine $delabTerm`.  Added the all-args-proof-like branch that emits `apply $head` instead — recovers the `apply h; · exact a; · exact b` shape that the old `tryDecompProblematicProofApp` produced (test 12, the `not_eq_prop` regression).
-- **Test 4b** (new): fvar head + 2 proof args, regression-locks the fvar-app path through the unified `tryDecompTheoremAppFallback`.  Combined with Test 4 (fvar head + 1 proof arg, falls to `decompExact`) the two snapshots cover both branches of the gating logic.
-- **Updated dispatch-list documentation** (`Decompiler.lean:317-`) to reflect that Phase 1 is now just `tryDecompExactLocalHyp` and Phase 8's `tryDecompTheoremAppFallback` handles both fvar and const heads.
-
-Sum.lean still 4/4, Int.lean still 5/5, all 19 snapshot tests pass.
-
-### Done: `used : List String` → state-monad refactor (2026-05-01)
-
-Threading the used-name accumulator as an explicit parameter through every handler signature was a long-standing wart: ~30-40 functions across 6 files all carried `(used : List String)` as a parameter and returned `(_, List String)` tuples, and threading bugs (`used.length` vs `used1.length`) had been a recurring source of regressions.
-
-Lifted into `DecompM := StateRefT (List String) TacticM` in `Helpers.lean`. Handler signatures are now `… → DecompM (Option (Array (TSyntax \`tactic)))` instead of `… → List String → TacticM (Option (Array (TSyntax \`tactic) × List String))`. Recursive calls drop the parameter and tuple — `let tactics ← decompileExpr expr lctx localInsts` instead of `let (tactics, used') ← decompileExpr expr lctx localInsts used`.
-
-Key design points:
-- **`getUsed` / `addUsed`** for read/write access to the accumulator. `addUsed` is no-op on duplicates (matches old `used.contains` guard).
-- **`chooseIntroName (idx : Nat) (userName : Name) : DecompM String`** keeps the explicit `idx` parameter (rather than reading `(← getUsed).length` internally) because the historical naming behavior depends on per-batch position counters: two consecutive `_` binders in one `assignIntroNames` call get base names `x1`, `x2` (not `x1`, `x_{used.length}`) — preserving snapshot-test naming output. Singleton sites (`tryDecompByContradiction`, `tryDecompLet`) pass `(← getUsed).length`; `assignIntroNames` threads its own local `idx := 0, 1, 2, …` counter.
-- **State save/restore at error boundaries**: `validateOrExact` saves the used-name list before calling `build`, restores it on either `subproofTacticsCloseGoal` failure or thrown exception. Same in `tryDecompByContradiction`'s catch arm. Without this, names introduced only in a failed branch would leak into subsequent handlers' name choices.
-- **Entry point**: `ProofTermMacro.lean`'s `buildDecompiledTactics` now does `(decompileExpr proof lctx localInstances).run' []` to discard the final used-name state.
-
-Affected files: `Helpers.lean`, `CasesOn.lean`, `EqDecomp.lean`, `Specialized.lean`, `Specialized/Grind.lean`, `Decompiler.lean`, `ProofTermMacro.lean`. Sum 4/4, Int 5/5, all 19 snapshot tests pass.
-
-### Done: combinator + strategy + handler-split cleanup (2026-04-30, batch 3)
-
-Continuation of the cleanup pass.  No behavior change (Sum 4/4, Int 5/5, all 18 tests pass).
-- **Heartbeat option exposure**.  `candidateMaxHeartbeats` (`Helpers.lean`) is now `register_option leanDecomp.candidateMaxHeartbeats : Nat := { defValue := 100000, … }`.  Nightly / tests can tune the speculative-validation cap via `set_option leanDecomp.candidateMaxHeartbeats N` without recompiling.
-- **`chooseExactStrategy` unified policy** (`Helpers.lean`).  The three fallback sites — `mkExactFallbackTactics` (validation-failure), `validateOrExact`'s catch arm, and `Decompiler.lean`'s `decompExact` (no-handler-matched) — interleave delab-vs-pp.all, decide-vs-with_unfolding_all-exact decisions differently.  Lifted into a single `chooseExactStrategy` parameterized by an `ExactStrategyConfig` record (`enforceMaxSize`, `tryDecideFirst`, `forcePrettyPrint : Expr → Bool`).  Each call site now passes its config.  Future tuning (e.g. always trying `decide`, or always pp.all-rendering propext) edits one function.
-- **`matchConstApp?` combinator** (`Helpers.lean`).  Most `tryDecompXxx` handlers shared the boilerplate `let (fn, args) := peelArgs e; let some name := fn.constName? | return none; if name != ``Foo then return none; if args.length < N then return none`.  Added `matchConstApp? : Expr → Name → Nat → Option (List Expr)` so handlers become `let some args := matchConstApp? e ``Foo N | return none`.  Applied to 12 handlers across `Decompiler.lean` (Iff.intro/mp/mpr, And.intro/proj, propext), `EqDecomp.lean` (congr, congrArg, Eq.symm, Eq.trans, the two `*Congr` peelers), and `Specialized/Grind.lean` (Eq.mpAutomationCast, Eq.mpKnownGrindCast, Eq.mpIntLinearNormLe, mt).  Net: ~3 lines saved per handler and the *intent* — "match this shape" — is now visible at the top of each handler.
-- **`tryDecompCasesOn` split** (`CasesOn.lean`).  340-line function broken up by extracting three named helpers, each with its own docstring:
-  - `runMVarIdCases` (~20 lines): allocate a fresh synthetic-opaque mvar of `expr`'s type, generalize the discriminant if needed, run `MVarId.cases`, return subgoals.  Returns `none` for generalized motives so the caller falls back to the older `lambdaTelescope` path.
-  - `cleanupEqMotiveTransport` (~40 lines): the load-bearing eq-motive substitution + `Eq.rec`/`Eq.ndrec` strip.  Documented why we strip only when the base is a lambda (would otherwise erase `noConfusion`'s const-headed `Eq.rec`).
-  - `mkCasesWithAltsTactic` (~10 lines): final `cases <disc> with …` syntax build, with optional `cases h : <disc>` form for generalized-equation motives.
-  Main `tryDecompCasesOn` body shrunk by ~70 lines and gained a docstring describing the three-phase per-branch flow (telescope → cleanup → recurse).
-
-### Done: dispatch + simplifier + test cleanup (2026-04-30, batch 2)
-
-Continuation of the cleanup pass.  No behavior change (Sum 4/4, Int 5/5, all 18 tests pass).
-- **Documented `firstSomeM` dispatch** in `Decompiler.lean:363-450`. Annotated 8 phases (Pre / Binder-introducing / Specialized / Structural-propositional / Structural-equality / False / Term-shape / Terminal-arithmetic / Theorem-app fallback) with rationale for each ordering invariant. Swapping phases now obviously breaks correctness — e.g. the comment for Phase 4 spells out that `tryDecompEqMpForallCongr` MUST precede `tryDecompEqMp` so the L70/L36 fast path fires.
-- **Added simplifier type-preservation invariant** in `Simplify.lean`. New `register_option leanDecomp.simplify.checkTypes` (default `false`) wraps every rule's output through `Meta.isDefEq oldTy newTy` and throws if the rule changed the proof term's type. This is the precise class of bug the old `Lean.Grind.of_eq_eq_true` rewrite had — it claimed to produce `a = b` but actually produced `Eq.mpr ... True.intro` of a different proposition. Smoke-tested at `set_option leanDecomp.simplify.checkTypes true` against all 18 snapshot tests; no current rules violate the invariant.
-- **Refactored `collectFinsetMemRewrites`** (`Specialized/Grind.lean`). Three passes (proof-walk for direct `Iff.mp` hits, cross-product of found lemmas × target fvars, lctx scan) are now visually separated with section comments and share a single `pushRw` helper that handles `(lemma, hyp)` deduplication. The shared `emitted : HashSet (Name × Name)` accumulator makes the dedup invariant explicit (preventing the "rw lemma at hyp twice fails" bug that broke L70 in the first iteration).
-- **Removed dead `extractGrindLemmaNames`** (30 lines, zero callers).
-- **Modernized `isStructuralConst` / `isGrindConst`** in `Helpers.lean` to use `Name.isPrefixOf` against namespace literals (`Eq`, `Classical`, `Int.Linear`, `Lean.Grind`, `Lean.RArray`) where possible. Added comment explaining why `congr*` / `*_congr*` / `eq_true*` / `eq_false*` checks remain string-prefixed (root-namespace names with no shared parent).
-- **Extracted `setInductionAltBinders`** in `CasesOn.lean`. The 40-line `Syntax.node` surgery that mutates an `inductionAltLHS`'s binder slot is now a named, documented helper instead of inline raw-syntax matching at the call site. The call site went from ~40 lines to one if-expression.
-- **Reorganized `Test.lean`** into 6 sections grouped by handler (Smoke / byContradiction / Hypothesis-preferences / Specialized-grind / propext-Iff regression locks / forall_congr+implies_congr regression locks) with an introductory comment block. Tests 14–18 are now annotated as "regression locks" so future contributors know not to "fix the snapshot" without reading the relevant handler docstring.
-
-### Done: utility consolidation pass (2026-04-30)
-
-Code-review punch list found three utility duplicates and several dead files. Cleaned up in one pass with no behavior change (`Sum.lean` still 4/4, `Int.lean` still 5/5, all 18 snapshot tests still pass). Net: −410 lines.
-- **Deleted dead files**: `BenchGrind.lean`, `casesonterm.lean`, `casesOnType.lean`, `IndentTest.lean`, `simpleterm` — orphan dump-output and unreferenced experiments.
-- **Consolidated `peelArgs`** (was duplicated in `EqDecomp.lean` as `peelApps`, `CasesOn.lean`, and `Specialized/Grind.lean`) into the single `LeanDecomp.peelArgs` in `Helpers.lean`.
-- **Consolidated `containsConstName` / `containsEagerReduce`** (3 copies each across `Decompiler.lean`, `EqDecomp.lean`, `Helpers.lean`) into the public `Helpers.lean` versions.
-- **Consolidated `anonymizeSyntheticMVars` / `ppExprToTermSyntax` / `ppExprToTermSyntaxWith`** (duplicated between `Decompiler.lean` and `Helpers.lean`) into single public `Helpers.lean` versions.
-- **Modernized `isBoolEqTrue`** in `Helpers.lean` to use `Expr.eq?` instead of an inline app-peeler.
-- **Extracted `silentTry` helper** in `Helpers.lean` for the save-messages / suppress / try `withoutModifyingState` / catch / restore pattern shared by `subproofTacticsCloseGoal`, `refineTacProducesGoals`, and `refineTacMatchesProofArgs`.
-- **Factored `tryDecompEqMpForallCongr` / `tryDecompEqMpImpliesCongr` clones**: extracted `emitHavePeel` in `EqDecomp.lean` for the shared `<introTacs>; have h := <ev>; <fast-path lia | recurse on Eq.mp eqProof h>` tail. Universal sub-cases pass `tryFastPath := false` (post-intro goal is still a `∀`, fast-path lia is a guaranteed miss); instantiated sub-cases pass `tryFastPath := true`. Cut ~80 lines and put the four sub-cases on equal footing.
-
-### Done: lctx-based mem-rewrite scan in `collectFinsetMemRewrites` (2026-04-30)
-
-Sum L36 was the last remaining nightly failure on `Sum.lean`. Investigation (instrumented `decompile` to dump the simplified proof term and per-phase markers to `/tmp`) showed the macro was running out of heartbeats inside `buildDecompiledTactics` rather than at validation time, with a single Eq.mp `refine` taking ~6.6s on the default 200k budget. Even 8M heartbeats wasn't enough.
-
-Root cause was a coverage gap, not a perf problem: `collectFinsetMemRewrites` only emitted rewrites when the proof contained `Iff.mp Finset.mem_<X> <fvar>` directly. L36's proof references `mem_sdiff.mp (Eq.mp <transport> hp)` — the third arg is an Eq.mp expr, not a direct fvar — so Pass 1 missed it, and Pass 2's lemma-only set had no `targetFvars` to pair with. The `tryHavesPlusLia` candidate ended up being just `have h_fact := hs x …; lia`, which can't close False without the membership rewrites of `hp`.
-
-Fix:
-- Added a Pass 3 to `collectFinsetMemRewrites` (in `Specialized/Grind.lean`) that scans the **lctx** for hypotheses whose type matches a known Finset interval / sdiff constructor and emits `rw [Finset.mem_<X>] at <hyp>` (and `rw [Finset.mem_sdiff]` first when the set is `s \ Finset.<X> a b`). Resolves `set r := …` opaque fvars by looking through the let-binding.
-- Made Pass 2 also insert into `foundPairs` so Pass 3 can dedupe against it — the duplicate `rw` on an already-rewritten hypothesis fails (LHS no longer matches), tanking the whole candidate. This was the bug that broke L70 in the first iteration.
-- Added a defensive heartbeat bound on `candidateTacticsCloseGoal` (Helpers.lean) — speculative validation attempts now run with `maxHeartbeats := 100000` so a single pathological refine candidate cannot consume the entire ambient budget. `validateOrExact` / `subproofTacticsCloseGoal` directly remain unbounded (they're the workhorse final check).
-
-**Result**: Sum.lean is now 4/4 (L36 was 3/4 before); Int.lean stays at 5/5. Sum L36 collapses to 8 lines: `intro x hp; apply Classical.byContradiction; intro hp_1; have h_fact := hs x …; have h_fact_1 : … := Int.not_le_eq …; rw [Finset.mem_sdiff] at hp; rw [Finset.mem_Ioc] at hp; lia`. Same shape as L70's working output, with the outer `intro x hp` reflecting that the user didn't pre-bind the loop variable.
-
-### Done: `forall_congr` / `implies_congr` peelers in `EqDecomp.lean`
-
-Two general (non-grind-specific) handlers that compose with the existing grind-specific leaf handler:
-
-- **`tryDecompEqMpForallCongr`** matches `Eq.mp (forall_congr <body>) <evidence>` (with optional trailing applications). Two cases:
-  - **Instantiated** (trailing args present, e.g. `… <ev> x mx`): emit `have h := <ev> x` and recurse on `Eq.mp (<body> x) h <remaining args>`. Fast path: if `lia` (or `with_unfolding_all lia`) closes the outer goal with the new `have` in the lctx, emit `have h := <ev> x; lia` directly — skipping the inner refine chain.
-  - **Universal** (no trailing args, goal is `∀ a, q a`): emit `intro x; have h := <ev> x; <recurse>`.
-- **`tryDecompEqMpImpliesCongr`** matches `Eq.mp (implies_congr p_eq q_eq) <evidence>` when `p_eq = Eq.refl`. Symmetric structure: instantiated case (trailing premise) emits `have h := <ev> hp; <recurse-or-lia>`; universal case emits `intro hp; have h := <ev> hp; <recurse>`.
-
-Both handlers also added a `have` step so downstream `lia` sees the user-form hypothesis in the lctx — without it, the application is just an expression invisible to lia.
-
-`tryDecompEqMpIntLinearNormLe` (in `Specialized/Grind.lean`) was extended with a `with_unfolding_all lia` fallback for cases where the goal is in polynomial-denote form (`Int.Linear.Poly.denote' … ≤ 0`) — happens when the leaf fires inside another peel.
-
-**Result on Sum L70**: now passes inside the default 200k-heartbeat budget. The decompile collapses to 7 lines: `apply Classical.byContradiction; intro hp; have h_fact := hs x (And.left (Finset.mem_sdiff.mp mx)); have h_fact_1 : (¬c + ↑(#s) ≤ x) = (x + (1 : ℤ) ≤ c + ↑(#s)) := Int.not_le_eq …; rw [Finset.mem_sdiff] at mx; rw [Finset.mem_Ico] at mx; lia`. The peeler's `lia` fast path closes the contradiction body directly with `h_fact` in the lctx — no outer `refine @Eq.mp <prop1> <prop2> ?_ ?_` chain on `propext (Iff.intro …)` shapes is generated, so the per-refine ~6.5s unification cost the previous bottleneck depended on never fires.
-
-### Done: `decide` swap in `mkExactFallbackTactics`
-
-Implemented in `LeanDecomp/Helpers.lean`. When the proof contains `eagerReduce` AND its inferred type is `(_ : Bool) = (true : Bool)` (the certificate shape), try `decide` before `with_unfolding_all exact`. Validates with `subproofTacticsCloseGoal`; falls back if `decide` doesn't close. Defensive: doesn't fire on the L70 forall_congr block (whose outer type is `∀ ...`, not `Bool = true`), so it didn't directly unblock L70/L36 — the L70 win came from the `forall_congr`/`implies_congr` peelers rerouting through `lia` instead of through the certificate fallback at all. Kept as a defensive change for future grind proofs that emit literal certificate-shaped fallbacks.
+**Earlier** — `decide` swap in `mkExactFallbackTactics`: when proof contains `eagerReduce` AND inferred type is `(_ : Bool) = (true : Bool)` (the certificate shape), try `decide` before `with_unfolding_all exact`.  Defensive — kept for future grind proofs that emit literal certificate-shaped fallbacks.
 
 ## Recommended Next Steps (after the top TODO)
 
@@ -581,6 +406,93 @@ Implemented in `LeanDecomp/Helpers.lean`. When the proof contains `eagerReduce` 
 - **Set `pp.numericTypes` and `pp.coercions.types` on every delab call that produces user-elaborable syntax.** L91 demonstrated that default delab options drop type information needed to disambiguate mixed-numeric expressions.
 
 ## Design Notes
+
+### Pipeline overview (deep-dive, 2026-05-09)
+
+The macro is a 3-stage pipeline + sanitization + validation round-trip:
+
+```
+inner tactic           User's `decompile <tac>` runs the wrapped tactic, producing a proof term.
+       ↓
+Stage 1: simplifyProofTerm      Expr → Expr.   Strip wrappers, beta-reduce,
+   (Simplify.lean)              normalize Eq.mp/Eq.mpr chains, convert grind
+                                certs to standard library forms.
+       ↓
+Stage 2: decompileExpr          Expr → Array (TSyntax `tactic).  The bulk.
+   (Decompiler.lean              8-phase dispatch over a mutual recursion of
+    + sub-files)                 ~25 handlers.  Each handler validates before
+                                 returning.
+       ↓
+Stage 3: simplifyTactics        TSyntax → TSyntax.  Currently only collapses
+   (TacticSimplify.lean)        `have h := by exact t` → `have h := t`.
+       ↓
+sanitizeInaccessibleIdents      Cross-file safety: `inst✝` → `inferInstance`.
+       ↓
+checkDecompiled                  Round-trip validation.  If fails → error.
+       ↓
+addSuggestion                    `Try this` codeAction.
+```
+
+#### Stage 2's 8-phase dispatch
+
+`Decompiler.lean:382` runs `tracedFirstSomeM` over a list of `(handlerName, action)` pairs in a fixed order.  First handler that returns `some` wins.  **Order is correctness-load-bearing in 2 places** (the `*Congr` peelers MUST precede `tryDecompEqMp`; specialized handlers MUST precede general structural Eq.mp).
+
+1. **Pre / shape escapes**: `tryDecompExactLocalHyp`.
+2. **Binder-introducing structural**: `tryDecompByContradiction`, `tryDecompCasesOn`.  Introduce new fvars for branch decomp.
+3. **Specialized (grind-aware)**: `trySpecializedDecompHandlers` (`Specialized/Grind.lean`).
+4. **Structural propositional + equality**: `tryDecompPropext`, `Iff.intro/mp/mpr`, `And.*`, `congr*`, `Eq.symm/trans`, `EqMp` peelers.
+5. **False / contradiction**: `tryDecompFalseRec`, `tryDecompFalseType`.
+6. **Term-shape**: `tryDecompLet`, `tryDecompBetaRedex`, `tryDecompEagerReduce`, `tryDecompEqRefl`, `tryDecompDecide`.
+7. **Terminal arithmetic**: `tryDecompArithmeticTerminalPasses` (`lia` → `grind_order` → `grind_linarith`).
+8. **Theorem-app fallback**: `tryDecompTheoremAppFallback`.
+
+If all 8 return `none`, `decompExact body` emits `exact` / `with_unfolding_all exact` / `grind only [<extracted>]` via `chooseExactStrategy`.
+
+#### Validation discipline
+
+Every speculative emission goes through `silentTry` (state + message-log + error rollback) before being returned as a real result.  Heartbeat cap (`leanDecomp.candidateMaxHeartbeats = 100k`) bounds the cost of one bad candidate.  See "Validation discipline" line in the deep-dive section under `## Concerns and risks` for caveats.
+
+#### `tryDecompByContradiction` — 4 internal phases
+
+- **Phase A**: specialized short-circuit (`trySpecializedDecompHandlers` on the body).  Big wins when grind's contradiction body is decoration over a single decidable predicate.
+- **Phase B**: structural recursion (`decompileExpr` on the body).
+- **Phase C**: arithmetic terminal (`lia`/`grind_order`/`grind_linarith`).
+- **Phase D**: `validateOrExact` final fallback.
+
+State-restoration (`let savedUsed ← getUsed; ...; set savedUsed`) between phases prevents name-state leak from a failed phase.  **Concern #2** wants cheap shape-checks at each phase entry to skip work that obviously won't match.
+
+#### `tryDecompCasesOn` — 3 sub-phases per branch
+
+1. **runMVarIdCases**: synthetic outer mvar + `MVarId.generalize` (if needed) + `MVarId.cases` → real per-branch substituted subgoals.
+2. **cleanupEqMotiveTransport**: substitute eq params; strip residual `Eq.rec`/`Eq.ndrec` (load-bearing for downstream `contradiction` / `noConfusion`).
+3. **Recurse via `decompileOrExact`** in the substituted lctx.
+
+Per-alt isolation via `let savedUsed ← getUsed; set savedUsed` so `cases h_inacc_1` in alt 1 doesn't bias alt 2.  Post-loop "trivial Or → bare lia" collapse closes the Sum L55/L81 hot pattern.
+
+#### `chooseExactStrategy` — fallback orchestra
+
+Order of attempts (`Helpers.lean:351`):
+1. `extractGrindOnlyLemmas proof` → if non-empty, try `grind only [<lemmas>]`.  **The 2026-05-09 Rat coverage win lives here.**
+2. If `containsEagerReduce proof` AND `cfg.tryDecideFirst` AND `proofTy = (_ : Bool) = true`: try `decide`.
+3. If `containsEagerReduce proof`: emit `with_unfolding_all exact <termStx>`.
+4. Else: emit `exact <termStx>`.
+
+All delab paths route through `liftPPTruncationOptions` (lifts `pp.deepTerms` + `pp.proofs` + `pp.maxSteps`) so `⋯` never appears in rendered output.  Pre-flight check in `checkDecompiled` catches any regression.
+
+### Concerns and risks (from 2026-05-09 deep-dive)
+
+10 concerns surfaced in the review.  Status of each:
+- **#1 Termination by heartbeat budget** — accepted; hard to prove formally.
+- **#2 byContradiction phases re-run `decompileExpr`** — *fixed 2026-05-09 PM* (Top TODO #5).  Phase B → Phase D dedup via cached body tactics.
+- **#3 `validateOrExact` cumulative cost** — `analyze.py shape` (added 2026-05-09 PM) gives per-file fallback-shape counts; iterate on data.
+- **#4 Generalized cases motives gap** — research item, deferred.
+- **#5 Dispatch-order load-bearing in 2 places** — fix planned (Top TODO #4 — snapshot tests that lock the order).
+- **#6 grind only output-policy relax** — clarified in code comments + Done section.
+- **#7 Stage-3 simplifier underused** — *2026-05-09 EOD: implemented; 2026-05-10: gated off by default* (Top TODO #7).  `eliminateDeadHaves` pass in `TacticSimplify.lean`, opt-in via `set_option leanDecomp.eliminateDeadHaves true`.
+- **#8 No CSE / sub-proof sharing** — declined as speculative; revisit if `analyze.py shape` shows duplication.
+- **#9 Two-tier heartbeat cap** — declined.
+- **#10 Mutual block hurts dev loop** — *fixed 2026-05-09 EOD* (Top TODO #6).  Extracted to Intro.lean / ByContradiction.lean / Helpers/ArithTerminal.lean.
+- **#11 `tryDecompIffMpMpr` brittle in synthetic contexts** (surfaced 2026-05-09 PM) — *fixed same day* (see Done section): emit changed from `refine Iff.mp ?_ ?_` to `refine @Iff.mp P Q ?_ ?_`.  Test 22 locks the new shape.
 
 ### Decompiler invariant: real proof state at every recursive call
 
